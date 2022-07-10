@@ -1,5 +1,5 @@
 ---
-title: "Figures from Screen Analysis"
+title: "Revision analyses"
 author: "David Wu"
 output: html_notebook
 ---
@@ -39,31 +39,18 @@ output_dir <- 'figures/screen'
 dir.create(output_dir, showWarnings = FALSE)
 ```
 
+### Control distribution
 ```{r}
-coding_pheno <- read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/Coding/screen_phenotypetable.txt',
+coding_pheno <- read_tsv('analysis/screen/output/01_process_experiments/results/Differentiation/Coding/screen_phenotypetable.txt',
                                 skip = 3,
                                 col_names = c('sgId', 'r1', 'r2', 'ave'))
 
-coding_pheno %>% 
-  filter(str_detect(sgId, 'non-targeting')) %>% 
-  ggplot(aes(x = ave)) +
-  geom_histogram(bins = 1000)
-```
-```{r}
-lncrna_pheno <- bind_rows(read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/CRiNCL/screen_phenotypetable.txt',
+lncrna_pheno <- bind_rows(read_tsv('analysis/screen/output/01_process_experiments/results/Differentiation/CRiNCL/screen_phenotypetable.txt',
                                    skip = 3,
                                    col_names = c('sgId', 'r1', 'r2', 'ave')),
-                          read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/Common/screen_phenotypetable.txt',
+                          read_tsv('analysis/screen/output/01_process_experiments/results/Differentiation/Common/screen_phenotypetable.txt',
                                    skip = 3,
                                    col_names = c('sgId', 'r1', 'r2', 'ave')))
-
-lncrna_pheno %>% 
-  filter(str_detect(sgId, 'non-targeting')) %>% 
-  ggplot(aes(x = ave)) +
-  geom_histogram(bins = 100)
-```
-### Control distribution
-```{r}
 all_phenos <- bind_rows(coding_pheno, lncrna_pheno) %>% pivot_longer(cols = -1, names_to = 'rep', values_to = 'pheno')
 
 p_control <- all_phenos %>% 
@@ -78,164 +65,8 @@ p_control
 ```
 ### Import screen data
 ```{r}
-screen_results <- read_tsv('analysis/screen/output/04_fdr/screen_results.tsv')
-neighbor_integration <- read_tsv('analysis/screen/output/05_neighbors/neighbor_hits.tsv.gz')
-```
-
-```{r}
-screen_results
-```
-
-### How many targets
-```{r}
-screen_results %>% filter(assay == 'Proliferation', group == 'Gene')
-```
-### How many guides
-```{r}
-coding_counts <- read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/Coding/screen_mergedcountstable.txt',
-                                skip = 3,
-                                col_names = c('sgId', 's1', 's2', 's3', 's4')) %>% 
-  rowwise() %>% 
-  mutate(total = s1 + s2 + s3 + s4) %>% 
-  left_join(read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/Coding/screen_librarytable.txt')) %>% 
-  select(sgId, gene, sequence, s1, s2, s3, s4, total)
-```
-```{r}
-coding_counts
-```
-
-
-```{r}
-crincl_counts <- read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/CRiNCL/screen_mergedcountstable.txt',
-                          skip = 3,
-                          col_names = c('sgId', 's1', 's2', 's3', 's4')) %>% 
-  rowwise() %>% 
-  mutate(total = s1 + s2 + s3 + s4) %>% 
-  left_join(
-    read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/CRiNCL/screen_librarytable.txt') %>% 
-      select(sgId = `...1`, sequence, gene)
-  )
-
-common_counts <- read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/Common/screen_mergedcountstable.txt',
-                          skip = 3,
-                          col_names = c('sgId', 's1', 's2', 's3', 's4')) %>% 
-  rowwise() %>% 
-  mutate(total = s1 + s2 + s3 + s4) %>% 
-    left_join(
-    read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/Common/screen_librarytable.txt') %>% 
-      select(sgId = `...1`, sequence, gene)
-  )
-
-crincl_counts
-```
-
-
-```{r}
-lncrna_counts <- bind_rows(crincl_counts, common_counts) %>% 
-  group_by(sequence) %>% 
-  slice_max(order_by = total, n = 1, with_ties = FALSE) 
-lncrna_counts
-```
-
-
-```{r}
-all_counts <- bind_rows(coding_counts %>% mutate(library = 'Coding'), lncrna_counts %>% mutate(library = 'lncRNA')) %>% 
-  select(sgId, gene, s1, s2, s3, s4, total, sequence, library) %>% 
-  mutate(condition1 = s1 + s2,
-         condition2 = s3 + s4,
-         min = min(condition1, condition2)) %>% 
-  ungroup()
-all_counts
-```
-```{r}
-quantile(c(all_counts$condition1, all_counts$condition2), probs = seq(0, 1, 0.01))
-```
-```{r}
-quantile(c(all_counts$condition1), probs = seq(0, 1, 0.01))
-```
-```{r}
-quantile(c(all_counts$condition2), probs = seq(0, 1, 0.01))
-```
-
-```{r}
-all_counts %>% filter(total >= 500)
-```
-
-```{r}
-all_totals <- all_counts %>% 
-  group_by(gene, library) %>% 
-  summarize(total = sum(total))
-
-all_totals %>% pull(total) %>% quantile(probs = seq(0, 1, 0.01))
-```
-```{r}
-all_totals %>% 
-  filter(total > 5000)
-```
-
-```{r}
-all_totals %>% filter(library == 'Coding') %>% pull(total) %>% quantile(probs = seq(0, 1, 0.01))
-```
-
-```{r}
-all_totals %>% 
-  ggplot(aes(x = total)) +
-  geom_histogram(bins = 1000) +
-  scale_x_log10() +
-  facet_wrap(~library)
-```
-
-```{r}
-all_counts %>% 
-  ggplot(aes(x = total)) +
-  geom_histogram(bins = 1000) +
-  #facet_wrap(~library, scales = 'free_y') +
-  scale_x_log10()
-```
-### Counts per hits
-```{r}
-hit_counts <- screen_results %>% filter(group == 'Gene') %>% left_join(all_totals %>% select(feature_id = gene, everything()))
-hit_counts
-```
-```{r}
-hit_counts %>% 
-  filter(status == 'Hit',
-         assay == 'Differentiation') %>% 
-  select(feature_id, total) %>% 
-  arrange(total)
-```
-### grnas per gene
-```{r}
-tallies <- all_counts %>% 
-  filter(condition1 > 50, condition2 > 50) %>% 
-  group_by(gene, library) %>% 
-  tally()
-
-tallies %>% group_by(library) %>% tally()
-```
-```{r}
-tallies
-```
-```{r}
-tallies_coding <- tallies %>% filter(library == 'Coding')
-tallies_coding %>% filter(n >=4)
-```
-```{r}
-tallies %>% 
-  mutate(max = ifelse(library == 'Coding', 5, 10)) %>% 
-  filter(n >= max * 0.8)
-```
-
-
-### Undetected gRNAs
-```{r}
-all_counts %>% filter(total == 0)
-```
-```{r}
-all_counts %>% filter((s1 + s2) < 100 & (s3 + s4) < 100)
-```
-```{r}
-all_counts %>% filter((s1 + s2) > 100 & (s3 + s4) > 100)
+screen_results <- read_tsv('analysis/screen/output/02_fdr/screen_results.tsv')
+neighbor_integration <- read_tsv('analysis/screen/output/03_neighbors/neighbor_hits.tsv.gz')
 ```
 
 ### gRNA concordance
@@ -248,29 +79,29 @@ screen_results_minimal
 ```
 
 ```{r}
-pheno_coding <- read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/Coding/screen_phenotypetable.txt', 
+pheno_coding <- read_tsv('analysis/screen/output/01_process_experiments/results/Differentiation/Coding/screen_phenotypetable.txt', 
                          skip = 3, 
                          col_names = c('sgId', 'Rep1', 'Rep2', 'avg')) %>% 
   left_join(
-    read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/Coding/screen_librarytable.txt') %>% 
+    read_tsv('analysis/screen/output/01_process_experiments/results/Differentiation/Coding/screen_librarytable.txt') %>% 
       select(sgId, sequence, feature_id = gene)
   ) %>% 
   left_join(screen_results_minimal %>% filter(assay == 'Differentiation')) 
 
-pheno_crincl <- read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/CRiNCL/screen_phenotypetable.txt', 
+pheno_crincl <- read_tsv('analysis/screen/output/01_process_experiments/results/Differentiation/CRiNCL/screen_phenotypetable.txt', 
                          skip = 2, 
                          col_names = c('sgId', 'Rep1', 'Rep2', 'avg')) %>% 
   left_join(
-    read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/CRiNCL/screen_librarytable.txt') %>% 
+    read_tsv('analysis/screen/output/01_process_experiments/results/Differentiation/CRiNCL/screen_librarytable.txt') %>% 
       select(sgId = `...1`, sequence, feature_id =gene)
   ) %>% 
   left_join(screen_results_minimal %>% filter(assay == 'Differentiation')) 
 
-pheno_common <- read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/Common/screen_phenotypetable.txt', 
+pheno_common <- read_tsv('analysis/screen/output/01_process_experiments/results/Differentiation/Common/screen_phenotypetable.txt', 
                          skip = 2, 
                          col_names = c('sgId', 'Rep1', 'Rep2', 'avg')) %>% 
   left_join(
-    read_tsv('analysis/screen/output/03_process_experiments/results/Differentiation/Common/screen_librarytable.txt') %>% 
+    read_tsv('analysis/screen/output/01_process_experiments/results/Differentiation/Common/screen_librarytable.txt') %>% 
       select(sgId = `...1`, sequence, feature_id =gene)
   ) %>% 
   left_join(screen_results_minimal %>% filter(assay == 'Differentiation'))
@@ -295,8 +126,6 @@ direction_summary <- pheno_all %>%
   tally() %>% 
   ungroup() %>% 
   pivot_wider(names_from = grna_direction, values_from = n, values_fill = 0)
-
-direction_summary
 ```
 
 ```{r}
@@ -307,8 +136,6 @@ grna_concordance <- direction_summary %>%
     hit_direction == 'Negative Hit' ~ Negative / sum(Positive, Negative),
     hit_direction == 'Non-hit' ~ Positive / sum(Positive, Negative))
   )
-
-grna_concordance
 ```
 
 
@@ -339,22 +166,6 @@ group1 <- grna_concordance %>% filter(status == 'Hit') %>% pull(concordance)
 group2 <- grna_concordance %>% filter(status == 'Non-hit') %>% pull(concordance)
 
 wilcox.test(group1, group2)
-```
-
-```{r}
-
-map('LH01489', function(i) {
-  
-  pheno_subset <- pheno_crincl %>% filter(feature_id == i)
-  
-  
-  
-})
-```
-
-
-```{r}
-all_counts %>% write_tsv('analysis/screen/output/revision/sgrna_sequences.tsv.gz')
 ```
 
 

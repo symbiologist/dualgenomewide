@@ -39,7 +39,7 @@ vignettes/*.pdf
 .Renviron
 
 # html files
-analysis/*.html
+*nb.html
 
 # Data directory (massive files)
 data

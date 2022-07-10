@@ -1,0 +1,172 @@
+---
+title: "Overlap epigenomic features"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Purpose
+Import peak files of epigenomics dataset into R and determine overlap with screen features
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(GenomicRanges)
+library(rtracklayer)
+library(plyranges)
+```
+
+### Load themes and functions
+```{r}
+source('analysis/universal/functions.R') # themes for all project components
+
+source('analysis/universal/themes.R') # themes for all project components
+
+theme_set(theme_publication())
+
+source('analysis/integration/scripts/functions.R') # functions for this component
+```
+
+### Directories
+```{r}
+analysis_dir <- 'analysis/epigenomics/output/02_overlap_features'
+data_dir <- 'data/epigenomics/derived'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### MACS data
+```{r}
+macs_table <- read_csv('data/epigenomics/derived/macs2/macs_table_all.csv') %>% filter(total_replicates == 1)
+macs_table
+```
+
+```{r}
+idr_table <- read_csv('data/epigenomics/derived/idr/idr_table.csv', col_names = F)
+idr_table
+```
+
+
+Read in singlicates and replicates separately
+```{r}
+single_replicates <- macs_table %>% 
+  mutate(extension = ifelse(type == 'Broad', 'broadPeak', 'narrowPeak'),
+         path = paste('macs2/', sample, '/', 'macs2_peaks.', extension, sep = '')) %>% 
+  pull(path)
+double_replicates <- idr_table %>% mutate(path = paste('idr/', X1, '.bed', sep = '')) %>% pull(path)
+```
+
+```{r}
+singlets <- set_names(file.path(data_dir, single_replicates), macs_table$sample)
+doublets <- set_names(file.path(data_dir, double_replicates), idr_table$X1)
+```
+```{r}
+read_idr <- function(path) {
+  path %>% read_tsv(col_names = F) %>% 
+    select(seqnames = X1,
+           start = X2,
+           end = X3,
+           score = X5,
+           strand = X6,
+           signal = X7,
+           pval = X8,
+           qval = X9,
+           summit = X10,
+           localIDR = X11,
+           globalIDR = X12) %>% 
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)}
+```
+
+```{r message=FALSE}
+singlet_granges <- map(singlets, function(i) {
+  imported <- import(i)
+  seqlevelsStyle(imported) <- 'UCSC'
+  imported}
+  )
+doublet_granges <- map(doublets, function(i) {
+  imported <- read_tsv(i, col_names = F) %>% 
+    select(seqnames = X1,
+           start = X2,
+           end = X3,
+           score = X5,
+           strand = X6,
+           signal = X7,
+           pval = X8,
+           qval = X9,
+           summit = X10,
+           localIDR = X11,
+           globalIDR = X12) %>% 
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+  seqlevelsStyle(imported) <- 'UCSC'
+  imported %>% filter(globalIDR > -log10(0.05))
+  
+  })
+
+epigenomics_granges <- c(singlet_granges, doublet_granges)
+```
+### Inspect and update names
+```{r}
+names(epigenomics_granges) %>% sort()
+```
+
+```{r}
+names(epigenomics_granges) <- names(epigenomics_granges) %>% str_remove('_1') %>% paste0('EpiBinary_', .)
+names(epigenomics_granges) %>% sort()
+```
+
+### Annotation and screen data
+```{r}
+screen_results <-  read_tsv('analysis/screen/output/03_neighbors/neighbor_hits.tsv.gz')
+gtf <- 'analysis/reference/output/02_unified_reference/unified_minimal.gtf'
+reference <- import(gtf)
+
+# Limit analysis to screened genes
+reference_subset <- reference %>% filter(feature_id %in% screen_results$feature_id, type == 'gene')
+reference_subset
+```
+
+Find all overlaps
+```{r}
+all_genes <- screen_results$feature_id %>% unique()
+
+epigenomics_overlap_table <- map_dfc(epigenomics_granges, function(i) {
+  overlaps <- find_overlaps(i %>% keepStandardChromosomes(pruning.mode = 'coarse'), reference_subset, maxgap = 1000)
+  overlapped_genes <- overlaps$feature_id %>% unique()
+  setNames(all_genes %in% overlapped_genes, all_genes) %>% as.numeric()
+}) %>% mutate(feature_id = all_genes) %>% 
+  select(sort(current_vars())) %>% 
+  select(feature_id, everything())
+
+epigenomics_overlap_table
+
+```
+
+Note combinations of interest
+```{r}
+epigenomics_wide <- epigenomics_overlap_table %>% 
+  mutate(EpiBinary_hESC_bivalent = ifelse(EpiBinary_hESC_H3K27ac & EpiBinary_hESC_H3K27me3, 1, 0),
+         EpiBinary_NSC_bivalent = ifelse(EpiBinary_NSC_H3K27ac & EpiBinary_NSC_H3K27me3, 1, 0))
+
+epigenomics_wide %>% filter(EpiBinary_NSC_bivalent == 1)
+```
+
+### Export
+```{r}
+epigenomics_wide %>% write_tsv(file.path(analysis_dir, 'epigenomics_wide.tsv.gz'))
+epigenomics_granges %>% write_rds(file.path(data_dir, 'epigenomics_granges.rds'), compress = 'gz')
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+
+

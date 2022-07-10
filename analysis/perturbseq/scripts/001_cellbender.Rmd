@@ -1,0 +1,104 @@
+---
+title: "Run cellbender"
+author: "David Wu"
+output: html_notebook
+---
+
+## Purpose
+Run cellbender remove background tool with custom parameters to limit imputation 
+
+## Setup
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+## Processing table
+Get cellranger cell counts for each sample
+```{r}
+library(tidyverse)
+# Pull out directories of interest
+pipestance_dir <- 'data/perturbseq/derived/pipestance'
+pipestances <- list.dirs(pipestance_dir, recursive = F) %>% str_subset('diff')
+samples <- basename(pipestances)
+names(pipestances) <- samples
+
+# sequencing summary
+metrics_summaries <- file.path(pipestances, 'outs', 'metrics_summary.csv')
+
+metrics_table <- map_dfr(metrics_summaries, function(f) {
+  read_csv(f) %>% 
+    mutate(path = f,
+           sample = basename(dirname(dirname(f))), 
+           condition = 'diff') %>% 
+    select(sample, path, everything())
+})
+
+metrics_table
+```
+
+Set up table for loop, using cellranger cell calls from each sample to filter out noisy cells 
+```{r}
+processing_table <- metrics_table %>% 
+  select(sample, path, cells = `Estimated Number of Cells`) %>% 
+  mutate(path = dirname(path))
+
+processing_table %>% write_csv('analysis/perturbseq/output/001_cellbender/processing_table.csv', col_names = FALSE)
+processing_table
+```
+
+### Install cellbender
+```{bash eval=FALSE}
+# clone 
+git clone https://github.com/broadinstitute/CellBender.git
+
+# create cellbender2 env
+conda create -n cellbender python=3.7
+
+# pytables
+conda install -c anaconda pytables
+
+# install pytorch (GPU); cuda version is 10.2
+conda install pytorch torchvision cudatoolkit=10.2 -c pytorch
+
+# install cellbender (cloned repo)
+pip install -e CellBender
+
+```
+
+### Cellbender code
+Start in project directory
+```{bash eval=FALSE}
+conda activate cellbender
+
+TOTAL=40000;
+EPOCHS=150;
+ZDIM=100; 
+ZLAYERS=500; 
+FPR=0.01;
+BASE=/media/data4/shared/ipsc_manuscript; # use full path
+PARAMS=$BASE/analysis/perturbseq/output/001_cellbender/processing_table.csv # processing file, where each row corresponds to parameters
+OUT=cellbender
+
+cd $BASE
+  
+while read -r LINE
+do
+    IFS=',' read -ra SAMPLE <<< "$LINE"
+    
+    NAME=${SAMPLE[0]}
+    DIR=${SAMPLE[1]}
+    EXPECTED=${SAMPLE[2]}
+    
+    echo $SAMPLE
+    echo $DIR
+    echo $EXPECTED
+    
+    cd $DIR
+    mkdir $OUT
+    time cellbender remove-background --input raw_feature_bc_matrix.h5 --output $OUT/cellbender.h5 --cuda --expected-cells $EXPECTED --total-droplets-included $TOTAL --epochs $EPOCHS --fpr $FPR --z-dim $ZDIM --z-layers $ZLAYERS --exclude-antibody-capture
+    
+    cd $BASE
+    
+done < $PARAMS; date; echo complete;
+```

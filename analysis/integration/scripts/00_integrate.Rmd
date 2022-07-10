@@ -1,0 +1,656 @@
+---
+title: "Integrate datasets"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+## Purpose
+Integrate genomic datasets into a master table
+
+## Setup 
+### Working directory
+#### Set working directory to project directory (ipsc_manuscript)
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file()) # /media/data4/shared/ipsc_manuscript
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(plyranges)
+library(patchwork)
+library(ggthemes)
+```
+
+### Load themes and functions
+```{r}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+
+source('analysis/screen/scripts/functions.R') # functions for this subcomponent
+
+theme_set(theme_publication())
+```
+### Load data
+#### Reference annotation
+```{r}
+unified_reference <- import('analysis/reference/output/02_unified_reference/unified_minimal.gtf') %>% select(feature_id, type, transcript_id, library) # minimal metadata for display purposes
+unified_reference
+```
+
+#### Screen results with neighbor information
+```{r, message=FALSE}
+neighbor_integration <- read_tsv('analysis/screen/output/03_neighbors/neighbor_hits.tsv.gz')
+neighbor_wide <- read_tsv('analysis/screen/output/03_neighbors/neighbor_wide.tsv.gz')
+
+neighbor_integration %>% head()
+```
+```{r}
+neighbor_wide %>% head()
+```
+
+#### Interaction and neighborhood analysis
+```{r}
+hit_pairs_all_duplicated <- read_tsv('analysis/architecture/output/01_interaction_hit_analysis/hit_pairs_all_duplicated.tsv')
+```
+
+#### Transcriptomics
+```{r}
+transcriptomics <- read_tsv('analysis/screen/output/07_transcriptomics/trascriptomics.tsv.gz')
+transcriptomics %>% head()
+```
+
+#### Epigenomics data
+```{r}
+epigenomics_wide <- read_tsv('analysis/epigenomics/output/02_overlap_features/epigenomics_wide.tsv.gz')
+epigenomics_wide %>% head()
+```
+
+#### Other external dataset of interest
+```{r}
+datasets_dir <- c('data/integration/external/bed') # mostly ENCODE, FANTOM, and additional public datasets
+
+datasets_paths <- list.files(datasets_dir, pattern = '*', full.names = TRUE)
+datasets_names <- basename(datasets_paths) %>% str_remove('.bed|.narrowPeak')
+names(datasets_paths) <- datasets_names
+datasets_paths
+```
+
+### Import external datasets
+```{r}
+dataset_list <- map(datasets_paths, function(i) {
+  print(paste0('importing ', basename(i)))
+  dataset <- import(i)
+  seqlevelsStyle(dataset) <- 'UCSC'
+  return(dataset)}
+)
+```
+
+### Functions
+```{r}
+# Find overlap between datasets, returning a GRanges with useful metadata
+overlap_datasets <- function(query,
+                             subject,
+                             metadata = 'feature_id') { 
+  
+  join_overlap_intersect(query, subject) %>% 
+    select(one_of(metadata))
+}
+```
+
+Promoter
+```{r}
+upstream <- 1000
+downstream <- 1000
+
+annotation_subset <- unified_reference %>% 
+  filter(feature_id %in% neighbor_integration$feature_id,
+         type == 'gene')
+
+promoters_of_interest <- annotation_subset %>% 
+  promoters(upstream = upstream, downstream = downstream)
+
+```
+
+## Add metadata for all files
+```{r}
+all_overlaps <- map(datasets_names, function(i) {
+  dataset_to_add <- dataset_list[[i]]
+  
+  regions_of_interest <- promoters_of_interest
+  
+  #Find overlaps with external dataset
+  overlaps <- overlap_datasets(regions_of_interest,
+                               dataset_to_add)
+  
+  #feature_id for the overlapping set
+  overlapping_features <- overlaps$feature_id %>% unique()
+  
+  # add metadata column
+  tibble('feature_id' = overlapping_features,
+         'dataset' = {{i}})
+}) %>% bind_rows()
+
+all_overlaps
+```
+
+Wide table
+```{r}
+
+## Column for FANTOM neural enhancers
+FANTOM_neural_datasets <- str_subset(datasets_names, 'astrocyte|brain|neuron')
+
+external_wide <- neighbor_integration %>% 
+  select(feature_id) %>% 
+  unique() %>% 
+  left_join(all_overlaps %>% 
+              mutate(status = 1) %>% 
+              pivot_wider(feature_id, names_from = dataset, values_from = status)) %>% 
+  replace(is.na(.), 0) %>% 
+  mutate(FANTOM5_neural = rowSums(across(one_of(FANTOM_neural_datasets))),
+         FANTOM5_neural = ifelse(FANTOM5_neural > 0, 1, 0))
+
+colnames(external_wide)[-1] <- paste0('ext_', colnames(external_wide)[-1])
+
+external_wide
+```
+
+
+### Quantitative epigenomics data
+Normalize to input
+```{r}
+epigenomics_quantitation_normalized <- read_tsv('analysis/epigenomics/output/02_quantitate/epigenomics_quantitation_normalized.tsv.gz')
+
+```
+
+## Interaction and neighborhood data
+lncRNA-coding pairs with potential regulatory relationships
+```{r}
+locus_neighborhood <- neighbor_integration %>% 
+  filter(locus_ambiguity == 'Non-ambiguous',
+         locus_type %in% c('Antisense', 'Overlapping', 'Divergent'),
+         full_status != 'Neighbor hit',
+         locus_pair_status == 'Hit') %>% 
+  select(feature_id, locus_pair, assay) %>% 
+  mutate(locus_neighborhood = 'Shared neighborhood')
+
+locus_neighborhood
+```
+
+
+```{r}
+interaction_integration <- 
+  neighbor_integration %>% 
+  left_join(locus_neighborhood) %>% 
+  mutate(locus_neighborhood = ifelse(is.na(locus_neighborhood), 'No relationship', locus_neighborhood)) %>% 
+  left_join(hit_pairs_all_duplicated %>% 
+              group_by(feature_id) %>% 
+              top_n(1, -interaction_distance)) %>% 
+  mutate(interaction_id = ifelse(is.na(interaction_id), 'None', interaction_id),
+         interaction_distance = ifelse(is.na(interaction_distance), 0, interaction_distance),
+         interaction_status = ifelse(interaction_id == 'None', 'Non-interaction', 'Interaction hit')) 
+
+interaction_integration
+```
+
+
+
+## Merge all datasets
+```{r}
+merged <- transcriptomics %>%
+  left_join(epigenomics_quantitation_normalized) %>% 
+  left_join(epigenomics_wide) %>% 
+  left_join(external_wide) 
+    
+merged
+```
+
+
+### Integrate
+
+```{r}
+master_table <- interaction_integration %>%
+  left_join(merged)
+
+master_table
+```
+### Potential enhancers
+```{r}
+potential_enhancer <- master_table %>% 
+  filter(full_status == 'Hit', 
+         ext_yosef_mpra == 1 | ext_FANTOM5_robust_enhancers == 1 | interaction_status == 'Interaction hit' | locus_neighborhood == 'Shared neighborhood') %>% 
+  pull(feature_id) %>% 
+  unique()
+
+master_table <- master_table %>% mutate(enhancer = ifelse(feature_id %in% potential_enhancer, 'Enhancer-like', 'Non-enhancer'))
+master_table %>% filter(enhancer == 'Enhancer-like', locus_ambiguity == 'Non-ambiguous') %>% group_by(library, assay, full_status) %>% tally()
+```
+
+```{r}
+master_table %>% filter(enhancer == 'Enhancer-like', locus_ambiguity == 'Non-ambiguous', library == 'lncRNA', full_status == 'Hit') %>% 
+  select(feature_id, gene_name, locus_type, locus_pair, locus_pair_status, locus_neighborhood, interaction_status, ext_yosef_mpra, ext_FANTOM5_robust_enhancers) %>% unique()
+```
+```{r}
+master_table %>% 
+  filter(library == 'lncRNA', locus_ambiguity == 'Non-ambiguous', full_status != 'Neighbor hit', assay == 'Differentiation', locus_pair_status == 'Hit') %>% 
+  group_by(full_status) %>% tally()
+```
+
+## Join wide tables and add variable for overlapping genes
+```{r}
+basic_metadata <- master_table %>% 
+  select(feature_id,
+         gene_name,
+         library,
+         primary_pheno,
+         locus_ambiguity,
+         locus_type,
+         locus_pair,
+         locus_distance,
+         locus_cor,
+         enhancer,
+         contains('neighbor_gene')) %>% 
+  unique() 
+
+basic_metadata
+```
+
+
+```{r}
+basic_columns <- colnames(basic_metadata) %>% setdiff('feature_id')
+
+basic_columns
+```
+
+```{r}
+dataset_columns <- colnames(merged) %>% setdiff('feature_id')
+```
+
+```{r}
+differentiation <- master_table %>% 
+  filter(assay == 'Differentiation') %>% 
+  select(-one_of(basic_columns),
+         -one_of(dataset_columns),
+         -assay) 
+
+colnames(differentiation)[-1] <- paste0('diff_', colnames(differentiation)[-1])
+differentiation
+```
+
+
+```{r}
+proliferation <- master_table %>% 
+  filter(assay == 'Proliferation') %>% 
+  select(-one_of(basic_columns),
+         -one_of(dataset_columns),
+         -assay) 
+
+colnames(proliferation)[-1] <- paste0('prol_', colnames(proliferation)[-1])
+proliferation
+```
+
+
+```{r}
+neighbor_wide <- basic_metadata %>% 
+  left_join(differentiation) %>% 
+  left_join(proliferation) %>% 
+  mutate(primary_pheno = case_when( # resolve dual neighbor hits
+    primary_pheno == 'Dual' & diff_full_status == 'Hit' & prol_full_status == 'Neighbor hit' ~ 'Differentiation',
+    primary_pheno == 'Dual' & diff_full_status == 'Neighbor hit' & prol_full_status == 'Hit' ~ 'Differentiation',
+    TRUE ~ primary_pheno),
+    neighbor_overall_status = case_when(
+      primary_pheno == 'Differentiation' & diff_full_status == 'Neighbor hit' ~ 'Neighbor hit',
+      primary_pheno == 'Proliferation' & prol_full_status == 'Neighbor hit' ~ 'Neighbor hit',
+      primary_pheno == 'Dual' & diff_full_status == 'Neighbor hit' & prol_full_status == 'Neighbor hit' ~ 'Neighbor hit',
+      primary_pheno == 'Dual' & prol_full_status == 'Neighbor hit' ~ 'Neighbor hit',
+      primary_pheno == 'None' ~ 'Non-hit',
+      TRUE ~ 'Non-neighbor')) %>% 
+  select(feature_id, 
+         gene_name, 
+         library, 
+         primary_pheno, 
+         locus_ambiguity, 
+         locus_type, 
+         locus_pair, 
+         locus_distance,
+         locus_cor,
+         locus_pair_diff_status = diff_locus_pair_status,
+         locus_pair_diff_pheno = diff_locus_pair_pheno,
+         locus_pair_prol_status = prol_locus_pair_status,
+         locus_pair_prol_pheno = prol_locus_pair_pheno,
+         starts_with('diff_'), starts_with('prol'), everything())
+  
+neighbor_wide
+```
+
+```{r}
+master_wide <- basic_metadata %>% 
+  left_join(differentiation) %>% 
+  left_join(proliferation) %>% 
+  left_join(merged) %>% 
+  mutate(
+    primary_pheno = case_when( # resolve dual neighbor hits
+      diff_full_status == 'Hit' & prol_full_status == 'Neighbor hit' ~ 'Differentiation',
+      diff_full_status == 'Neighbor hit' & prol_full_status == 'Hit' ~ 'Proliferation',
+      TRUE ~ primary_pheno),
+    neighbor_overall_status = case_when(
+      primary_pheno == 'Differentiation' & diff_full_status == 'Neighbor hit' ~ 'Neighbor hit',
+      primary_pheno == 'Proliferation' & prol_full_status == 'Neighbor hit' ~ 'Neighbor hit',
+      primary_pheno == 'Dual' & diff_full_status == 'Neighbor hit' & prol_full_status == 'Neighbor hit' ~ 'Neighbor hit',
+      primary_pheno == 'Dual' & prol_full_status == 'Neighbor hit' ~ 'Neighbor hit',
+      primary_pheno == 'None' ~ 'Non-hit',
+      TRUE ~ 'Non-neighbor')) %>% 
+  mutate(overlap = ifelse(neighbor_gene_distance > 1000, 'Non-overlap', 'Overlap'),
+         interaction_status = ifelse(diff_interaction_status == 'Interaction hit' | prol_interaction_status == 'Interaction hit', 'Interaction hit', 'Non-interaction'),
+         locus_neighborhood = ifelse(diff_locus_neighborhood == 'Shared neighborhood' | prol_locus_neighborhood == 'Shared neighborhood', 'Yes', 'No')) %>% 
+  select(feature_id, all_of(basic_columns), starts_with('locus'), starts_with('neighbor'), interaction_status, everything())
+
+master_wide 
+
+```
+
+
+
+## Export
+```{r}
+external_wide %>% write_tsv('analysis/integration/output/00_integrate/external_wide.tsv.gz')
+external_wide %>% select(feature_id, contains('ENCODE')) %>% write_tsv('analysis/integration/output/00_integrate/encode_wide.tsv.gz')
+external_wide %>% select(feature_id, contains('FANTOM5_u_'), contains('FANTOM5_robust')) %>% write_tsv('analysis/integration/output/00_integrate/fantom_wide.tsv.gz')
+
+# minimal table
+master_minimal <- master_wide %>% 
+  select(-starts_with('txn'),
+         -starts_with('Epi'),
+         -starts_with('ext'))
+
+master_minimal %>% write_tsv('analysis/integration/output/00_integrate/master_minimal.tsv.gz')
+master_minimal %>% write_tsv('/media/data4/shared/neural_induction_webapp/shiny/data/master.tsv') # webapp
+
+
+master_table %>% write_tsv('analysis/integration/output/00_integrate/master_long.tsv.gz')
+master_wide %>% write_tsv('analysis/integration/output/00_integrate/master_wide.tsv.gz')
+
+```
+
+```{r}
+enrich_subset <- master_wide %>% 
+  select(feature_id, library, primary_pheno, neighbor_overall_status, dataset = ext_lu_gwas_loop_all) %>% 
+  filter(neighbor_overall_status != 'Neighbor hit')
+
+enrich_subset
+```
+```{r}
+
+enrich <- map(c('Coding', 'lncRNA'), function(which_library) {
+  map(c('Differentiation', 'Dual', 'Proliferation'), function(which_pheno) {
+    
+    
+      data_subset <- enrich_subset %>% filter(library == which_library,
+                                              primary_pheno == which_pheno)
+      
+    
+    
+      features_of_interest_case <- data_subset %>% pull(feature_id)
+      features_of_interest_all <- enrich_subset %>% filter(library == which_library) %>% pull(feature_id)
+      overlapping_features <- enrich_subset %>% filter(dataset == 1) %>% pull(feature_id)
+      
+      #Test enrichment for hits
+      enrichment_results <- enrichment_test(list1 = features_of_interest_case,
+                                            list2 = overlapping_features,
+                                            cat1 = c('Hit', 'Non-hit'),
+                                            cat2 = c('Overlap', 'Non-overlap'),
+                                            background = features_of_interest_all,
+                                            print = FALSE)
+      
+      double_positive_features <- intersect(features_of_interest_case,
+                                            overlapping_features)
+      
+      tibble(library = which_library,
+             primary_pheno = which_pheno,
+             odds_ratio = enrichment_results$fisher$estimate,
+             pvalue = enrichment_results$fisher$p.value,
+             n_overlaps = double_positive_features %>% n_distinct())
+      
+      
+      
+  }) %>% bind_rows()
+  
+}) %>% bind_rows() %>% 
+  mutate(padj = round(p.adjust(pvalue), 3),
+         pval = round(pvalue, 3))
+
+enrich
+
+  
+```
+
+### Potential enhancer tally 
+```{r}
+enhancer_tally <- master_wide %>% 
+  filter(enhancer == 'Enhancer-like',
+         library == 'Coding' | locus_ambiguity == 'Non-ambiguous',
+         neighbor_overall_status == 'Non-neighbor') 
+
+enhancer_tally %>% group_by(library) %>% tally()
+```
+
+
+#### Differentiation
+#### lncRNA
+```{r}
+data_subset <- master_wide %>% filter(locus_ambiguity == 'Non-ambiguous', library == 'lncRNA', diff_full_status == 'Hit')
+lncrna_nonneighbor_hits <- data_subset %>% filter(diff_full_status == 'Hit', locus_ambiguity == 'Non-ambiguous', library == 'lncRNA') %>% pull(feature_id)
+fantom_enhancer_lncrnas <- data_subset %>% filter(ext_FANTOM5_robust_enhancers == 1) %>% pull(feature_id)
+fantom_neural_lncrnas <- data_subset %>% filter(ext_FANTOM5_neural == 1) %>% pull(feature_id) 
+yosef_enhancer_lncrnas <- data_subset %>% filter(ext_yosef_mpra == 1) %>% pull(feature_id) 
+lncrna_hit_interactors <- data_subset %>% filter(interaction_status == 'Interaction hit') %>% pull(feature_id)
+lncrna_shared_neighborhood <- data_subset %>% filter(diff_locus_neighborhood == 'Shared neighborhood') %>% pull(feature_id) 
+```
+
+
+```{r}
+library(eulerr)
+
+venn_colors <- c('#F29191', # pink
+                 '#F24141', # red
+                 '#F2B035', # orange
+                 '#166B8C', # blue
+                 '#26A699' # teal
+                 )
+
+p <- plot(euler(list('Interaction' = lncrna_hit_interactors,
+                     'Neighborhood' = lncrna_shared_neighborhood,
+                     'MPRA' = yosef_enhancer_lncrnas,
+                     'FANTOM5 all' = fantom_enhancer_lncrnas,
+                     'FANTOM5 neural' = fantom_neural_lncrnas)),
+          fill = venn_colors,
+          alpha = 0.7,
+          quantities = TRUE)
+
+pdf(file = 'figures/integration/cis_venn_lncrna_diff.pdf')
+p
+dev.off()
+p
+
+```
+Include full set
+```{r}
+p <- plot(euler(list('Interaction' = lncrna_hit_interactors,
+                     'Neighborhood' = lncrna_shared_neighborhood,
+                     'MPRA' = yosef_enhancer_lncrnas,
+                     'FANTOM5 all' = fantom_enhancer_lncrnas,
+                     'FANTOM5 neural' = fantom_neural_lncrnas,
+                     'Non-enhancer hits' = lncrna_nonneighbor_hits)),
+          fill = venn_colors,
+          alpha = 0.7,
+          quantities = TRUE)
+
+pdf(file = 'figures/integration/cis_venn_lncrna_diff_full.pdf')
+p
+dev.off()
+p
+```
+
+
+#### Coding
+```{r}
+data_subset <- master_wide %>% filter(library == 'Coding', diff_status == 'Hit')
+coding_nonneighbor_hits <- data_subset %>% pull(feature_id)
+fantom_enhancer_coding <- data_subset %>% filter(ext_FANTOM5_robust_enhancers == 1) %>% pull(feature_id)
+fantom_neural_coding <- data_subset %>% filter(ext_FANTOM5_neural == 1) %>% pull(feature_id) 
+yosef_enhancer_coding <- data_subset %>% filter(ext_yosef_mpra == 1) %>% pull(feature_id) 
+coding_hit_interactors <- data_subset %>% filter(interaction_status == 'Interaction hit') %>% pull(feature_id)
+coding_shared_neighborhood <- data_subset %>% filter(diff_locus_neighborhood == 'Shared neighborhood') %>% pull(feature_id) 
+```
+
+```{r}
+
+p <- plot(euler(list('Interaction' = coding_hit_interactors,
+                     'Neighborhood' = coding_shared_neighborhood,
+                     'MPRA' = yosef_enhancer_coding,
+                     'FANTOM5 all' = fantom_enhancer_coding,
+                     'FANTOM5 neural' = fantom_neural_coding)),
+          fill = venn_colors,
+          alpha = 0.7,
+          quantities = TRUE)
+
+pdf(file = 'figures/integration/cis_venn_coding_diff.pdf')
+p
+dev.off()
+p
+
+```
+```{r}
+UpSetR::fromList(list('Interaction' = coding_hit_interactors,
+                     'Neighborhood' = coding_shared_neighborhood,
+                     'MPRA' = yosef_enhancer_coding,
+                     'FANTOM5 all' = fantom_enhancer_coding,
+                     'FANTOM5 neural' = fantom_neural_coding, 
+                     'Non-enhancer hits' = coding_nonneighbor_hits
+                     )) %>% upset()
+```
+
+Full set
+```{r}
+p <- plot(euler(list('Interaction' = coding_hit_interactors,
+                     'Neighborhood' = coding_shared_neighborhood,
+                     'MPRA' = yosef_enhancer_coding,
+                     'FANTOM5 all' = fantom_enhancer_coding,
+                     'FANTOM5 neural' = fantom_neural_coding,
+                     'Non-enhancer hits' = coding_nonneighbor_hits)),
+          fill = venn_colors,
+          alpha = 0.7,
+          quantities = TRUE)
+
+pdf(file = 'figures/integration/cis_venn_coding_diff_full.pdf')
+p
+dev.off()
+p
+```
+
+```{r}
+enrich_subset <- master_table %>% 
+  filter(assay == 'Differentiation',
+         full_status != 'Neighbor hit',
+         locus_ambiguity == 'Non-ambiguous') %>% 
+  select(feature_id, library, pheno, full_status, locus_type, locus_pair_status)
+
+enrich_subset
+```
+
+
+```{r}
+enrichment <- map(c('Coding', 'lncRNA'), function(which_library) {
+  map(c('Antisense', 'Overlapping', 'Divergent'), function(which_type) {
+    
+      hits <- enrich_subset %>% filter(library == which_library, full_status == 'Hit') %>% pull(feature_id)  
+      locus_subset <- enrich_subset %>% filter(library == which_library, locus_type == which_type, locus_pair_status == 'Hit') %>% pull(feature_id) 
+      
+      universe <- enrich_subset %>% filter(library == which_library) %>% pull(feature_id) %>% unique()
+      
+      
+      
+      #Test enrichment for hits
+      enrichment_results <- enrichment_test(list1 = hits,
+                                            list2 = locus_subset,
+                                            cat1 = c('Hit', 'Non-hit'),
+                                            cat2 = c('Overlap', 'Non-overlap'),
+                                            background = universe,
+                                            print = FALSE)
+      
+      double_positive_features <- intersect(hits,
+                                            locus_subset)
+      
+      tibble(library = which_library,
+             locus_type = which_type,
+             odds = enrichment_results$fisher$estimate,
+             conf1 = enrichment_results$fisher$conf.int[1],
+             conf2 = enrichment_results$fisher$conf.int[2],
+             pvalue = enrichment_results$fisher$p.value,
+             n_overlaps = double_positive_features %>% n_distinct(),
+             n_hits = length(hits),
+             n_features = length(locus_subset),
+             f_hits = round(n_overlaps/n_hits, 3))
+      
+  }) %>% bind_rows()
+}) %>% bind_rows() %>% 
+  mutate(padj = p.adjust(pvalue))
+
+enrichment
+```
+```{r}
+data_input <- master_table %>% 
+  filter(assay == 'Differentiation',
+         full_status != 'Neighbor hit',
+         locus_ambiguity == 'Non-ambiguous') %>% 
+  select(feature_id, library, full_status, locus_type, locus_pair_status)
+
+  
+group_totals <- 
+  data_input %>% 
+  group_by(library, full_status) %>% 
+  tally(name = 'total')
+
+group_totals
+```
+
+```{r}
+subgroup_totals <- 
+  data_input %>% 
+  group_by(library, locus_type, full_status, locus_pair_status) %>% 
+  tally() %>% 
+  left_join(group_totals) %>% 
+  mutate(f = round(n/total, 3) * 100)
+
+subgroup_totals %>% filter(locus_pair_status == 'Hit')
+```
+
+```{r}
+enrich_to_plot <- enrichment %>% 
+  filter(locus_type == 'Antisense')
+
+p <- enrich_to_plot %>% 
+  ggplot(aes(x = library,
+             y = odds)) +
+  geom_bar(stat = 'identity',
+           fill = 'grey90',
+           color = 'grey50') + 
+  geom_errorbar(aes(ymin = conf1,
+                    ymax = conf2),
+                width = 0.2) +
+  #ylim(c(0, 9)) + 
+  geom_hline(yintercept = 1, linetype = 'dashed', color = 'grey20') +
+  labs(x = '',
+       y = 'Odds')
+
+p
+```
+
+## Session info
+```{r}
+sessionInfo()
+```

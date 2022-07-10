@@ -1,0 +1,164 @@
+---
+title: "Perturb-Seq data processing"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+## Purpose
+Process Perturb-Seq data using cellranger count pipeline
+
+## Set up
+### Set working directory to project directory
+```{r setup, include=FALSE}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Directories
+```{r}
+analysis_dir <- 'analysis/perturbseq/output/000_process'
+data_dir <- 'data/perturbseq'
+dir.create(analysis_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(plyranges)
+```
+
+### fastqc
+```{bash eval=FALSE}
+time fastqc -t 40 fastq/*.fastq.gz -o fastqc
+```
+
+### Trim R1 to 28 and R2 to 100 
+```{bash eval=FALSE}
+RAM=24; #ram per job; use no more than 300 GB in total (for 20 concurrent jobs, this should be set to 300 / 20 = 15)
+THREADS=6; #threads per sample; use no more than available threads
+JOBS=12; #number of concurrent jobs; will pull a job from the queue as soon as a job completes
+EXT=fastq.gz
+
+for SAMPLE in `find round2 -type f -name *R2_001.${EXT} | sed 's!.*/!!' | sed s/.${EXT}//g | sort -u`; do
+echo Running ${SAMPLE}
+sem -j ${JOBS} -k time /home/software/bbmap/bbduk.sh threads=${THREADS} -Xmx${RAM}g -ftr=99 zl=6 pigz ordered in=round2/${SAMPLE}.${EXT} out=bbduk/${SAMPLE}.${EXT} &> bbduk/${SAMPLE}.log
+done; sem --wait; echo 'All Jobs Complete'; 
+
+for SAMPLE in `find round2 -type f -name *R1_001.${EXT} | sed 's!.*/!!' | sed s/.${EXT}//g | sort -u`; do
+echo Running ${SAMPLE}
+sem -j ${JOBS} -k time /home/software/bbmap/bbduk.sh threads=${THREADS} -Xmx${RAM}g -ftr=27 zl=6 pigz ordered in=round2/${SAMPLE}.${EXT} out=bbduk/${SAMPLE}.${EXT} &> bbduk/${SAMPLE}.log
+done; sem --wait; echo 'All Jobs Complete'; 
+
+## Check these files with fastqc and then move to fastq folder
+```
+
+## Prepare tables
+Follow 10x cellranger instructions for processing (https://support.10xgenomics.com/single-cell-gene-expression/software/pipelines/latest/using/feature-bc-analysis)
+
+### Set up 10x library table
+```{r}
+fastq_dir <- file.path(data_dir, 'raw', 'fastq')
+sample_names <- list.files(fastq_dir) %>% str_remove(pattern = '_S.*$') %>% unique()
+
+libraries <- tibble(fastqs = file.path('/media/data4/shared/ipsc_manuscript', fastq_dir), # full path must be given
+                    sample = sample_names,
+                    library_type = ifelse(str_detect(sample, 'gene'), 
+                                          'Gene Expression',
+                                          'CRISPR Guide Capture'))
+libraries
+```
+
+Each run must have its own library file; separate into groups
+```{r}
+libraries_augmented <- libraries %>% 
+  separate(sample, into = c('condition', 'type', 'replicate'), remove = FALSE) %>% 
+  mutate(group = paste(condition, replicate, sep = '_'))
+libraries_augmented
+```
+
+Write library file for each group
+```{r}
+pipestance_dir <- file.path(data_dir, 'derived', 'pipestance')
+dir.create(pipestance_dir, showWarnings = FALSE, recursive = TRUE)
+
+map(libraries_augmented$group %>% unique(), function(i) {
+  libraries_subset <- libraries_augmented %>% filter(group == i) %>% select(fastqs, sample, library_type)
+  libraries_subset %>% write_csv(paste0(pipestance_dir, '/', i, '_libraries.csv'))
+})
+```
+
+### Set up features file
+```{r}
+features <- read_csv('analysis/perturbseq/input/perturbseq_features.csv')
+
+features 
+```
+Read annotation table from unified reference
+```{r}
+unified_cellranger <- import('data/reference/derived/unified_cellranger/genes/genes.gtf')
+unified_cellranger
+```
+
+Pull feature_ids to double check
+```{r}
+unified_feature_ids <- unified_cellranger@elementMetadata %>% as_tibble() %>% pull(feature_id) %>% unique()
+```
+
+Ensure target gene names match feature_ids from reference
+```{r}
+target_gene_names <- features$target_gene_name %>% unique() # 240 targets excluding controls
+
+intersect(unified_feature_ids, target_gene_names) %>% n_distinct()
+```
+
+Ensure correct column order
+```{r}
+features_output <- features %>% 
+  select(id, 
+         name,
+         read,
+         pattern,
+         sequence,
+         feature_type,
+         target_gene_id,
+         target_gene_name)
+
+features_output
+```
+### Export
+```{r}
+features_output %>% write_csv(file.path(pipestance_dir, 'features.csv'))
+```
+
+### cellranger
+Run on terminal with cellranger 4.0, start in project directory
+```{bash eval=FALSE}
+OUTPUT=data/perturbseq/derived/pipestance; # output_directory
+REF=/media/data4/shared/ipsc_manuscript/data/reference/derived/unified_cellranger # custom reference, supply full path
+MEM=64;
+CORES=20;
+cd ${OUTPUT};
+
+for SAMPLE in `find . -type f -name  '*libraries.csv' | sed 's/_libraries.csv//g' | sed 's|^./||' | sort -u`; 
+do
+echo $SAMPLE
+time cellranger count --id=${SAMPLE} \
+                      --libraries=${SAMPLE}_libraries.csv \
+                      --feature-ref=features.csv \
+                      --transcriptome=${REF} \
+                      --localmem=${MEM} \
+                      --localcores=${CORES} \
+                      --nosecondary &
+done 
+# took about 48 hours
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+

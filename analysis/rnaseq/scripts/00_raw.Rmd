@@ -1,0 +1,74 @@
+---
+title: "Organize raw data"
+author: "David Wu"
+output: html_notebook
+---
+
+Set working directory to project directory
+```{r setup, include=FALSE}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+Output directory
+```{r}
+output_dir <- 'analysis/rnaseq/output/00_raw'
+data_dir <- 'data/rnaseq/raw/fastq'
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+Load libraries
+```{r, echo=FALSE, message=FALSE}
+library(tidyverse)
+```
+
+Collect all sequencing files and move to data folder (data/rnaseq/raw/fastq/)
+```{r}
+# original data directory
+original_dir <- '/media/data4/dwu/induction_rna_seq/data' 
+original_files <- list.files(original_dir, pattern = '*.fq.gz', recursive = TRUE, full.names = TRUE)
+
+# set up file table
+fastq_table <- tibble(Path = original_files) %>%
+  mutate(Condition = ifelse(str_detect(Path, 'DWU22'), 'Total', 'polyA'), # DWU22 is total RNA-Seq
+         Sample = basename(Path) %>% str_remove_all('induction_') %>% str_to_upper(), # Standardize file names
+         Run = ifelse(str_detect(Path, 'DWU17'), 'Run2', 'Run1')) %>% # DWU17 is resequencing of DWU14; mark as Run 2
+  separate(Sample, into = c('Day', 'Replicate', NA)) %>% # metadata
+  mutate(Replicate = paste('Rep', str_remove(Replicate, 'R'), sep = ''),  # Standardize file names
+         Sample = paste(Day, Condition, Replicate, sep = '_'),
+         Name = paste(Sample, Run, sep = '_'),
+         Output = paste(data_dir, '/', Name, '.fq.gz', sep = '')) 
+
+fastq_table
+```
+Sequencing table for loop
+```{r}
+fastq_table %>% write_csv(file.path(output_dir, 'fastq_table.csv'))
+fastq_table %>% select(Name, Path, Output) %>% write_csv(file.path(output_dir, 'fastq_table_for_loop.csv'), col_names = F)
+```
+
+Move/copy fastq files to in data/rnaseq/raw/fastq
+
+Run bash loop to copy files
+```{bash}
+while read -r LINE
+do
+    (IFS=',' read -ra SAMPLE <<< "$LINE"
+    
+    NAME=${SAMPLE[0]}
+    INPUT=${SAMPLE[1]}
+    OUTPUT=${SAMPLE[2]}
+    
+    echo $NAME
+    rsync -avh --info=progress2 $INPUT $OUTPUT
+    )
+
+done < analysis/rnaseq/output/00_raw/fastq_table_for_loop.csv;
+
+```
+
+```{r}
+sessionInfo()
+```
+

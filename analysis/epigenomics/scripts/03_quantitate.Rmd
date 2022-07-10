@@ -1,0 +1,141 @@
+---
+title: "Quantitate ChIP-Seq Signal"
+output: html_notebook
+---
+
+## Purpose
+Obtain quantitative ChIP-Signal (opposed to peak overlaps)
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+
+theme_set(theme_publication())
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/epigenomics/output/03_quantitate' # analysis file output directory
+data_dir <- 'data/epigenomics/derived/' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(plyranges)
+library(Rsubread)
+```
+
+### Import GTF
+```{r}
+unified_gtf <- import('analysis/reference/output/02_unified_reference/unified_minimal.gtf.gz')
+
+unified_gtf
+```
+
+### Obtain promoters
+```{r}
+promoter_gtf <- unified_gtf %>% 
+  filter(type == 'gene') %>% 
+  promoters(upstream = 1000,
+            downstream = 1000)
+
+promoter_gtf
+```
+
+
+```{r}
+promoter_gtf_path <- file.path(analysis_dir, 'unified_promoters.gtf')
+promoter_gtf %>% export(promoter_gtf_path)
+```
+
+## Quantitate promoter regions
+```{r eval=FALSE}
+bam_dir <- file.path(data_dir, 'bam_merge')
+bam_files <- list.files(bam_dir, 
+                        pattern = '.bam$', 
+                        full.names = TRUE)
+
+pe <- FALSE
+strand <- 0
+gtf <- TRUE
+feature <- 'gene'
+threads <- 16
+autosort <- FALSE
+multi <- FALSE
+fraction <- TRUE
+
+epigenomics_quantitation_fc <- featureCounts(files = bam_files,
+                                       annot.ext = promoter_gtf_path, 
+                                       isGTFAnnotationFile = gtf, 
+                                       isPairedEnd = pe, 
+                                       GTF.attrType = 'feature_id',
+                                       GTF.featureType = feature, 
+                                       strandSpecific = strand,
+                                       nthreads = threads, 
+                                       autosort = autosort,
+                                       allowMultiOverlap = TRUE,
+                                       countMultiMappingReads = multi, 
+                                       fraction = fraction)
+
+epigenomics_quantitation_fc %>% write_rds(file.path(analysis_dir, 'epigenomics_quantitation_fc.rds'))
+```
+
+### Convert to table
+```{r}
+epigenomics_quantitation <- epigenomics_quantitation_fc$counts %>% as.data.frame() %>% rownames_to_column('feature_id') %>% as_tibble()
+colnames(epigenomics_quantitation) <- colnames(epigenomics_quantitation) %>% str_remove('.bam') %>% str_replace('\\.', '_')
+```
+
+### Normalize to input
+```{r}
+epigenomics_long <- epigenomics_quantitation %>% 
+  pivot_longer(cols = -feature_id,
+               names_to = 'sample',
+               values_to = 'count') %>% 
+  separate(sample, into = c('condition', 'target'))
+
+epigenomics_input <- epigenomics_long %>% 
+  filter(target == 'input') %>% 
+  select(feature_id, condition, input = count)
+
+epigenomics_normalized <- epigenomics_long %>% 
+  filter(target != 'input') %>% 
+  left_join(epigenomics_input) %>% 
+  mutate(normalized = count/input,
+         sample = paste(condition, target, sep = '_'))
+
+epigenomics_normalized_wide <- epigenomics_normalized %>% 
+  select(feature_id, sample, normalized) %>% 
+  pivot_wider(names_from = sample,
+              values_from = normalized)
+
+colnames(epigenomics_normalized_wide)[-1] <- paste0('epi_', colnames(epigenomics_normalized_wide)[-1])
+epigenomics_normalized_wide
+```
+
+## Export
+```{r}
+epigenomics_quantitation %>% write_tsv(file.path(analysis_dir, 'epigenomics_quantitation.tsv.gz'))
+
+epigenomics_normalized_wide %>% write_tsv(file.path(analysis_dir, 'epigenomics_quantitation_normalized.tsv.gz'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

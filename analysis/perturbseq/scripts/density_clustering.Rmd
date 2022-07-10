@@ -1,0 +1,504 @@
+---
+title: "Perturbation diversity"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Analyze diverse perturbation effects
+
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Output directory
+```{r}
+analysis_dir <- 'analysis/perturbseq/output/density_clustering'
+figures_dir <- 'figures/perturbseq'
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(figures_dir, showWarnings = FALSE)
+```
+
+
+```{r}
+library(pheatmap)
+library(cluster)
+library(factoextra)
+```
+
+### Load files
+```{r}
+## -------------------------------------------------------------------------------------------------------
+DIR <- 'analysis/perturbseq/output/data_export/'
+pca_file <- 'pca_coordinates.tsv.gz'
+umap_file <- 'umap_coordinates.tsv.gz'
+meta_file <- 'coordinate_metadata.tsv.gz'
+dr <- list('pca' = read_tsv(file.path(DIR, pca_file)),
+           'umap' = read_tsv(file.path(DIR, umap_file)))
+           
+meta <- read_tsv(file.path(DIR, meta_file))
+```
+
+
+### Import density tables
+```{r}
+density_cluster_coordinates <- read_tsv('analysis/perturbseq/output/cell_states/density_cluster_coordinates.tsv.gz')
+```
+
+
+```{r}
+compare_densities <- function(target1, 
+                              target2,
+                              coordinates) {
+  
+  coordinates <- coordinates %>% drop_na()
+  
+  target1_subset <- coordinates %>% filter(target == target1) %>% mutate(target1 = TRUE) %>% select(x, y, target1) %>% unique()
+  target2_subset <- coordinates %>% filter(target == target2) %>% mutate(target2 = TRUE) %>% select(x, y, target2) %>% unique()
+  
+  target_join <- full_join(target1_subset, target2_subset, by = c('x', 'y'))
+  
+  coordinates_union <- nrow(target_join)
+  coordinates_intersect <- nrow(target_join %>% filter(target1, target2))
+  
+  tibble('target1' = target1,
+         'target2' = target2,
+         'jaccard' = coordinates_intersect/coordinates_union,
+         'target1_overlap' = coordinates_intersect/nrow(target1_subset),
+         'target2_overlap' = coordinates_intersect/nrow(target2_subset))
+}
+### Merged cluster visualization
+merged_cluster_plot <- function(coordinates,
+                                hc_cluster = NULL,
+                                background_data = dr$umap,
+                                print_plot = FALSE,
+                                point_size = 0.5,
+                                point_alpha = 0.5,
+                                point_color = 'dodgerblue4',
+                                plot_background = TRUE,
+                                downsample_points = 0.2, # if plotting points, downsample to this fraction for computational efficiency
+                                background_point_alpha = 0.1, 
+                                background_point_size = 1,
+                                background_point_color = 'grey90',
+                                plot_labels = TRUE,
+                                label_size = 5) {
+  
+  coordinates_subset <- coordinates %>% filter(hc_cluster == {{hc_cluster}}) %>% select(x, y, hc_cluster) %>% unique()
+  
+  x_range <- range(background_data$UMAP_1)
+  y_range <- range(background_data$UMAP_2)
+  
+  p <- coordinates_subset %>% 
+    ggplot(aes(x = x,
+               y = y))
+  
+  if(plot_background) {
+    p <- p +
+      geom_point(data = background_data %>% sample_frac(downsample_points),
+                 inherit.aes = FALSE,
+                 aes(x = UMAP_1,
+                     y = UMAP_2),
+                 color = background_point_color,
+                 size = background_point_size,
+                 alpha = background_point_alpha)
+  }
+  
+  p <- p +
+    geom_point(size = point_size,
+               alpha = point_alpha,
+               color = point_color) +
+    xlim(x_range) +
+    ylim(y_range) +
+    scale_color_carto_d() +
+    theme(legend.position = 'none',
+          axis.line = element_blank(),
+          panel.border = element_rect(color = 'black', fill = 'transparent'),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 12, hjust = 0.5, face = 'plain')) +
+    ggtitle(paste('Cluster', hc_cluster))
+    
+    if(plot_labels) {
+      centers <- coordinates_subset %>% dplyr::group_by(hc_cluster) %>% dplyr::summarize(x = median(x), y = median(y))
+      p <- p + shadowtext::geom_shadowtext(data = centers, aes(x = x, y = y, label = hc_cluster), color = 'white', size = label_size, bg.color = 'black')
+    }
+    
+    p
+}
+```
+
+
+
+```{r}
+all_targets <- meta %>% filter(library == 'Coding' | locus_ambiguity == 'Non-ambiguous') %>% pull(guide_target) %>% unique()
+pairwise_table <- crossing('target1' = all_targets,
+                           'target2' = all_targets)
+pairwise_table
+```
+```{r}
+tic()
+pairwise_similarity <- mclapply(1:nrow(pairwise_table),
+                                mc.cores = 72,
+                                function(i) {
+                                  
+                                  pair_subset <- pairwise_table[i,]
+                                  target1 <- pair_subset$target1
+                                  target2 <- pair_subset$target2
+                                  
+                                  target_overlap <- compare_densities(target1 = target1,
+                                                               target2 = target2,
+                                                               coordinates = density_cluster_coordinates)
+                                  
+                                  target_overlap
+                                  
+                                }) %>% 
+  bind_rows() %>% 
+  rowwise() %>% 
+  mutate(max_overlap = max(target1_overlap, target2_overlap),
+         min_overlap = min(target1_overlap, target2_overlap)) 
+pairwise_similarity %>% write_rds(file.path(analysis_dir, 'pairwise_similarity.rds'))
+toc()
+```
+```{r}
+pairwise_similarity %>% filter(target1 != target2) %>% head()
+```
+
+
+```{r}
+target_subset <- meta %>% filter(library == 'Coding' | locus_ambiguity == 'Non-ambiguous', diff_hit_direction != 'Non-hit', diff_full_status != 'Neighbor hit') %>%
+  pull(guide_target) %>% unique()
+wide_input <- pairwise_similarity %>% 
+  select(target1, target2, similarity = jaccard) %>% 
+  filter(target1 %in% target_subset,
+         target2 %in% target_subset)
+pairwise_wide <- wide_input %>% 
+  pivot_wider(names_from = 'target2',
+              values_from = 'similarity') %>% 
+  column_to_rownames('target1')
+```
+
+### For figure
+```{r}
+output_dir <- file.path(analysis_dir, 'target_heatmap')
+dir.create(output_dir, showWarnings = F)
+
+ph <- pheatmap(pairwise_wide,
+               clustering_distance_cols = 'correlation',
+               clustering_distance_rows = 'correlation',
+               clustering_method = 'ward.D',
+               border_color = NA,
+               height = 12,
+               width = 12,
+               color = colorRampPalette(colors = c('white', 'darkorchid4'))(100),
+               #filename = file.path(figures_dir, 'heatmap.pdf'),
+               fontsize = 6)
+```
+
+### Merge and cluster states
+```{r}
+wide_input %>% 
+  filter(target1 != target2,
+         similarity > 0.5)
+```
+```{r}
+target_state_table <- density_cluster_coordinates %>% 
+  filter(target %in% all_targets) %>% 
+  drop_na() %>% 
+  select(target, cluster) %>% 
+  mutate(target_cluster = paste(target, cluster, sep = '_')) %>% 
+  unique()
+target_state_table
+```
+```{r}
+target_state_pairs <- crossing('target_cluster_1' = target_state_table$target_cluster,
+                               'target_cluster_2' = target_state_table$target_cluster) %>% 
+  separate(target_cluster_1, into = c('target1', 'cluster1'), sep = '_') %>% 
+  separate(target_cluster_2, into = c('target2', 'cluster2'), sep = '_')
+target_state_pairs
+```
+
+```{r eval=FALSE}
+tic()
+target_state_similarity <- mclapply(1:nrow(target_state_pairs),
+                                    mc.cores = 76,
+                                    function(i) {
+                                      
+                                      pair_subset <- target_state_pairs[i,]
+                                      
+                                      target1 <- pair_subset$target1
+                                      cluster1 <- pair_subset$cluster1
+                                      target2 <- pair_subset$target2
+                                      cluster2 <- pair_subset$cluster2
+                                      
+                                      if(target1 == target2) {
+                                        
+                                        if(cluster1 == cluster2) {
+                                          
+                                          target_overlap = tibble(target1 = target1,
+                                                                  cluster1 = cluster1,
+                                                                  target2 = target2,
+                                                                  cluster2 = cluster2,
+                                                                  jaccard = 1,
+                                                                  target1_overlap = 1,
+                                                                  target2_overlap = 1)
+                                          
+                                        } else {
+                                          
+                                          target_overlap = tibble(target1 = target1,
+                                                                  cluster1 = cluster1,
+                                                                  target2 = target2,
+                                                                  cluster2 = cluster2,
+                                                                  jaccard = 0,
+                                                                  target1_overlap = 0,
+                                                                  target2_overlap = 0)
+                                        }
+                                        
+                                      } else {
+                                        
+                                        coordinate_subset <- density_cluster_coordinates %>% 
+                                          filter((target == target1 & cluster == cluster1) | (target == target2 & cluster == cluster2))
+                                        
+                                        target_overlap <- compare_densities(target1 = target1,
+                                                                            target2 = target2,
+                                                                            coordinates = coordinate_subset) %>% 
+                                          mutate(cluster1 = cluster1,
+                                                 cluster2 = cluster2) %>% 
+                                          select(target1, cluster1, target2, cluster2, everything())
+                                        
+                                      }
+                                      
+                                      target_overlap
+                                      
+                                    }) %>% 
+  bind_rows() %>% 
+  mutate(target_cluster1 = paste(target1, cluster1, sep = '_'),
+         target_cluster2 = paste(target2, cluster2, sep = '_')) %>% 
+  rowwise() %>% 
+  mutate(max_overlap = max(target1_overlap, target2_overlap),
+         min_overlap = min(target1_overlap, target2_overlap)) %>% 
+  ungroup() %>% 
+  select(target1, cluster1, target_cluster1, target2, cluster2, target_cluster2, everything()) 
+target_state_similarity %>% write_rds(file.path(analysis_dir, 'target_state_similarity.rds'))
+toc()
+```
+```{r}
+target_state_similarity <- read_rds(file.path(analysis_dir, 'target_state_similarity.rds'))
+```
+
+
+```{r}
+target_state_wide <- target_state_similarity %>% 
+  select(target_cluster1, target_cluster2, similarity = max_overlap) %>% 
+  arrange(target_cluster1, target_cluster2) %>% 
+  pivot_wider(names_from = target_cluster2, 
+              values_from = similarity) %>% 
+  column_to_rownames('target_cluster1') %>% 
+  as.matrix()
+
+target_state_distance <- as.dist(1 -target_state_wide)
+```
+
+
+```{r}
+target_state_clust <- agnes(target_state_distance, method = 'gaverage')
+
+
+pltree(target_state_clust, cex = 0.1, labels=FALSE)
+```
+
+```{r fig.height= 4, fig.width = 14}
+
+pdf(file = file.path(figures_dir,'target_state_cluster_tree.pdf') , width = 12, height = 4)
+pltree(target_state_clust, cex = 0.1, labels=FALSE)
+dev.off()
+```
+```{r}
+pheatmap(target_state_wide[target_state_clust$order, target_state_clust$order],
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         show_rownames = F,
+         show_colnames = F, legend = FALSE,
+         color = colorRampPalette(colors = c('white', 'red3'))(100),
+         filename = file.path(figures_dir, 'target_state_heatmap.png'),
+         height = 4,
+         width = 4)
+```
+
+```{r}
+nbclust_res <- NbClust::NbClust(diss = target_state_distance, distance = NULL, method = 'ward.D2', index = 'silhouette', min.nc = 2, max.nc = 50)
+
+fviz_nbclust(x = nbclust_res)
+```
+
+```{r}
+sil_loop <- map(2:50, function(i) {
+  clust_res <- cutree(as.hclust(target_state_clust), k = i)
+  sil_res <- silhouette(x = clust_res,
+                        dist = target_state_distance)  
+  
+  average_sil <- mean(sil_res[,3])
+  tibble('k' = i,
+         'silhouette_score' = average_sil)
+}) %>% bind_rows()
+
+sil_loop %>% arrange(-silhouette_score)
+
+```
+```{r}
+sil_loop %>% ggplot(aes(x = k,
+                        y = silhouette_score)) +
+  geom_point() +
+  geom_path()
+```
+
+```{r}
+tree_clusters <- cutree(as.hclust(target_state_clust), k = 29)
+tree_clusters %>% table()
+```
+
+
+
+```{r}
+cell_state_clusters <- tibble('target_cluster' = names(tree_clusters),
+                              'hc_cluster' = tree_clusters) %>% 
+  inner_join(target_state_table) %>% 
+  inner_join(density_cluster_coordinates) %>% 
+  group_by(hc_cluster, x, y) %>% 
+  add_count(name = 'n_point') %>% 
+  group_by(hc_cluster) %>% 
+  mutate(n_max = max(n_point),
+         proportion = n_point/n_max) %>% 
+  ungroup()
+cell_state_clusters
+```
+
+
+### All plots
+```{r}
+ all_hc_clusters <- cell_state_clusters$hc_cluster %>% unique()
+ coordinates_filtered <- cell_state_clusters %>% filter(proportion > 0.5 | target == 'SUFU')
+```
+
+
+```{r}
+centers <- coordinates_filtered %>% dplyr::select(x, y, hc_cluster) %>% dplyr::group_by(hc_cluster) %>% dplyr::summarize(x = median(x), y = median(y))
+p <- coordinates_filtered %>% 
+  dplyr::select(x, y, hc_cluster) %>% 
+  unique() %>% 
+  ggplot(aes(x = x,
+             y = y,
+             color = as.character(hc_cluster))) +
+  geom_point(data = dr$umap,
+             aes(x = UMAP_1, y = UMAP_2),
+             color = 'grey90',
+             size = 0.1,
+             alpha = 0.1) +
+  geom_point(alpha = 0.8,
+             size = 1) +
+  theme(legend.position = F) +
+  theme_void() +
+  shadowtext::geom_shadowtext(data = centers, aes(x = x, y = y, label = hc_cluster), color = 'white', size = 5, bg.color = 'black')
+
+save_figure(p,
+            directory = analysis_dir,
+            filename = 'cell_state_hclust',
+            device = 'png',
+            dpi = 150)
+p
+```
+
+
+```{r}
+coordinates_filtered
+  
+  
+```
+```{r}
+hc_cluster_pairs <- crossing('hc_cluster1' = all_hc_clusters,
+                             'hc_cluster2' = all_hc_clusters)
+hc_cluster_pairs
+```
+
+```{r eval=FALSE}
+tic()
+hc_cluster_similarity <- mclapply(1:nrow(hc_cluster_pairs),
+                                  mc.cores = 64,
+                                  function(i) {
+                                    
+                                    pair_subset <- hc_cluster_pairs[i,]
+                                    
+                                    hc_cluster1 <- pair_subset$hc_cluster1
+                                    hc_cluster2 <- pair_subset$hc_cluster2
+                                    
+                                    coordinate_subset <- coordinates_filtered %>% 
+                                      mutate(target = hc_cluster) %>% 
+                                      filter()
+                                    
+                                    target_overlap <- compare_densities(target1 = hc_cluster1,
+                                                                        target2 = hc_cluster2,
+                                                                        coordinates = coordinate_subset)
+                                  
+                                    target_overlap  
+                                  }) %>% 
+  bind_rows() %>% 
+  rowwise() %>% 
+  mutate(max_overlap = max(target1_overlap, target2_overlap),
+         min_overlap = min(target1_overlap, target2_overlap)) %>% 
+  ungroup() 
+
+toc()
+```
+
+```{r}
+hc_cluster_similarity
+```
+```{r}
+wide_input <- hc_cluster_similarity %>% 
+  select(target1, target2, similarity = max_overlap)
+pairwise_wide <- wide_input %>% 
+  pivot_wider(names_from = 'target2',
+              values_from = 'similarity') %>% 
+  column_to_rownames('target1')
+
+pairwise_wide
+```
+```{r}
+ph <- pheatmap(pairwise_wide,
+               clustering_distance_cols = 'correlation',
+               clustering_distance_rows = 'correlation',
+               fontsize = 10)
+```
+
+
+```{r}
+coordinates_filtered %>% write_tsv(file.path(analysis_dir, 'coordinates_hclust.tsv.gz'))
+wide_input %>% 
+  filter(target1 != target2,
+         similarity > 0.5) %>% 
+  left_join(meta %>% select(target1 = guide_target, library1 = library) %>% unique()) %>% 
+  left_join(meta %>% select(target2 = guide_target, library2 = library) %>% unique()) %>% 
+  write_tsv(file.path(analysis_dir, 'perturbation_similarity_table.tsv.gz'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```

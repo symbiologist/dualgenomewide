@@ -1,0 +1,60 @@
+---
+title: "FANTOM5 export"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+## Purpose
+Export FANTOM5 datasets as bed files
+
+## Setup 
+### Working directory
+#### Set working directory to project directory (ipsc_manuscript)
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file()) 
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(patchwork)
+library(ggthemes)
+```
+
+### Load themes and functions
+```{r}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+
+theme_set(theme_publication())
+```
+
+
+### Directories
+```{r}
+analysis_dir <- 'analysis/integration/output/fantom5'
+dir.create(analysis_dir, showWarnings = FALSE)
+```
+
+## FANTOM
+```{r}
+fantom <- import('analysis/integration/input/fantom5_all_enhancers.bed')
+fantom_datasets <- names(fantom)
+```
+
+```{r}
+map(fantom_datasets, function(i){
+  
+  fantom[[i]] %>% export(paste0('data/integration/external/bed/FANTOM5_', i, '.bed'))
+})
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,237 @@
+---
+title: "Dimensionality Reduction of Perturb-Seq data"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Run dimensionality reduction 
+
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/011_dimensionality_reduction' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(Seurat)
+library(plotly)
+```
+
+### Import feature table
+```{r}
+feature_reference <- read_csv('data/perturbseq/derived/pipestance/features.csv')
+feature_reference %>% head()
+```
+### Import screen data
+```{r}
+master_minimal <- read_tsv('analysis/integration/output/00_integrate/master_minimal.tsv.gz')
+master_minimal %>% head()
+```
+
+# SCT
+## Import integrated object
+```{r}
+tic()
+integrated <- read_rds('data/perturbseq/derived/seurat/unified_cellranger_sct_clustered.rds')
+toc()
+integrated
+``` 
+
+## Globals
+```{r}
+significant_dims <- 1:30
+k <- 30
+min_dist <- 0.1
+n_epochs <- 250
+umap_seed <- 20200522
+
+tsne_seed <- umap_seed
+theta <- 0.2
+iter <- 1000
+
+which_assay <- 'integrated'
+```
+
+```{r}
+tic()
+integrated <- integrated %>% 
+  RunPCA(npcs = max(significant_dims) + 10,
+         assay = which_assay, 
+         verbose = FALSE)
+toc()
+```
+
+### UMAP
+```{r fig.height=6, fig.width=6}
+tic()
+reduced <- integrated %>% 
+  RunUMAP(
+          dims = significant_dims, 
+          assay = which_assay,
+          reduction = 'pca', 
+          reduction.name = 'umap',
+          n.components = 2, 
+          n.neighbors = k, 
+          min.dist = min_dist,
+          n.epochs = n_epochs,
+          seed.use = umap_seed)
+
+toc()
+
+all_umap <- reduced %>% seurat_plot(reduction = 'umap', feature = 'ident', do.label = T, size = 0.05, alpha = 0.2) %>% wrap_plots()
+
+ggsave(plot = all_umap, 
+       path = analysis_dir, 
+       filename = 'unified_cellranger_sct_umap.png', 
+       h = 3, w = 3)
+
+all_umap
+```
+
+
+### 3D UMAP
+```{r eval=TRUE}
+reduced <- reduced %>% 
+  RunUMAP(
+          assay = which_assay,
+          dims = significant_dims, 
+          reduction = 'pca', 
+          reduction.name = 'umap3d',
+          n.components = 3, 
+          n.neighbors = k, 
+          min.dist = min_dist,
+          n.epochs = n_epochs,
+          seed.use = umap_seed)
+
+```
+
+
+```{r eval=FALSE}
+seurat_3d(reduced)
+```
+
+
+### t-SNE
+```{r fig.height=12, fig.width=12, eval=FALSE}
+tic()
+reduced <- reduced %>% 
+  RunTSNE(
+          dims = significant_dims, 
+          assay = which_assay,
+          reduction = 'pca', 
+          tsne.method = 'FIt-SNE', 
+          fast_tsne_path = '/home/software/FIt-SNE/bin/fast_tsne', 
+          max_iter = iter, 
+          nthreads = 24,
+          theta = theta, 
+          perplexity = k,
+          seed.use = tsne_seed)
+  })
+toc()
+```
+
+### Low resolution clustering to filter for multiple trajectory inference
+Perform low resolution clustering on UMAP coordinates for downstream pseudotime analysis
+```{r}
+trajectory_clustering <- reduced %>% 
+  FindNeighbors(reduction = 'umap',
+                dims = 1:2, 
+                k = 100)
+
+trajectory_clustering <- trajectory_clustering %>% 
+  FindClusters(resolution = 0.3)
+
+seurat_plot(trajectory_clustering, feature = 'seurat_clusters')
+```
+
+
+```{r}
+trajectory <- case_when(
+  trajectory_clustering$seurat_clusters %in% c(9, 3, 6, 5) ~ 'Cell Cycle',
+  trajectory_clustering$seurat_clusters %in% c(10, 1, 0, 2, 16, 4) ~ 'NSC',
+  trajectory_clustering$seurat_clusters %in% c(11, 7, 12) ~ 'Non-NSC',
+  TRUE ~ 'Other')
+
+reduced$low_res_cluster <- trajectory_clustering$seurat_clusters
+reduced$trajectory <- trajectory
+
+seurat_plot(reduced, feature = 'trajectory')
+```
+
+## Reset to RNA assay
+```{r}
+DefaultAssay(integrated) <- 'RNA'
+integrated <- integrated %>% NormalizeData()
+    
+```
+
+## Add final metadata
+```{r}
+metadata_table <- integrated@meta.data %>% 
+  rownames_to_column('barcode') %>%
+  left_join(master_minimal %>% 
+              dplyr::select(guide_target = feature_id,
+                            library,
+                            primary_pheno,
+                            diff_pheno,
+                            diff_hit_direction) 
+            %>% unique()) %>% 
+  as_tibble()
+
+metadata_table
+```
+
+```{r}
+data_to_add <- metadata_table %>% 
+  dplyr::select(barcode,
+                library,
+                primary_pheno,
+                diff_pheno,
+                diff_hit_direction) %>% 
+  mutate_if(is.numeric, ~replace(., is.na(.), 0)) %>% 
+  mutate_if(is.character, ~replace(., is.na(.), 'Control')) %>% 
+  column_to_rownames('barcode') 
+
+reduced <- AddMetaData(reduced, data_to_add)
+
+```
+
+## Export
+```{r}
+reduced %>% write_rds(file.path(data_dir, 'unified_cellranger_sct_reduced.rds'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

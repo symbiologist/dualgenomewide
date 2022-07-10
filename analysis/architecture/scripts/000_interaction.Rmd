@@ -1,0 +1,217 @@
+---
+title: "Genomic interaction analysis"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Purpose
+Load and analyze interaction data
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load libraries
+```{r message=FALSE}
+library(tidyverse)
+library(GenomicRanges)
+library(GenomicFeatures)
+library(GenomicInteractions)
+library(rtracklayer)
+library(plyranges)
+library(ggforce)
+library(ggthemes)
+library(rcartocolor)
+```
+
+### Directories
+```{r}
+analysis_dir <- 'analysis/architecture/output/000_interaction'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+```
+
+### Functions and themes
+```{r}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+
+theme_set(theme_publication())
+```
+
+### Functions
+```{r}
+overlap_datasets <- function(query,
+                             subject,
+                             metadata = 'feature_id') { 
+  
+  join_overlap_intersect(query, subject) %>% 
+    select(one_of(metadata))
+}
+```
+
+### Load coding/lncRNA gtf
+```{r}
+gtf <- import('analysis/reference/output/02_unified_reference/unified_minimal.gtf')
+```
+
+### Load TSS distances
+```{r}
+pairwise <- read_rds('data/screen/derived/neighbor/pairwise_tss_distances.rds')
+```
+
+
+### Screen data
+```{r}
+neighbor_integration <- read_tsv('analysis/screen/output/03_neighbors/neighbor_hits.tsv.gz')
+neighbor_integration
+```
+
+```{r}
+all_genes <- gtf %>% filter(feature_id %in% neighbor_integration$feature_id, type == 'gene') %>% mutate(id = feature_id)
+```
+
+```{r}
+maps <- read_tsv('analysis/architecture/input/WTC_0hr_trim_merged.5k.2.peaks.bedpe')
+maps
+```
+```{r}
+maps_edit <- maps %>% 
+  filter(fdr < 0.05) %>% 
+  mutate(feature = row_number(),
+         name = paste('feature', feature, sep = '_'),
+         score = count,
+         strand1 = '*',
+         strand2 = '*') %>% 
+  select(chr1, start1, end1, chr2, start2, end2, name, score, strand1, strand2, everything())
+
+maps_edit %>% write_tsv(file.path(analysis_dir, 'maps_filtered.bedpe'), col_names = F)
+maps_edit
+```
+```{r}
+interact <- makeGenomicInteractionsFromFile(file.path(analysis_dir, 'maps_filtered.bedpe'), type = 'bedpe')
+interact$interact_id <- 1:length(interact)
+interact
+```
+
+### Annotate all interactions with features manually
+
+```{r}
+anchor1 <- anchorOne(interact) %>% mutate(interact_id = interact$interact_id)
+anchor1
+```
+
+```{r}
+anchor2 <- anchorTwo(interact) %>% mutate(interact_id = interact$interact_id)
+anchor2
+```
+
+```{r}
+anchor1_overlaps <- find_overlaps(anchor1, all_genes %>% select(feature_id, library))
+anchor1_overlaps
+```
+
+```{r}
+anchor2_overlaps <- find_overlaps(anchor2, all_genes %>% select(feature_id, library))
+anchor2_overlaps
+```
+
+Fill in missing anchor regions
+```{r}
+anchor1_missing <- setdiff(anchor1$interact_id, anchor1_overlaps$interact_id)
+anchor1_full <- c(anchor1 %>% filter(interact_id %in% anchor1_missing),
+                  anchor1_overlaps)
+
+anchor1_full
+```
+```{r}
+anchor2_missing <- setdiff(anchor2$interact_id, anchor2_overlaps$interact_id)
+anchor2_full <- c(anchor2 %>% filter(interact_id %in% anchor2_missing),
+                  anchor2_overlaps)
+
+anchor2_full
+```
+
+```{r}
+anchors_master <- interact %>% 
+  as_tibble() %>% 
+  select(interact_id, counts) %>% 
+  inner_join(
+    left_join(anchor1_full %>% as_tibble(),
+              anchor2_full %>% as_tibble(),
+              by = c('interact_id' = 'interact_id'))) %>% 
+  mutate(distance = abs(start.x - start.y)) %>% 
+  filter(feature_id.x != feature_id.y)
+
+anchors_master
+```
+
+## Add screen data
+```{r}
+neighbor_integration_minimal <- neighbor_integration %>% 
+  mutate(full_direction = ifelse(status == 'Hit', direction, 'Non-hit')) %>% 
+  select(feature_id, primary_pheno, library, assay, full_direction) %>% 
+  pivot_wider(names_from = 'assay',
+              values_from = 'full_direction') %>% 
+  mutate(description = paste(library, primary_pheno, sep = '_')) %>% 
+  unique()
+
+neighbor_integration_minimal
+```
+
+### Interaction master table
+```{r}
+hit_categories <- c('Coding_Differentiation:lncRNA_Differentiation',
+                    'Coding_Differentiation:lncRNA_Dual',
+                    'Coding_Proliferation:lncRNA_Proliferation',
+                    'Coding_Proliferation:lncRNA_Dual')
+
+interaction_master <- anchors_master %>% 
+  left_join(neighbor_integration_minimal %>% set_names(paste0(colnames(.), '.x'))) %>% 
+  left_join(neighbor_integration_minimal %>% set_names(paste0(colnames(.), '.y'))) %>% 
+  replace(is.na(.), 'Distal') %>% # distal classification
+  mutate(category = ifelse(description.x < description.y, 
+                           paste(description.x, description.y, sep = ':'),
+                           paste(description.y, description.x, sep = ':')),
+         combination = ifelse(feature_id.x < feature_id.y, 
+                              paste(feature_id.x, feature_id.y, sep = ':'),
+                              paste(feature_id.y, feature_id.x, sep = ':')),
+         primary_phenos =ifelse(feature_id.x < feature_id.y, 
+                                paste(primary_pheno.x, primary_pheno.y, sep = ':'),
+                                paste(primary_pheno.y, primary_pheno.x, sep = ':')),
+         coding = ifelse(library.x == 'Coding' | library.y == 'Coding', 1, 0),
+         lncrna = ifelse(library.x == 'lncRNA' | library.y == 'lncRNA', 1, 0),
+         distal = ifelse(library.x == 'Distal' | library.y == 'Distal', 1, 0),
+         proliferation = ifelse(primary_pheno.x == 'Proliferation' | primary_pheno.y == 'Proliferation', 1, 0),
+         differentiation = ifelse(primary_pheno.x == 'Differentiation' | primary_pheno.y == 'Differentiation', 1, 0),
+         dual = ifelse(primary_pheno.x == 'Dual' | primary_pheno.y == 'Dual', 1, 0),
+         hit = ifelse(proliferation + differentiation + dual > 0, 1, 0),
+         same_assay = ifelse(primary_pheno.x == primary_pheno.y, 1, 0),
+         type = case_when(
+           primary_pheno.x == 'Distal' | primary_pheno.y == 'Distal' ~ 'Distal',
+           primary_pheno.x != 'None' & primary_pheno.y != 'None' ~ 'Hit, hit',
+           primary_pheno.x != 'None' | primary_pheno.y != 'None' ~ 'Hit, non-hit',
+           primary_pheno.x == 'None' & primary_pheno.y == 'None' ~ 'Non-hit, non-hit',
+         )) %>% 
+  left_join(pairwise) %>% # obtain TSS to TSS distances for filtering
+  mutate(status = ifelse((tss_distance > 1000) & category %in% hit_categories, 'Interaction hit', 'Other interaction')) # add interaction hit status
+
+interaction_master
+```
+
+### Export
+```{r}
+interaction_master %>% write_tsv(file.path(analysis_dir, 'interaction_master.tsv.gz'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

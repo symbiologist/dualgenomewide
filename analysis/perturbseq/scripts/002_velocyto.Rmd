@@ -1,0 +1,47 @@
+---
+title: "Velocyto"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Run RNA velocity processing pipeline on Perturb-Seq data
+
+## Set up
+### Set working directory to project directory
+VELOCYTO
+Loop on all samples; initially didn't work (couldn't generate cell sorted bam file), so run a loop to generate these bam files first.
+```{bash}
+BASE=/media/data4/shared/ipsc_manuscript/data/perturbseq/derived; # use full path rna
+PIPESTANCE=pipestance;
+REPEATMASK=/home/genomes/Homo_sapiens/Ensembl/GRCh37/grch37_rmsk.gtf;
+REF=/media/data4/shared/ipsc_manuscript/analysis/reference/output/002_unified_reference/unified.gtf
+THREADS=2;
+RAM=32;
+
+cd ${BASE};
+
+ADDITIONAL_THREADS=8
+RAM_PER_THREAD=6;
+
+for SAMPLE in `find ${PIPESTANCE} -mindepth 1 -maxdepth 1 -type d -name '*' | sed 's!.*/!!' | sort -u`;
+do
+time samtools sort -t CB -O BAM -@ ${ADDITIONAL_THREADS} -m ${RAM_PER_THREAD}G -o ${PIPESTANCE}/${SAMPLE}/outs/cellsorted_possorted_genome_bam.bam ${PIPESTANCE}/${SAMPLE}/outs/possorted_genome_bam.bam
+done
+
+```
+
+Now run velocyto
+```{bash}
+conda activate velocyto
+
+for SAMPLE in `find ${PIPESTANCE} -mindepth 1 -maxdepth 1 -type d -name '*' | sed 's!.*/!!' | sort -u`;
+do
+velocyto run10x -m ${REPEATMASK} --samtools-threads ${THREADS} --samtools-memory ${RAM} -vv ${PIPESTANCE}/${SAMPLE} ${REF} |& tee ${SAMPLE}_velocyto.log &
+done
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,45 @@
+---
+title: "Generate RNA-Seq index files"
+author: "David Wu"
+output: html_notebook
+---
+
+Set working directory to project directory
+```{r setup, include=FALSE}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+Generate index files for cellranger (STAR index) and kallisto
+For below, run on command line:
+Use cellranger mkref on new unified refenence
+```{bash}
+cd data/reference/derived
+FASTA=../external/GRCh37.p13.genome.fa;
+GTF=../../../analysis/reference/output/02_unified_reference/unified_for_cellranger.gtf
+THREADS=64;
+RAM=128;
+
+time cellranger mkref --genome=unified_cellranger --fasta=${FASTA} --genes=${GTF} --nthreads=${THREADS} --memgb=${RAM} |& tee unified_cellranger.log
+
+mv Log.out unified_cellranger
+mv unified_cellranger.log unified_cellranger
+```
+
+Convert gtf to fasta for kallisto reference
+Use gtf with exon data only
+```{bash}
+cd data/reference/derived
+mkdir kallisto
+GTF=../../../analysis/reference/output/02_unified_reference/unified_transcripts.gtf
+FASTA=../external/GRCh37.p13.genome.fa;
+OUTPUT=kallisto/unified
+INDEX=kallisto/unified_kallisto.idx
+
+/usr/bin/gffread -w ${OUTPUT}.fa ${GTF} -g ${FASTA} -G ; # convert to fasta
+gzip ${OUTPUT}.fa
+
+kallisto index -i ${INDEX} ${OUTPUT}.fa.gz
+date; echo complete;
+
+```

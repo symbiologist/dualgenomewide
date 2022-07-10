@@ -1,0 +1,184 @@
+---
+title: "Prepare lncRNA reference"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+## Purpose
+Prepare lncRNA reference gtf used for generating CRiNCL sgRNA library for downstream merge with coding gtf
+
+## Setup
+### Set working directory to project directory
+```{r setup, include=FALSE}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Output directory
+```{r}
+output_dir <- 'analysis/reference/output/00_lncrna_reference'
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(GenomicFeatures)
+library(plyranges)
+```
+
+### Import
+Import CRiNCL library and LH_ID to TSS_ID information
+```{r}
+crincl_path <- 'analysis/reference/input/crincl_7lines_all.gtf' # hg 19 annotation used for CRiNCL library
+crincl <- import(crincl_path) %>% 
+  sort() %>% 
+  mutate(id = 1:n()) # add row id information for tracking
+seqlevelsStyle(crincl) <- 'UCSC' # use UCSC seqlevels style to match gencode reference
+crincl
+```
+
+Load LH ID and TSS ID information
+```{r}
+lh2tss_table <- read_tsv('analysis/screen/input/crincl_reference/CRISPRi_v2_human_lincRNA_unique_merged_librarytable.txt') %>% 
+  select(lh_id = gene, tss_id = premerge_gene) %>% unique()
+lh2tss_table
+```
+
+## Analysis
+### Merge locus information
+Join lh_id table to crincl and select columns of interest
+Use lh_id to replace gene_id since screen is analyzed at locus-level
+If gene name is missing, use lh_id
+```{r}
+crincl_augmented <- crincl %>% as.data.frame() %>% 
+  left_join(lh2tss_table) %>% 
+  mutate(exon_id = paste(transcript_id, exon_number, sep = '.'),
+         gene_type = 'lncRNA', # Add gene_type 
+         library = 'lncRNA', # add library
+         ref_id = nearest_ref, # reference id (Ensembl, Broad, miTranscriptome)
+         internal_id = gene_id, # Move gene_id to internal_id
+         gene_id = lh_id, # Use lh_id to replace gene_id
+         gene_name = ifelse(is.na(gene_name), lh_id, gene_name), # if no gene_name, use LH_ID
+         transcript_name = gene_name) %>% # move gene name to transcript name since multiple gene names may be collated into a single feature based on LH ID 
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+
+crincl_augmented
+```
+
+Make sure rows are still matched up
+```{r}
+identical(crincl$id, crincl_augmented$id)
+```
+
+Correspondance of lh_id and gene_id?
+```{r}
+crincl_augmented %>% summarise_all(n_distinct)
+```
+
+Some tss_ids are in crincl gtf but not in the lh_id table
+```{r}
+lh2tss_table$tss_id %>% n_distinct() #16983 unique tss_id
+crincl$tss_id %>% n_distinct() # 17674 unique tss_id
+```
+
+Look in the gtf - these will be missing lh_id (now gene_id)
+```{r}
+crincl_augmented %>% filter(is.na(gene_id))
+```
+
+Remove from crincl 
+```{r}
+crincl_subset <- crincl_augmented %>% filter(!is.na(gene_id)) 
+crincl_subset
+```
+## Metadata
+```{r}
+metadata <- crincl_subset@elementMetadata %>% as_tibble() %>% select(-type, -id, -exon_id, -exon_number) %>% unique()
+metadata
+```
+
+Check if each transcript_id maps to only 1 lh_id (TRUE)
+```{r}
+metadata %>% select(gene_id, transcript_id) %>%  unique() %>% group_by(transcript_id) %>% add_tally() %>% filter(n > 1)
+```
+
+## Transcript and gene models
+All are missing transcript and gene structure information
+Use GenomicFeatures to add these
+```{r}
+txdb <- makeTxDbFromGRanges(crincl_subset)
+
+transcript_structure <- transcripts(txdb)
+gene_structure <- genes(txdb)
+```
+
+
+### Transcript models
+Add missing metadata and to add back to main gtf
+
+```{r}
+transcript_gtf <- transcript_structure %>% 
+  as.data.frame() %>% 
+  mutate(transcript_id = tx_name,
+         type = 'transcript') %>% 
+  left_join(metadata) %>% 
+  select(-tx_id, -tx_name) %>% 
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+
+transcript_gtf
+
+```
+### Gene models
+```{r}
+gene_gtf <- gene_structure %>% 
+  as.data.frame() %>% 
+  mutate(type = 'gene') %>% 
+  left_join(metadata %>% select(gene_id, library, gene_type) %>% unique()) %>% 
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+
+gene_gtf
+```
+## Merge reference
+```{r}
+crincl_final <- c(crincl_subset, transcript_gtf, gene_gtf) %>% 
+  sort() %>% 
+  mutate(length = width,
+         feature_id = gene_id) %>% 
+  select(source, 
+         type,
+         score,
+         phase,
+         feature_id,
+         gene_name,
+         gene_id,
+         transcript_name,
+         transcript_id,
+         exon_id,
+         internal_id,
+         ref_id,
+         class_code,
+         lh_id,
+         tss_id,
+         length,
+         gene_type,
+         library) 
+crincl_final 
+```
+
+## Export
+```{r}
+crincl_final %>% export('analysis/reference/output/00_lncrna_reference/lncrna.gtf')
+```
+
+```{bash}
+gzip --keep -f analysis/reference/output/00_lncrna_reference/lncrna.gtf
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

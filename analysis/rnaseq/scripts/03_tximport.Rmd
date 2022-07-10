@@ -1,0 +1,89 @@
+---
+title: "Import RNA-Seq with tximport"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+## Purpose
+Obtain feature-level counts data from tximport
+
+## Setup
+### Set working directory to project directory
+```{r setup, include=FALSE}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+### Libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(tximport)
+library(DESeq2)
+```
+
+### Directories
+```{r}
+analysis_dir <- 'analysis/rnaseq/output/03_tximport'
+data_dir <- 'data/rnaseq/derived/tximport'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Transcript to gene table
+```{r}
+t2g <- read_tsv('analysis/reference/output/02_unified_reference/unified_t2g.tsv.gz') # use feature ID to aggregate
+t2g
+```
+
+### Sample table
+```{r}
+sample_table <- read_tsv('analysis/rnaseq/output/02_sleuth/sample_table.tsv')
+sample_table
+```
+
+## Processing
+### tximport
+```{r}
+files <- set_names(file.path(sample_table$path, "abundance.h5"),
+                   sample_table$sample)
+
+txi <- tximport(files, type = "kallisto", 
+                tx2gene = t2g %>% select(transcript_id, feature_id))
+```
+Examine abundance and counts files
+```{r}
+txi$abundance[1:5, 1:5]
+```
+```{r}
+txi$counts[1:5, 1:5]
+```
+```{r}
+txi$countsFromAbundance
+```
+
+### Pre-compute DESeq2 vst 
+```{r}
+deseq <- DESeqDataSetFromMatrix(countData = round(as.matrix(txi$counts)),
+                                colData = sample_table %>% mutate(time = as.factor(time)),
+                                design = ~time)
+
+vsd <- vst(deseq, blind = TRUE)
+rlog <- rlog(deseq, blind = TRUE)
+plotPCA(vsd, intgroup = 'time') 
+```
+
+### Export
+```{r}
+txi %>% write_rds(file.path(data_dir, 'tximport.rds'), compress = 'gz')
+
+list('deseq' = deseq,
+     'vsd' = vsd,
+     'rlog' = rlog) %>% write_rds(file.path(data_dir, 'deseq.rds'), compress = 'gz')
+```
+
+### Session info
+```{r}
+sessionInfo()
+```
+

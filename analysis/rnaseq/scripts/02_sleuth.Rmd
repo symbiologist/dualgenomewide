@@ -1,0 +1,56 @@
+---
+title: "Import RNA-Seq with sleuth"
+author: "David Wu"
+output: html_notebook
+---
+
+Load into sleuth. 
+Run on command line for multicore support. Be sure to start R in correct working directory (the project directory)
+```{r}
+library(tidyverse)
+library(sleuth)
+library(tictoc)
+
+# output folders
+analysis_dir <- 'analysis/rnaseq/output/02_sleuth'
+data_dir <- 'data/rnaseq/derived/sleuth'
+dir.create(analysis_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Load processing table and convert to a sample:covariates table
+# Use lowercase column names for sleuth
+sample_table <- read_csv('analysis/rnaseq/output/01_process/processing_table.csv', col_names = F) %>% 
+  select(sample = X1, path = X3) %>% 
+  separate(sample, into = c('time', 'condition', 'replicate'), remove = FALSE) %>% # covariates
+  mutate(time = time %>% str_remove('D') %>% as.integer()) %>%  # convert time to numeric
+  arrange(condition, time, replicate)
+# Load t2g table
+t2g <- read_tsv('analysis/reference/output/02_unified_reference/unified_t2g.tsv.gz') # use feature ID to aggregate
+
+# Use a custom filter to retain all transcripts, including 0
+custom_filter <- function(row, min_reads = 0, min_prop = 0) { 
+  mean(row >= min_reads) >= min_prop
+}
+
+# Import with sleuth
+tic()
+sleuth <- sleuth_prep(sample_table, 
+                      num_cores = 24, 
+                      filter_fun = custom_filter,
+                      target_mapping = t2g %>% rename(target_id = transcript_id), 
+                      aggregation_column = 'feature_id', 
+                      gene_mode = TRUE)
+toc() # took about 90 seconds
+
+# Obtain counts/tpm table
+counts_table <- sleuth %>% kallisto_table() %>% as_tibble() %>% arrange(target_id, time) %>% rename(feature_id = target_id) # arrange by feature
+
+# Obtain tpm matrix, arrange in order of sample
+tpm_matrix <- sleuth_to_matrix(sleuth, which_df = 'obs_norm', which_units = 'tpm')[, sample_table$sample] %>% as.data.frame() %>% rownames_to_column('feature_id') 
+
+# Export; large files go to data dir
+sample_table %>% write_tsv(file.path(analysis_dir, 'sample_table.tsv'))
+sleuth %>% write_rds(file.path(data_dir, 'sleuth.rds'), compress = 'gz')
+counts_table %>% write_tsv(file.path(data_dir, 'counts_table.tsv.gz'))
+tpm_matrix %>% write_tsv(file.path(data_dir, 'tpm_matrix.tsv.gz'))
+```

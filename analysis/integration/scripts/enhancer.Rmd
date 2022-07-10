@@ -1,0 +1,451 @@
+---
+title: "Integrate datasets"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+## Purpose
+Integrate genomic datasets into a master table
+
+## Setup 
+### Working directory
+#### Set working directory to project directory (ipsc_manuscript)
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file()) # /media/data4/shared/ipsc_manuscript
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(patchwork)
+library(ggthemes)
+library(extrafont)
+```
+
+### Load themes and functions
+```{r}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+
+theme_set(theme_publication())
+```
+
+
+### Directories
+```{r}
+analysis_dir <- 'analysis/integration/output/enhancer'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+
+```
+
+### Master table
+```{r}
+master <- read_tsv('analysis/integration/output/000_integrate/master_wide.tsv.gz')
+```
+
+### Add column for any FANTOM overlap
+```{r}
+master <- master %>% 
+  mutate(FANTOM5_any = rowSums(across(contains('FANTOM'))),
+         FANTOM5_any = ifelse(FANTOM5_any > 0, 1, 0))
+
+master %>% 
+  select(feature_id, FANTOM5_any, contains('FANTOM'))
+```
+```{r}
+master %>% filter(library == 'Coding' | library == 'Non-ambiguous')
+```
+
+
+```{r}
+variables <- str_subset(colnames(master), 'FANTOM5|yosef')
+```
+
+### Test for enrichment across different categories
+```{r}
+enrich <- map(variables, function(i) {
+  map(c('Coding', 'lncRNA'), function(which_library) {
+    map(c('Differentiation', 'Dual', 'Proliferation', 'All', 'Differentiation+Dual', 'Proliferation+Dual'), function(which_pheno) {
+      
+      enrich_subset <- master %>% 
+        filter(neighbor_overall_status != 'Neighbor hit',
+               library == which_library,
+               library == 'Coding' | locus_ambiguity == 'Non-ambiguous') %>% 
+        select(feature_id, primary_pheno, dataset = {{i}})
+      
+      # primary pheno
+      if(which_pheno == 'All') {
+        pheno_subset <- c('Differentiation', 'Dual', 'Proliferation')
+      } else if (which_pheno == 'Differentiation+Dual') {
+        pheno_subset <- c('Differentiation', 'Dual')
+      } else if (which_pheno == 'Proliferation+Dual') {
+        pheno_subset <- c('Proliferation', 'Dual')
+      } else {
+        pheno_subset <- which_pheno
+      }
+      
+      hits <- enrich_subset %>% filter(primary_pheno %in% pheno_subset) %>% pull(feature_id)  
+      overlapping_features <- enrich_subset %>% filter(dataset == 1) %>% pull(feature_id) 
+      
+      universe <- enrich_subset %>% pull(feature_id) %>% unique()
+      
+      
+      
+      #Test enrichment for hits
+      enrichment_results <- enrichment_test(list1 = hits,
+                                            list2 = overlapping_features,
+                                            cat1 = c('Hit', 'Non-hit'),
+                                            cat2 = c('Overlap', 'Non-overlap'),
+                                            background = universe,
+                                            print = FALSE)
+      
+      double_positive_features <- intersect(hits,
+                                            overlapping_features)
+      
+      tibble(library = which_library,
+             primary_pheno = which_pheno,
+             dataset = i,
+             odds = enrichment_results$fisher$estimate,
+             conf1 = enrichment_results$fisher$conf.int[1],
+             conf2 = enrichment_results$fisher$conf.int[2],
+             pvalue = enrichment_results$fisher$p.value,
+             n_overlaps = double_positive_features %>% n_distinct(),
+             n_hits = length(hits),
+             n_features = length(overlapping_features),
+             f_hits = round(n_overlaps/n_hits, 3))
+      
+    }) %>% bind_rows()
+  }) %>% bind_rows() 
+}) %>% bind_rows() %>% 
+  mutate(log2odds = log2(odds),
+         padj = p.adjust(pvalue, method = 'BH')) %>% 
+  arrange(-n_overlaps)
+
+  
+enrich
+  
+
+```
+### Subset to compare
+```{r}
+enrich_to_plot <- enrich %>% 
+  filter(primary_pheno == 'Differentiation+Dual',
+         dataset == 'FANTOM5_any')
+
+p <- enrich_to_plot %>% 
+  ggplot(aes(x = library,
+             y = odds)) +
+  geom_bar(stat = 'identity',
+           fill = 'grey90',
+           color = 'grey50') + 
+  geom_errorbar(aes(ymin = conf1,
+                    ymax = conf2),
+                width = 0.2) +
+  ylim(c(0, 4.5)) + 
+  geom_hline(yintercept = 1, linetype = 'dashed', color = 'grey20') +
+  labs(x = '',
+       y = 'Odds',
+       title = 'Odds of overlapping FANTOM5 enhancer')
+
+save_figure(plot = p,
+            filename = 'fantom5_overlap_odds',
+            directory = 'figures/integration',
+            h = 5, 
+            w = 3)
+
+p
+
+
+```
+
+### Subset to compare
+```{r}
+enrich_to_plot <- enrich %>% 
+  filter(primary_pheno == 'Differentiation+Dual',
+         dataset == 'ext_FANTOM5_neural')
+
+p <- enrich_to_plot %>% 
+  ggplot(aes(x = library,
+             y = odds)) +
+  geom_bar(stat = 'identity',
+           fill = 'grey90',
+           color = 'grey50') + 
+  geom_errorbar(aes(ymin = conf1,
+                    ymax = conf2),
+                width = 0.2) +
+  #ylim(c(0, 4.5)) + 
+  geom_hline(yintercept = 1, linetype = 'dashed', color = 'grey20') +
+  labs(x = '',
+       y = 'Odds',
+       title = 'Odds of overlapping FANTOM5 neural enhancer')
+
+save_figure(plot = p,
+            filename = 'fantom5_neural_overlap_odds',
+            directory = 'figures/integration',
+            h = 5, 
+            w = 3)
+
+p
+
+```
+## MPRA
+```{r}
+enrich_to_plot <- enrich %>% 
+  filter(primary_pheno == 'All',
+           dataset == 'ext_yosef_mpra')
+
+p <- enrich_to_plot %>% 
+  ggplot(aes(x = library,
+             y = odds)) +
+  geom_bar(stat = 'identity',
+           fill = 'grey90',
+           color = 'grey50') + 
+  geom_errorbar(aes(ymin = conf1,
+                    ymax = conf2),
+                width = 0.2) +
+  #ylim(c(0, 9)) + 
+  geom_hline(yintercept = 1, linetype = 'dashed', color = 'grey20') +
+  labs(x = '',
+       y = 'Odds',
+       title = 'Odds of overlapping FANTOM5 neural enhancer')
+
+save_figure(plot = p,
+            filename = 'yosef_overlap_odds',
+            directory = 'figures/integration',
+            h = 5, 
+            w = 3)
+
+p
+```
+
+### Individual
+```{r}
+which_library <-  'lncRNA'
+which_pheno <- c('Differentiation','Dual')
+which_dataset <- 'ext_FANTOM5_robust_enhancers'
+
+enrich_subset <- master %>% 
+  filter(neighbor_overall_status != 'Neighbor hit',
+         library == 'Coding' | locus_ambiguity == 'Non-ambiguous',
+         library == which_library) %>% 
+  select(feature_id, primary_pheno, dataset = all_of(which_dataset))
+
+hits <- enrich_subset %>% filter(primary_pheno %in% which_pheno) %>% pull(feature_id)
+overlapping_features <- enrich_subset %>% filter(dataset == 1) %>% pull(feature_id) 
+
+universe <- enrich_subset %>% pull(feature_id) %>% unique()
+
+
+
+#Test enrichment for hits
+enrichment_results <- enrichment_test(list1 = hits,
+                                      list2 = overlapping_features,
+                                      cat1 = c('Hit', 'Non-hit'),
+                                            cat2 = c('Overlap', 'Non-overlap'),
+                                            background = universe,
+                                            print = TRUE)
+```
+
+
+How many hits intersect with FANTOM enhancers?
+```{r}
+master %>% 
+  filter(FANTOM5_any == 1, neighbor_overall_status != 'Neighbor hit', primary_pheno !='None', library == 'Coding' | locus_ambiguity == 'Non-ambiguous') %>% 
+  group_by(library) %>% tally()
+```
+How many are FANTOM enhancers from neural tissues?
+```{r}
+master %>% 
+  filter(ext_FANTOM5_neural == 1, neighbor_overall_status != 'Neighbor hit', primary_pheno !='None') %>% 
+  group_by(library) %>% tally()
+```
+
+How many hits intersect with Yosef neural induction cis-regulatory regions?
+```{r}
+master %>% 
+  filter(ext_yosef_mpra == 1, neighbor_overall_status != 'Neighbor hit', primary_pheno != 'None') %>% 
+  group_by(library) %>% tally()
+```
+```{r}
+master %>% 
+  filter(ext_yosef_mpra == 1, neighbor_overall_status != 'Neighbor hit', primary_pheno == 'None') %>% 
+  group_by(library) %>% tally()
+```
+
+How many hits intersect with Yosef or FANTOM?
+```{r}
+master %>% 
+  filter(ext_yosef_mpra == 1 | FANTOM5_any == 1, neighbor_overall_status != 'Neighbor hit', primary_pheno !='None') %>% 
+  group_by(library) %>% tally()
+```
+```{r}
+master %>% filter(enhancer == 'Non-enhancer', neighbor_overall_status == 'Non-neighbor') %>% group_by(library) %>% tally()
+```
+
+```{r}
+enrich %>% 
+  filter(primary_pheno %in% c('None', 'Differentiation', 'Proliferation', 'Dual'),
+         dataset != 'FANTOM5_any') %>%  # equivalent to fantom5 robust
+  mutate(padj = p.adjust(pvalue)) %>% 
+  filter(dataset %in% c('ext_FANTOM5_robust_enhancers',
+                        'ext_FANTOM5_neural',
+                        'ext_yosef_mpra')) 
+```
+```{r}
+enrich %>% 
+  filter(primary_pheno %in% c('Differentiation+Dual')) %>%  
+  filter(dataset %in% c('ext_FANTOM5_robust_enhancers',
+                        'ext_FANTOM5_neural',
+                        'ext_yosef_mpra')) %>% 
+  mutate(padj = p.adjust(pvalue)) %>% 
+  arrange(dataset, library) %>% 
+  select(-primary_pheno) 
+
+```
+
+## Percentage table
+```{r}
+data_input <- master %>% 
+  filter(diff_full_status != 'Neighbor hit',
+         library == 'Coding' | locus_ambiguity == 'Non-ambiguous') %>% 
+  mutate(status = diff_full_status)
+  
+group_totals <- 
+  data_input %>% 
+  group_by(library, status) %>% 
+  tally(name = 'total')
+
+group_totals
+```
+
+```{r}
+fantom_any_count <- 
+  data_input %>% 
+  filter(FANTOM5_any == 1) %>% 
+  group_by(library, status) %>% 
+  tally() %>% 
+  mutate(dataset = 'FANTOM Any') 
+
+fantom_any_count 
+  
+```
+
+```{r}
+fantom_neural_count <- 
+  data_input %>% 
+  filter(ext_FANTOM5_neural == 1) %>% 
+  group_by(library, status) %>% 
+  tally() %>% 
+  mutate(dataset = 'FANTOM Neural')
+
+fantom_neural_count 
+```
+
+```{r}
+mpra_count <- 
+  data_input %>% 
+  filter(ext_yosef_mpra == 1) %>% 
+  group_by(library, status) %>% 
+  tally() %>% 
+  mutate(dataset = 'MPRA')
+
+mpra_count
+```
+
+```{r}
+overlap_percentages <- 
+  bind_rows(list(fantom_any_count,
+                 fantom_neural_count,
+                 mpra_count)) %>% 
+  left_join(group_totals) %>% 
+  mutate(percentage = n / total * 100,
+         status = factor(status, levels = c('Non-hit', 'Hit')))
+
+overlap_percentages
+```
+
+```{r}
+venn_colors <- c('#F29191', # pink
+                 '#F24141', # red
+                 '#F2B035', # orange
+                 '#166B8C', # blue
+                 '#26A699' # teal
+                 )
+
+ylim <- c(0, 20)
+height <- 4
+width <- 3
+```
+
+FANTOM5 any
+```{r}
+p <- overlap_percentages %>% 
+  filter(dataset == 'FANTOM Any') %>% 
+  ggplot(aes(x = library, 
+             y = percentage,
+             fill = status)) +
+  geom_bar(stat = 'identity',
+           position = 'dodge',
+           alpha = 0.7) +
+  ylim(ylim) +
+  scale_fill_manual(values = c('grey70', venn_colors[4]))
+
+save_figure(plot = p,
+            filename = 'percent_fantom5_any',
+            directory = 'figures/integration',
+            h = height, 
+            w = width)
+
+p
+```
+
+FANTOM5 neural
+```{r}
+p <- overlap_percentages %>% 
+  filter(dataset == 'FANTOM Neural') %>% 
+  ggplot(aes(x = library, 
+             y = percentage,
+             fill = status)) +
+  geom_bar(stat = 'identity',
+           position = 'dodge',
+           alpha = 0.7) +
+  ylim(ylim) +
+  scale_fill_manual(values = c('grey70', venn_colors[5]))
+
+save_figure(plot = p,
+            filename = 'percent_fantom5_neural',
+            directory = 'figures/integration',
+            h = height, 
+            w = width)
+
+p
+```
+MPRA
+```{r}
+p <- overlap_percentages %>% 
+  filter(dataset == 'MPRA') %>% 
+  ggplot(aes(x = library, 
+             y = percentage,
+             fill = status)) +
+  geom_bar(stat = 'identity',
+           position = 'dodge',
+           alpha = 0.7) +
+  ylim(ylim) +
+  scale_fill_manual(values = c('grey70', venn_colors[3]))
+
+save_figure(plot = p,
+            filename = 'percent_mpra',
+            directory = 'figures/integration',
+            h = height, 
+            w = width)
+
+p
+```
+## Session info
+```{r}
+sessionInfo()
+```

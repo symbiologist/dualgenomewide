@@ -1,0 +1,160 @@
+---
+title: "RNA Velocity loom files"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Extract and save loom files
+https://github.com/basilkhuder/Seurat-to-RNA-Velocity#multiple-sample-integration
+https://htmlpreview.github.io/?https://github.com/satijalab/seurat.wrappers/blob/master/docs/velocity.html
+http://htmlpreview.github.io/?https://github.com/satijalab/seurat-wrappers/blob/master/docs/scvelo.html
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/loom' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+#library(velocyto.R) #devtools::install_github("velocyto-team/velocyto.R")
+library(Seurat)
+library(SeuratDisk) #remotes::install_github("mojaveazure/seurat-disk")
+library(SeuratWrappers)
+```
+
+### Function for merging duplicate gene names
+```{r}
+consolidate_rows <- function(input_matrix) {
+  
+  library(data.table)
+  DT <- as.data.table(input_matrix)
+  DT[, 'row':=rownames(input_matrix)]
+  
+  # which columns are numeric 
+  tic()
+  DT_sum <- DT[, lapply(.SD, sum), by = row] %>% as.data.frame() %>% column_to_rownames('row') %>% as.matrix()
+  toc()
+  
+  sparse_mat <- Matrix::Matrix(DT_sum, sparse = TRUE)
+  sparse_mat
+  
+}
+```
+
+### Load Seurat 
+```{r}
+diff <- read_rds('data/perturbseq/derived/seurat/unified_qc.rds')
+metadata <- diff@meta.data %>% rownames_to_column('barcode')
+```
+
+### Loop to process all loom file output from velocyto
+```{r eval=FALSE}
+samples <- paste0('diff_', 1:6) %>% set_names(.)
+
+loom_list <- map(samples, function(i) {
+  barcodes <- metadata %>% filter(sample == i) %>% pull(barcode)
+  sample_number <- barcodes[1] %>% str_sub(start = nchar(barcodes[1]))
+  
+  ldat <- read.loom.matrices(file = paste0('data/perturbseq/derived/pipestance/', i, '/velocyto/', i, '.loom'))
+  loom_corrected_barcodes <- colnames(ldat$spliced) %>% str_remove('diff_[123456]:') %>% str_remove('x') %>% paste0(., '-1_', sample_number)
+  
+  colnames(ldat$spliced) <- loom_corrected_barcodes
+  colnames(ldat$unspliced) <- loom_corrected_barcodes
+  colnames(ldat$ambiguous) <- loom_corrected_barcodes
+  
+  barcodes_intersect <- intersect(barcodes, loom_corrected_barcodes)
+  
+  ldat$spliced <- ldat$spliced[, barcodes_intersect] %>% consolidate_rows()
+  ldat$unspliced <- ldat$unspliced[, barcodes_intersect] %>% consolidate_rows()
+  ldat$ambiguous <- ldat$ambiguous[, barcodes_intersect] %>% consolidate_rows()
+  
+  loom_filename <- paste0('loom_', i, '.rds')
+  ldat %>% write_rds(file.path(data_dir, loom_filename))
+  
+  ldat
+  })
+
+loom_merge <- list(spliced = map(samples, function(i) {loom_list[[i]]$spliced}) %>% Reduce(f = cbind),
+                   unspliced = map(samples, function(i) {loom_list[[i]]$unspliced}) %>% Reduce(f = cbind),
+                   ambiguous = map(samples, function(i) {loom_list[[i]]$ambiguous}) %>% Reduce(f = cbind))
+  
+loom_merge %>% write_rds(file.path(data_dir, 'loom_merge.rds'))
+```
+
+### Re-load merged loom
+```{r}
+loom_merge <- read_rds(file.path(data_dir, 'loom_merge.rds'))
+```
+
+### Seurat clusters for trajectory analysis
+```{r}
+colors <- carto_pal(n = 5, name = 'Bold')
+colors
+p_trajectory <- seurat_plot(diff, feature = 'trajectory', color_package = 'custom', color_scale = c('orangered', 'darkgreen', 'dodgerblue3', 'grey90'), do.label = F, alpha = 0.05)
+p_trajectory <- seurat_plot(diff, feature = 'trajectory', color_package = 'custom', color_scale = c("#7F3C8D", "#11A579", "#3969AC",  "#A5AA99","#F2B701"), do.label = F, alpha = 0.05)
+p_trajectory
+
+save_figure(plot = p_trajectory,
+            device = 'png',
+            directory = 'figures/perturbseq',
+            filename = 'umap_trajectory')
+```
+## Tally
+```{r}
+diff$trajectory %>% table()
+```
+
+```{r}
+diff$low_res_cluster %>% table()
+```
+
+### Prepare for anndata
+```{r}
+seurat_loom <- as.Seurat(loom_merge)
+intersection_subset <- subset(diff, cells = colnames(seurat_loom))
+```
+
+```{r}
+seurat_plot(intersection_subset, feature = 'trajectory')
+```
+
+```{r}
+seurat_loom@meta.data <- intersection_subset@meta.data # transfer metadata
+seurat_loom[['RNA']] <- seurat_loom[['spliced']]
+DefaultAssay(seurat_loom) <- 'RNA'
+
+umap_coordinates <- Embeddings(intersection_subset, reduction = 'umap')
+
+write.csv(umap_coordinates, file = file.path(data_dir, 'diff_umap.csv')) # export UMAP for scVelo
+SaveH5Seurat(seurat_loom, filename = file.path(data_dir, 'diff.h5Seurat'), overwrite = TRUE)
+Convert(file.path(data_dir, 'diff.h5Seurat'), dest = 'h5ad', overwrite = TRUE)
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+

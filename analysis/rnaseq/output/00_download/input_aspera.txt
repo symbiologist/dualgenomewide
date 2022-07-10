@@ -1,0 +1,17 @@
+ena-fast-download.py SRR067970
+ena-fast-download.py SRR067971
+ena-fast-download.py SRR067972
+ena-fast-download.py SRR067973
+ena-fast-download.py SRR067974
+ena-fast-download.py SRR067975
+ena-fast-download.py SRR067976
+ena-fast-download.py SRR067977
+ena-fast-download.py SRR097974
+ena-fast-download.py SRR097975
+ena-fast-download.py SRR097976
+ena-fast-download.py SRR179764
+ena-fast-download.py SRR179765
+ena-fast-download.py SRR316173
+ena-fast-download.py SRR316174
+ena-fast-download.py SRR353350
+ena-fast-download.py SRR518305

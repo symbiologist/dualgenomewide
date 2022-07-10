@@ -1,0 +1,154 @@
+---
+title: "Download MPRA Neural Induction Dataset"
+output: html_notebook
+---
+
+## Purpose
+Import data from Yosef/Ahituv study: https://www.sciencedirect.com/science/article/pii/S1934590919304217
+Obtain ENA metadata table from: https://www.ebi.ac.uk/ena/browser/view/PRJNA473806
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/mpra/output/00_download' # analysis file output directory
+data_dir <- 'data/mpra' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+```
+
+## Download
+Load ENA metadata tables (split by assay)
+Make sure to select columns including:
+         library_name, 
+         library_layout, 
+         library_strategy, 
+         library_selection, 
+         experiment_title,
+         sample_alias,
+         sample_title,
+         fastq_bytes,
+         fastq_md5,
+         fastq_aspera,
+         sample_accession,
+         experiment_accession,
+         run_accession
+```{r}
+srp <- bind_rows(
+  read_tsv('analysis/mpra/input/filereport_read_run_PRJNA473881_tsv.txt') %>% mutate(fastq_bytes = as.character(fastq_bytes)),
+  read_tsv('analysis/mpra/input/filereport_read_run_PRJNA473882_tsv.txt'),
+  read_tsv('analysis/mpra/input/filereport_read_run_PRJNA473883_tsv.txt'))
+
+srp
+
+```
+
+Subset file
+```{r}
+sample_subset <- srp %>% 
+  select( library_name, 
+         library_layout, 
+         library_strategy, 
+         library_selection, 
+         experiment_title,
+         sample_alias,
+         sample_title,
+         fastq_bytes,
+         fastq_md5,
+         fastq_aspera,
+         sample_accession,
+         experiment_accession,
+         run_accession) %>%
+  separate(fastq_bytes, into = c('fastq1_bytes', 'fastq2_bytes'), sep = ';') %>% 
+  separate(fastq_md5, into = c('fastq1_md5', 'fastq2_md5'), sep = ';') %>% 
+  separate(fastq_aspera, into = c('fastq1_aspera', 'fastq2_aspera'), sep = ';') %>% 
+  mutate(fastq1_gb = as.numeric(fastq1_bytes)/(1024^3),
+         fastq2_gb = as.numeric(fastq2_bytes)/(1024^3)) %>% 
+  separate(experiment_title, into = c(NA, 'experiment_title'), sep = ';') %>% 
+  select(-fastq1_bytes, -fastq2_bytes)
+
+
+sample_subset 
+```
+
+
+Calculate total fastq size
+```{r}
+sample_subset %>% pull(fastq1_gb) %>% sum(na.rm = TRUE)
+```
+```{r}
+sample_subset %>% pull(fastq2_gb) %>% sum(na.rm = TRUE)
+```
+
+Prepare a bash script using ena-fast-download.py (https://github.com/wwood/ena-fast-download) that uses aspera-connect
+Previously already set up aspera
+```{r}
+dir.create(file.path(data_dir, 'external/fastq'))
+paste('ena-fast-download.py', sample_subset$run_accession) %>% 
+  write(file.path(data_dir, 'external/fastq', 'aspera.txt'))
+```
+
+In case ena-fast-download is failing, set up manual aspera code
+```{r}
+paste0('ascp -QT -l 300m -P33001 -i /home/dwu/.aspera/connect/etc/asperaweb_id_dsa.openssh era-fasp@', c(sample_subset$fastq1_aspera, sample_subset$fastq2_aspera) %>% na.omit(), ' .') %>% 
+  write(file.path(data_dir, 'external/fastq', 'aspera_manual.txt'))
+```
+
+Run script
+```{bash eval=FALSE}
+BASE=data/mpra/external
+cd $BASE
+cd fastq
+
+while read LIST; do
+$LIST; 
+done < aspera_manual.txt
+```
+
+Check files
+```{r}
+all_files <- c(sample_subset$fastq1_aspera, sample_subset$fastq2_aspera) %>% na.omit() %>% basename() %>% str_remove('.fastq.gz')
+all_files
+```
+
+```{r}
+download_dir <- file.path(data_dir, 'external/fastq')
+downloaded_files <- list.files(download_dir, pattern = '*.gz') %>% str_remove('.fq.gz') %>% str_remove('.fastq.gz')
+downloaded_files
+```
+
+```{r}
+missing_files <- setdiff(all_files, downloaded_files)
+missing_files
+```
+
+## Export table
+```{r}
+sample_subset %>% write_tsv(file.path(analysis_dir, 'sample_table.tsv'))
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+

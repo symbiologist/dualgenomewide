@@ -1,0 +1,232 @@
+---
+title: "Load into Seurat"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Generate Seurat objects from imported data and add metadata
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/006_seurat' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(Seurat)
+library(parallel)
+```
+
+### Import feature reference
+```{r}
+features <- read_csv('data/perturbseq/derived/pipestance/features.csv')
+features
+```
+### Feature calls
+```{r}
+filtered_sgrnas <- read_tsv('analysis/perturbseq/output/004_sgrna_filtering/filtered_sgrnas.tsv.gz') %>% 
+  left_join(features %>% select(guide_identity = id,
+                                guide_target = target_gene_id))
+filtered_sgrnas
+```
+
+### sgRNA metadata to add
+```{r}
+metadata_table <- filtered_sgrnas %>% 
+  select(cell_barcode,
+         sample, 
+         condition,
+         UMI_count, 
+         z_score, 
+         guide_identity,
+         guide_target,
+         singlet_status) 
+
+metadata_table
+```
+
+### Read in filtered matrices from 005_import
+```{r}
+tic()
+unified_cellranger_matrices <- read_rds(file.path(data_dir, 'unified_cellranger_matrices.rds'))
+unified_cellbender_matrices <- read_rds(file.path(data_dir, 'unified_cellbender_matrices.rds'))
+toc()
+```
+
+## Unified
+## Import data and load into Seurat
+### Identify output files
+```{r}
+# Pull out directories of interest
+pipestance_dir <- 'data/perturbseq/derived/pipestance'
+pipestances <- list.dirs(pipestance_dir, full.names = T, recursive = F) %>% str_subset('diff')
+sample_names <- basename(pipestances) %>% set_names(.)
+names(pipestances) <- sample_names
+pipestances
+```
+
+### Load into Seurat object
+```{r}
+tic() 
+unified_cellranger <- map(sample_names, function(sample) {
+  so <- CreateSeuratObject(unified_cellranger_matrices[[sample]]$gene, project = sample)
+  so[['grna']] <- CreateAssayObject(counts = unified_cellranger_matrices[[sample]]$grna) # cellranger sgRNA counts
+  so
+  })
+toc()
+```
+
+```{r}
+unified_cellranger
+```
+
+## Add metadata
+```{r}
+tic()
+unified_cellranger <- map(unified_cellranger, function(seurat) {
+  barcodes <- colnames(seurat)
+  metadata <- as.data.frame(metadata_table %>% 
+                              filter(sample == seurat@project.name))
+  rownames(metadata) <- metadata$cell_barcode
+  metadata <- metadata[barcodes, -1]
+  AddMetaData(seurat, metadata)
+})
+toc()
+```
+
+```{r}
+unified_cellranger <- unified_cellranger %>% map(function(seurat) {PercentageFeatureSet(seurat, pattern = '^MT-', col.name = 'percent_mito')})
+unified_cellranger <- unified_cellranger %>% map(function(seurat) {PercentageFeatureSet(seurat, pattern = '^RPS|^RPL|^MRPS|^MRPL', col.name = 'percent_ribo')})
+```
+
+### Filter out zeroes
+```{r}
+tic()
+unified_cellranger <- map(unified_cellranger, function(seurat) {
+  
+  barcodes <- seurat@meta.data %>% 
+    rownames_to_column() %>% 
+    filter(nCount_RNA > 0,
+           percent_mito > 0,
+           percent_ribo > 0) %>% 
+    pull(rowname)
+  
+  subset(seurat, cells = barcodes)
+})
+toc()
+```
+
+```{r}
+unified_cellranger
+```
+## Export
+```{r}
+tic()
+
+unified_cellranger %>% write_rds(file.path(data_dir, 'unified_cellranger.rds'), compress = 'gz')
+toc()
+```
+```{r}
+rm(unified_cellranger)
+gc()
+```
+
+## Unified cellbender
+
+```{r}
+tic() 
+unified_cellbender <- map(sample_names, function(sample) {
+  so <- CreateSeuratObject(unified_cellbender_matrices[[sample]]$gene, project = sample)
+
+  so
+  })
+toc()
+```
+
+### Add sgRNA metadata
+```{r}
+tic()
+unified_cellbender <- map(unified_cellbender, function(seurat) {
+  barcodes <- colnames(seurat)
+  metadata <- as.data.frame(metadata_table %>% 
+                              filter(sample == seurat@project.name))
+  rownames(metadata) <- metadata$cell_barcode
+  metadata <- metadata[barcodes, -1]
+  AddMetaData(seurat, metadata)
+})
+toc()
+
+```
+
+### Add qc metrics (ribosomal and mitochondrial content)
+```{r}
+tic()
+
+unified_cellbender <- unified_cellbender %>% map(function(seurat) {PercentageFeatureSet(seurat, pattern = '^MT-', col.name = 'percent_mito')})
+unified_cellbender <- unified_cellbender %>% map(function(seurat) {PercentageFeatureSet(seurat, pattern = '^RPS|^RPL|^MRPS|^MRPL', col.name = 'percent_ribo')})
+
+toc()
+```
+
+### Exclude zeros
+```{r}
+tic()
+unified_cellbender <- map(unified_cellbender, function(seurat) {
+  barcodes <- seurat@meta.data %>% 
+    rownames_to_column() %>% 
+    filter(nCount_RNA > 0,
+           percent_mito > 0,
+           percent_ribo > 0) %>% 
+    pull(rowname)
+  
+  subset(seurat, cells = barcodes)
+  
+})
+toc()
+
+
+```
+```{r}
+unified_cellbender
+```
+
+## Export
+```{r}
+unified_cellbender %>% write_rds(file.path(data_dir, 'unified_cellbender.rds'), compress = 'gz')
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+

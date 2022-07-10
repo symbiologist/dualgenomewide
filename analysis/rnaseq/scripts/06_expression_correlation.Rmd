@@ -1,0 +1,78 @@
+---
+title: "Expression correlation"
+author: "David Wu"
+output: html_notebook
+---
+
+## Purpose
+Generate pairwise correlations of expression patterns
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(tictoc)
+library(WGCNA)
+```
+
+### Load universal functions and themes
+```{r}
+source('analysis/rnaseq/scripts/functions.R') # functions for this subcomponent
+
+source('analysis/universal/themes.R') # themes for all project components
+
+theme_set(theme_publication())
+```
+
+### Output directory
+```{r}
+output_dir <- 'analysis/rnaseq/output/06_expression_correlation'
+dir.create(output_dir, showWarnings = FALSE)
+```
+
+### Load expression clustering data
+```{r}
+expression_clusters <- read_tsv('analysis/rnaseq/output/04_expression_clusters/expression_clusters.tsv.gz')
+expression_clusters %>% head()
+```
+
+## Convert scaled values to matrix
+```{r}
+scaled_wide <- expression_clusters %>% 
+  filter(expression_fraction == 'polyA') %>% 
+  select(feature_id, time, scaled_expression) %>% 
+  pivot_wider(names_from = time,
+              values_from = scaled_expression)
+
+scaled_wide %>% head()
+```
+
+```{r}
+scaled_matrix <- scaled_wide %>% drop_na() %>% column_to_rownames('feature_id') %>% as.matrix()
+
+tic()
+expression_cor <- WGCNA::cor(t(scaled_matrix))
+toc()
+```
+
+```{r}
+expression_cor
+```
+
+```{r}
+expression_cor %>% write_rds('data/rnaseq/derived/other/expression_cor.rds')
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+
+

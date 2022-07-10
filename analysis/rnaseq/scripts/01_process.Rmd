@@ -1,0 +1,212 @@
+---
+title: "Process RNA-Seq data"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Purpose
+Process RNA-Seq data and run kallisto
+
+## Setup
+### Working directory
+Set working directory to project directory
+```{r setup, include=FALSE}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Output directories
+```{r}
+output_dir <- 'analysis/rnaseq/output/01_process'
+data_dir <- 'data/rnaseq/raw/fastq'
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Pipeline
+### clumpify 
+Run clumpify on data upstream of all processing (serial)
+```{bash}
+cd data/rnaseq/raw
+
+EXT=fastq.gz
+RAM=64
+THREADS=5
+for SAMPLE in `find fastq -type f -name "*.${EXT}" | sed 's!.*/!!' | sed s/.${EXT}//g | sort -u`; do # SE reads
+echo Running ${SAMPLE}
+/home/software/bbmap/clumpify.sh reorder threads=${THREADS} -Xmx${RAM}g zl=6 pigz deleteinput=t in=fastq/${SAMPLE}.${EXT} out=fastq/${SAMPLE}.fq.gz |& tee fastq/${SAMPLE}_clumpify.log
+done; date; echo "All Jobs Complete";
+```
+
+### fastQC
+```{bash}
+TOTAL_THREADS=30
+mkdir ../derived/fastqc
+time fastqc -t ${TOTAL_THREADS} fastq/*.fq.gz -o ../derived/fastqc
+```
+
+### bbduk
+Run bbduk quality/adapter/kmer trim
+First, run bbduk quality/adapter/kmer trim
+Run on command line, using semaphore to run job
+```{bash eval = FALSE}
+mkdir bbduk
+
+RAM=16; #ram per job
+THREADS=2; #threads per sample
+JOBS=10; #number of concurrent jobs; will pull a job from the queue as soon as a job completes
+
+for SAMPLE in `find fastq -type f -name *.fq.gz | sed 's!.*/!!' | sed s/.fq.gz//g | sort -u`; do
+
+  echo Running ${SAMPLE}
+
+  sem -j ${JOBS} -k time /home/software/bbmap/bbduk.sh \
+    ref=/home/software/bbmap/resources/adapters.fa \
+    threads=${THREADS} \
+    -Xmx${RAM}g \
+    mink=8 \
+    hdist=1 \
+    k=31 \
+    ktrim=r \
+    qtrim=rl \
+    qin=33 \
+    ml=20 \
+    maq=10 \
+    tpe \
+    tbo \
+    ordered=T \
+    zl=6 \
+    in1=fastq/${SAMPLE}.fq.gz \
+    out1=bbduk/${SAMPLE}.fq.gz &> bbduk/${SAMPLE}.log
+  
+done; sem --wait; date; echo 'All Jobs Complete';
+```
+
+Load libraries
+```{r, echo=FALSE, message=FALSE}
+library(tidyverse)
+```
+
+Load sequencing table and modify for loop
+```{r}
+sequencing_table <- read_csv('analysis/rnaseq/output/00_raw/fastq_table.csv') 
+sequencing_table
+```
+
+
+```{r}
+sample_table <- sequencing_table %>% 
+  select(Sample, Condition, Day, Replicate, Run, Name, Path = Output) %>% 
+  mutate(Path = str_replace(Path, 'fastq', 'bbduk')) %>% 
+  pivot_wider(-Name, names_from = Run, values_from = Path)
+sample_table
+```
+
+Combine runs 1 and 2 
+```{r}
+kallisto_dir <- 'data/rnaseq/derived/kallisto/'
+dir.create(kallisto_dir, showWarnings = FALSE, recursive = TRUE)
+
+processing_table <- sample_table %>% 
+  mutate(Input = ifelse(is.na(Run2), 
+                        Run1,
+                        paste(Run1, Run2, sep = ' ')),
+         Output = paste0(kallisto_dir, Day, '_', Replicate, '_', Condition)) %>% 
+  select(Sample, Input, Output)
+
+processing_table
+processing_table %>% write_csv(file.path(output_dir, 'processing_table.csv'), col_names = F)
+```
+
+Run kallisto on unified reference
+Run on command line via tmux
+Start in working directory 
+~7 mins clock time per sample
+```{bash eval = FALSE}
+INDEX=data/reference/derived/kallisto/unified_kallisto.idx
+BOOTSTRAPS=30;
+THREADS=10;
+JOBS=6;
+PROCESS_FILE=analysis/rnaseq/output/01_process/processing_table.csv # processing file, where each row corresponds to parameters
+NROWS=`wc -l $PROCESS_FILE | awk '{ print $1 }'` # automatically count number of rows in file
+
+# loop to run through all samples using semaphores to queue jobs
+for i in $(seq 1 ${NROWS}); do # run through sequence of 1 to nrows
+  
+  LINE=`sed "${i}q;d" $PROCESS_FILE` # parameters at nth row
+  IFS=',' read -ra PARAMS <<< "$LINE" # split parameters by comma as delimiter
+  
+  # store temporary variables
+  SAMPLE=${PARAMS[0]}
+  INPUT=${PARAMS[1]}
+  OUTPUT=${PARAMS[2]}
+  
+  sem -j ${JOBS} -k time kallisto quant -i ${INDEX} -o ${OUTPUT} -b ${BOOTSTRAPS} -t ${THREADS} --rf-stranded --single -l 200 -s 20 ${INPUT}
+  
+  # print to screen
+  echo Running Sample $i: $SAMPLE
+  echo Input: $INPUT
+  echo Output: $OUTPUT
+  
+done; sem --wait; date; echo 'All Jobs Complete';
+```
+
+## For hisat
+```{r}
+processing_table <- read_csv('analysis/rnaseq/output/01_process/processing_table.csv', col_names = F)
+hisat2_table <- processing_table %>% 
+  mutate(X2 = str_replace(X2, ' ', ','))
+hisat2_table %>% write_tsv('analysis/rnaseq/output/01_process/hisat2_table.tsv', col_names = F)
+hisat2_table
+```
+
+Run hisat2 (mainly for visualization of reads)
+```{bash}
+BASE=/media/data4/shared/ipsc_manuscript
+INDEX=/home/genomes/Homo_sapiens/Ensembl/GRCh37/grch37_snp_tran/genome_snp_tran
+THREADS=16
+OUT_DIR=data/rnaseq/derived/bam/
+PROCESS_FILE=analysis/rnaseq/output/01_process/hisat2_table.tsv;
+NROWS=`wc -l $PROCESS_FILE | awk '{ print $1 }'` # automatically count number of rows in file
+JOBS=3
+
+cd $BASE
+mkdir $OUTDIR
+
+
+hisat2bam(){
+  hisat2 -p ${2} --summary-file ${5}/${3}.log --new-summary -x ${1} -U ${4} -S ${5}/${3}.sam # align
+  samtools view -bSu -@ `expr ${2} - 1` -o ${5}/${3}_unsorted.bam ${5}/${3}.sam # convert to bam 
+  rm ${5}/${3}.sam # remove sam
+  samtools sort -@ `expr ${2} - 1` -o ${5}/${3}.bam ${5}/${3}_unsorted.bam # sort bam
+  rm ${5}/${3}_unsorted.bam # remove unsorted bam
+}
+
+export -f hisat2bam;
+
+# loop to run through all samples using semaphores to queue jobs
+for i in $(seq 1 ${NROWS}); do # run through sequence of 1 to nrows
+  
+  LINE=`sed "${i}q;d" $PROCESS_FILE` # parameters at nth row
+  IFS=$'\t' read -ra PARAMS <<< "$LINE" # split parameters by tab as delimiter
+  
+  # store temporary variables
+  NAME=${PARAMS[0]}
+  INPUT=${PARAMS[1]}
+  
+  sem -j ${JOBS} -k time hisat2bam ${INDEX} ${THREADS} ${NAME} ${INPUT} ${OUT_DIR}
+  
+  # print to screen
+  echo Running Sample $i: $NAME
+  echo Input: $INPUT
+  
+done; sem --wait; date; echo 'All Jobs Complete';
+
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

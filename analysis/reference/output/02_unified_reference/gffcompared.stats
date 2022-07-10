@@ -1,0 +1,30 @@
+# gffcompare v0.10.6 | Command line was:
+#/home/software/gffcompare-0.10.6.Linux_x86_64/gffcompare -o analysis/reference/output/002_unified_reference/gffcompared -r analysis/reference/output/001_coding_reference/coding.gtf -R -Q -s data/reference/external/GRCh37.p13.genome.fa -V analysis/reference/output/000_lncrna_reference/lncrna.gtf
+#
+
+#= Summary for dataset: analysis/reference/output/000_lncrna_reference/lncrna.gtf 
+#     Query mRNAs :   11562 in    5984 loci  (10248 multi-exon transcripts)
+#            (2010 multi-transcript loci, ~1.9 transcripts per locus)
+# Reference mRNAs :   25245 in    6837 loci  (23202 multi-exon)
+# Super-loci w/ reference transcripts:     5610
+#-----------------| Sensitivity | Precision  |
+        Base level:    42.0     |    39.9    |
+        Exon level:    28.5     |    66.9    |
+      Intron level:    25.7     |    66.6    |
+Intron chain level:    25.7     |    58.1    |
+  Transcript level:    28.0     |    61.1    |
+       Locus level:    67.9     |    77.1    |
+
+     Matching intron chains:    5957
+       Matching transcripts:    7064
+              Matching loci:    4639
+
+          Missed exons:   42331/67652	( 62.6%)
+           Novel exons:    4541/27317	( 16.6%)
+        Missed introns:   23779/41271	( 57.6%)
+         Novel introns:    2226/15896	( 14.0%)
+           Missed loci:       0/6837	(  0.0%)
+            Novel loci:       0/5984	(  0.0%)
+
+ Total union super-loci across all input datasets: 13255 
+20785 out of 20785 consensus transcripts written in analysis/reference/output/002_unified_reference/gffcompared.annotated.gtf (0 discarded as redundant)

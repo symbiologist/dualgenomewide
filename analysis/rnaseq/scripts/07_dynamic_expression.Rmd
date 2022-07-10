@@ -1,0 +1,129 @@
+---
+title: "Expression correlation"
+author: "David Wu"
+output: html_notebook
+---
+
+## Purpose
+Generate pairwise correlations of expression patterns
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(tictoc)
+```
+
+### Load universal functions and themes
+```{r}
+source('analysis/rnaseq/scripts/functions.R') # functions for this subcomponent
+
+source('analysis/universal/themes.R') # themes for all project components
+
+theme_set(theme_publication())
+```
+
+### Output directory
+```{r}
+analysis_dir <- 'analysis/rnaseq/output/07_dynamic_expression'
+dir.create(analysis_dir, showWarnings = FALSE)
+```
+
+
+### Load tximport data
+```{r}
+txi <- read_rds('data/rnaseq/derived/tximport/tximport.rds')
+```
+### Sample table
+```{r}
+sample_table <- read_tsv('analysis/rnaseq/output/02_sleuth/sample_table.tsv') %>% 
+  mutate(time = paste('D', time, sep = ''))
+sample_table
+```
+
+### DESeq pipeline
+```{r}
+conditions_table <- sample_table %>% 
+  mutate(group = paste(condition, time, sep = '_')) %>% 
+  filter(time != 'D0') %>% 
+  select(group, condition, time) %>% 
+  unique()
+
+conditions_table
+
+```
+
+```{r}
+foldchanges <- map(conditions_table$group, function(i) {
+  
+  conditions <- conditions_table %>% filter(group == i)
+  
+  sample_subset <- sample_table %>% 
+    filter(condition == conditions$condition,
+           time %in% c('D0', conditions$time)) %>% 
+    column_to_rownames('sample')
+  
+  which_samples <- rownames(sample_subset)
+    
+  # Create DESeq object
+  deseq <- DESeqDataSetFromMatrix(countData = round(txi$counts[, which_samples]),
+                                  colData = sample_subset, 
+                                  design = ~time)
+  
+
+  deseq$time <- relevel(deseq$time, ref = 'D0')
+  
+  # Find DE genes
+  tic()
+  deseq <- DESeq(deseq)
+  toc()
+  
+  deseq_res <- results(deseq, tidy = TRUE) %>% as_tibble()
+  
+  deseq_res %>% 
+    select(feature_id = row,
+           log2fc = log2FoldChange,
+           pvalue = pvalue,
+           padj = padj) %>% 
+    mutate(time = conditions$time,
+           condition = conditions$condition,
+           group = conditions$group)
+  
+}) %>% bind_rows()
+```
+
+```{r}
+foldchanges %>% 
+  filter(padj < 0.05) %>% 
+  select(feature_id) %>% 
+  unique()
+```
+
+```{r}
+foldchanges_wide <- foldchanges %>% 
+  select(-time, -condition, -pvalue) %>% 
+  mutate(group = paste(group, 'log2fc', sep = '_')) %>% 
+  pivot_wider(names_from = group, values_from = log2fc)
+
+foldchanges_wide
+```
+## Export
+```{r}
+foldchanges %>% write_tsv(file.path(analysis_dir, 'foldchanges_long.tsv.gz'))
+foldchanges_wide %>% write_tsv(file.path(analysis_dir, 'foldchanges_wide.tsv.gz'))
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+
+

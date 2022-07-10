@@ -1,0 +1,609 @@
+---
+title: "Unify reference annotations"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Purpose
+Unify lncRNA and Ensembl coding reference annotations 
+
+## Setup
+### Set working directory to project directory
+```{r setup, include=FALSE}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Output directory
+```{r}
+output_dir <- 'analysis/reference/output/02_unified_reference'
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+### Load libraries
+```{r, echo=FALSE, message=FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(GenomicFeatures)
+library(plyranges)
+library(ggExtra)
+library(patchwork)
+library(ggthemes)
+theme_set(theme_few())
+scale_colour_discrete <- scale_color_few
+```
+
+### Import annotation files
+```{r}
+lncrna_gtf <- import('analysis/reference/output/00_lncrna_reference/lncrna.gtf')
+coding_gtf <- import('analysis/reference/output/01_coding_reference/coding.gtf')
+```
+
+## gffcompare 
+Run gffcompare to find overlaps in reference files
+Need to install gffcompare (https://ccb.jhu.edu/software/stringtie/gffcompare.shtml)
+Ensure that genome fasta is unzipped and indexed by samtools faidx
+Ensure GTF files are unzipped
+```{bash}
+QUERY=analysis/reference/output/00_lncrna_reference/lncrna.gtf;
+REF=analysis/reference/output/01_coding_reference/coding.gtf;
+GENOME=data/reference/external/GRCh37.p13.genome.fa;
+OUTPUT_NAME=gffcompared
+OUTPUT_DIR=analysis/reference/output/02_unified_reference;
+
+time /home/software/gffcompare-0.10.6.Linux_x86_64/gffcompare -o $OUTPUT_DIR/${OUTPUT_NAME} -r ${REF} -R -Q -s ${GENOME} -V ${QUERY} &> $OUTPUT_DIR/gffcompare.log
+mv analysis/reference/output/00_lncrna_reference/*map ${OUTPUT_DIR} # move output to the correct directory
+```
+
+### Load gffcompare data
+```{r}
+gffcompare <- read.table('analysis/reference/output/02_unified_reference/gffcompared.lncrna.gtf.tmap', header = 1, stringsAsFactors = FALSE) %>% 
+  select(-FPKM, -TPM, -cov) %>% as_tibble()
+gffcompare
+```
+
+### Class codes
+Classification codes from de novo assembly are included in lncRNA gtf as well. Check gffcompare codes against original codes to as a sanity check
+See gffcompare link: https://ccb.jhu.edu/software/stringtie/gffcompare.shtml for explanation of codes
+```{r}
+overlapping_codes <- c('=', # complete exatch match
+                       'c', # contained in reference (intron compatible)
+                       'k', # contains reference
+                       'm', # retained introns, all introns matched
+                       'n', # retained introns, not matching
+                       'j', # multi-exon with at least one junction match
+                       'e', # single exon transfrag partially covering intron; possible pre-mRNA fragment
+                       's', # intron match on opposite strand (mapping error)
+                       'i', # fully contained within reference intron
+                       'r') # repeat (50% bases soft-masked)
+
+nonoverlapping_codes <- c('o', # opposite strand overlap with ref exon
+                          'x', # exonic overlap on opposite strand
+                          'y', # contains reference within intron
+                          'p', # polymerase run-on, no overlap
+                          'u') # no overlap
+```
+
+
+Non-overlapping transcripts
+```{r}
+gffcompare %>% filter(class_code %in% nonoverlapping_codes) %>% pull(class_code) %>% table()
+```
+
+Overlapping transcripts (expect a lot since many should match reference transcripts)
+```{r}
+gffcompare %>% filter(class_code %in% overlapping_codes) %>% pull(class_code) %>% table()
+```
+
+### Overlaps
+Summarize the transcript overlap, adding in other metadata from gtf files
+```{r}
+lncrna_t2g <- lncrna_gtf %>% 
+  filter(type == 'transcript') %>% 
+  as_tibble() %>%
+  select(lncrna_gene_id = gene_id,
+         lncrna_gene_name = gene_name,
+         lncrna_transcript_id = transcript_id,
+         original_code = class_code,
+         lncrna_strand = strand) %>% 
+  unique()
+
+coding_t2g <- coding_gtf %>% 
+  filter(type == 'transcript') %>% 
+  as_tibble() %>% 
+  select(coding_gene_id = gene_id,
+         coding_gene_name = gene_name,
+         coding_transcript_id = transcript_id,
+         coding_transcript_name = transcript_name,
+         coding_gene_type = gene_type,
+         coding_strand = strand) %>% 
+  unique()
+```
+Merge to gffcompare output 
+```{r}
+overlaps <- gffcompare %>% 
+  select(coding_transcript_id = ref_id,
+         lncrna_transcript_id = qry_id,
+         lncrna_length = len,
+         coding_length = ref_match_len,
+         class_code) %>% 
+  inner_join(lncrna_t2g) %>% # add lncrna metadata
+  left_join(coding_t2g) %>% # add coding metadata
+  mutate(classification = ifelse(class_code %in% overlapping_codes, 'Overlap', 'Non-overlap'), # temporarily classify transcripts based on class code
+         combination = ifelse(!is.na(coding_transcript_id), paste(lncrna_transcript_id, coding_transcript_id, sep = ':'), NA)) %>% # store the potential overlap combination 
+  select(lncrna_gene_name, lncrna_gene_id, lncrna_transcript_id, lncrna_strand,
+         coding_gene_name, coding_gene_id, coding_transcript_id, coding_transcript_name, coding_strand, coding_gene_type,
+         original_code,
+         class_code,
+         classification,
+         combination,
+         lncrna_length,
+         coding_length)
+
+overlaps
+```
+How many matched reference identically, as expected? Should be ~7500, came close
+```{r}
+overlaps %>% filter(original_code == '=', class_code == '=')
+```
+
+### Merge overlaps
+Plan: non-overlapping transcripts from coding and lncRNA gtfs can simply be added together to form the reference. 
+However, overlapping transcripts can simply be removed from coding gtf and replaced with the entry from the lncRNA gtf.
+First, identify true overlaps: either class code of =, or potential overlaps that share a large fraction of sequence (on the same strand).
+Start with potential overlaps and determine the fraction overlap and distance between transcriptional start sites (TSS)
+```{r}
+potential_overlaps <- overlaps %>% filter(class_code != '=', lncrna_strand == coding_strand) 
+potential_overlaps
+```
+
+### Find overlap fraction 
+```{r}
+# Function to examine overlap of two transcripts and determine TSS distance
+overlap_fraction <- function(query_gtf,
+                             subject_gtf,
+                             query_id,
+                             subject_id) {
+  
+  # gene combination
+  combination <- paste(query_id, subject_id, sep = ':') 
+  
+  # subset gtf
+  query <- query_gtf[query_gtf$type == 'transcript' & query_gtf$transcript_id == query_id]
+
+  subject <- subject_gtf[subject_gtf$type == 'transcript' & subject_gtf$transcript_id == subject_id]
+  
+  # find overlap
+  overlap <- intersect(query, subject) # same strand intersection
+  
+  if(length(overlap) == 0) { # no overlap, set these to 0
+    overlap_length <- 0
+    tss_distance <- 0
+    jaccard <- 0 
+  } else {
+    # find tss distance
+    tss_distance <- distance(resize(query, 1), resize(subject, 1))
+    overlap_length <- width(overlap)
+    jaccard <- overlap_length/width(union(query, subject))# intersect / union
+  }
+  
+  # length info
+  query_length <- as.integer(query$length)
+  subject_length <- as.integer(subject$length)
+  
+  
+  tibble('query' = query_id,
+         'subject' = subject_id,
+         'combination' = combination,
+         'query_length' = query_length,
+         'subject_length' = subject_length,
+         'overlap' = overlap_length,
+         'jaccard' = round(jaccard, 2),
+         'f_query' = round(overlap_length/query_length, 2),
+         'f_subject' = round(overlap_length/subject_length, 2),
+         'tss_distance' = tss_distance) 
+}
+```
+
+No overlap
+```{r}
+overlap_fraction(query_gtf = lncrna_gtf,
+                 subject_gtf = coding_gtf,
+                 query_id = 'TCONS_00000100',
+                 subject_id = 'ENST00000294576')
+
+```
+
+Some overlap
+```{r}
+overlap_fraction(query_gtf = lncrna_gtf,
+                 subject_gtf = coding_gtf,
+                 query_id = 'TCONS_00000007',
+                 subject_id = 'ENST00000440038')
+
+```
+Complete overlap
+```{r}
+overlap_fraction(query_gtf = lncrna_gtf,
+                 subject_gtf = coding_gtf,
+                 query_id = 'TCONS_00000018',
+                 subject_id = 'ENST00000419160')
+```
+
+Calculate fraction overlap and tss distance for all potential overlaps
+```{r}
+# Prefilter gtf for potential overlap transcripts
+lncrna_gtf_potential <- lncrna_gtf %>% filter(type == 'transcript', transcript_id %in% potential_overlaps$lncrna_transcript_id)
+coding_gtf_potential <- coding_gtf %>% filter(type == 'transcript', transcript_id %in% potential_overlaps$coding_transcript_id)
+
+# takes about 10 minutes
+potential_overlap_fraction <- map(1:nrow(potential_overlaps), function(i) {
+  overlap_fraction(query_gtf = lncrna_gtf_potential,
+                   subject_gtf = coding_gtf_potential,
+                   query_id = potential_overlaps$lncrna_transcript_id[i],
+                   subject_id = potential_overlaps$coding_transcript_id[i])
+}) %>% bind_rows()
+
+potential_overlap_fraction
+```
+
+How many share more than 50% overlap with each other?
+```{r}
+p <- potential_overlap_fraction %>% 
+  ggplot(aes(x = f_query, 
+             y = f_subject,
+             color = jaccard >= 0.5)) + 
+  geom_jitter(alpha = 0.5) + 
+  coord_equal() + 
+  theme(legend.position = 'bottom') 
+ggMarginal(p, type = 'histogram')
+```
+Examine jaccard similarities 
+```{r}
+potential_overlap_fraction %>% 
+  ggplot(aes(x = jaccard)) + 
+  geom_histogram() 
+```
+
+How many are within 1 kb TSS? Most
+```{r}
+p <- potential_overlap_fraction %>% ggplot(aes(x = tss_distance + 1, y = jaccard)) + geom_jitter(alpha = 0.5) + scale_x_log10()
+ggMarginal(p, type = 'histogram')
+```
+Jaccard vs query or subject overlap fraction
+```{r}
+p1 <- potential_overlap_fraction %>% ggplot(aes(x = f_query, y = jaccard)) + geom_jitter(alpha = 0.5) + coord_equal()
+p2 <- potential_overlap_fraction %>% ggplot(aes(x = f_subject, y = jaccard)) + geom_jitter(alpha = 0.5) + coord_equal()
+list(ggMarginal(p1, type = 'histogram'),
+     ggMarginal(p2, type = 'histogram')) %>% wrap_plots()
+
+```
+### Identify true overlaps
+True overlaps: define as TSS within 1 kb (for LH ID, since CRISPRi window is small) and jaccard >= 0.5
+```{r}
+true_overlaps <- potential_overlap_fraction %>% filter(jaccard >= 0.5, tss_distance <= 1000) %>% select(query, subject)
+true_overlaps
+```
+Add to previously classified overlaps
+```{r}
+classified_true_overlaps <- overlaps %>% filter(classification == 'Overlap', lncrna_strand == coding_strand) %>% select(lncrna_transcript_id, coding_transcript_id)
+classified_true_overlaps
+```
+
+### Merge
+Merge all true overlaps with lncrna metadata
+```{r}
+all_true_overlaps <- bind_rows(true_overlaps %>% select(lncrna_transcript_id = query,
+                                                        coding_transcript_id = subject),
+                               classified_true_overlaps) %>% 
+  inner_join(lncrna_t2g %>% select(lncrna_transcript_id, lncrna_gene_id, lncrna_gene_name)) %>% 
+  inner_join(coding_t2g %>% select(coding_transcript_id, coding_transcript_id, coding_gene_name)) # bring in coding gene names because not all names may match, though >90% do
+
+all_true_overlaps
+```
+
+### Filter coding gtf
+Now, remove all of these reference transcripts from coding_gtf. This can then be merged to the lncRNA gtf after gene names have been tidied up
+```{r}
+# if gene_id corresponds to this transcript and this transcript alone, the gene model must also be removed
+single_t2g <- coding_t2g %>% add_count(coding_gene_id) %>% filter(n == 1, coding_transcript_id %in% all_true_overlaps$coding_transcript_id) %>% pull(coding_gene_id)
+
+coding_gtf_subset <- coding_gtf %>% 
+  filter(!(transcript_id %in% all_true_overlaps$coding_transcript_id),
+         !(gene_id %in% single_t2g)) %>% 
+  mutate(source = 'Reference') %>% 
+  sort()
+
+coding_gtf_subset
+
+```
+
+
+### Dual targeting
+Some genes from coding gtf (lncRNAs, pseudogenes, etc) are entirely mapped to genes in the lncRNA reference. This is expected.
+However, some are dually targeted by both coding and lncRNA libraries for some reason (turns out to be just 3 genes). 
+Identify these genes and put those transcripts back so that they have an entry (they now have a "gene" record but no "transcript" record) for later analysis
+Add a metadata column "dual_target" to keep track of them in both the coding and noncoding record
+```{r}
+features_from_transcripts <- coding_gtf_subset %>% filter(type == 'transcript') %>% as_tibble() %>% pull(feature_id) %>% unique()
+features_from_genes <- coding_gtf_subset %>% filter(type == 'gene') %>% as_tibble() %>% pull(feature_id) %>% unique()
+perfect_matches <- setdiff(features_from_genes, features_from_transcripts)
+
+dual_targets <- coding_gtf %>% filter(feature_id %in% perfect_matches, library == 'Coding') %>% mutate(dual_target = TRUE)
+dual_targets
+```
+
+For final coding gtf, remove gene models for perfect matches then add dual targets back
+```{r}
+coding_gtf_final <- coding_gtf_subset %>% 
+  filter(!(feature_id %in% perfect_matches)) %>% # remove perfect match gene models
+  c(dual_targets) # add dually targted
+
+coding_gtf_final
+```
+
+## Integrate
+### lncRNA metadata
+Integrate lncRNA metadata. Since gene names for lncRNAs are mostly arbitrary and do not correspond to a static ID, combine all gene names for each LH ID (gene_id) as a lookup table for downstream use.
+However, the transcript names can be kept individual to facilitate potential transcript-level analysis.
+The LH ID will be used as the feature identifier for most analyses since this is the unit on which the screen is performed (for coding, use gene_name as described in 001_coding_reference.Rmd)
+```{r}
+overlaps_name_table <- all_true_overlaps %>% 
+  pivot_longer(cols = ends_with('gene_name'), # combine all gene names into 1 column
+               names_to = 'source',
+               values_to = 'gene_name') %>% 
+  select(gene_id = lncrna_gene_id, 
+         transcript_id = lncrna_transcript_id,
+         ref_id = coding_transcript_id,
+         gene_name) %>% 
+  unique()
+
+original_name_table <- lncrna_gtf@elementMetadata %>% 
+  as_tibble() %>% 
+  filter(type == 'transcript') %>% 
+  select(gene_id, transcript_id, ref_id, gene_name) %>%
+  unique()
+
+lncrna_name_table <- bind_rows(overlaps_name_table, original_name_table) %>% unique() %>% add_count(transcript_id) # combine
+lncrna_name_table 
+```
+
+For each transcript, collate ref_id and names
+```{r}
+transcripts_collated <- map(lncrna_name_table$transcript_id %>% unique(), function(i) {
+  name_subset <- filter(lncrna_name_table, transcript_id == i)
+  
+  ref_ids <- name_subset %>% pull(ref_id) %>% unique() %>% na.omit() %>% sort() %>% paste(collapse = ':')
+  
+  if(ref_ids == '') {
+    ref_ids <- NA #maintain NA for genes without reference overlap
+  }
+
+  transcript_names <- name_subset %>% pull(gene_name) %>% unique() %>% na.omit() %>% sort() %>% paste0(collapse = ':')
+  
+  tibble('gene_id' = name_subset$gene_id %>% unique(),
+         'transcript_id' = i,
+         'ref_id' = ref_ids,
+         'transcript_name' = transcript_names)
+}) %>% 
+  bind_rows() %>% 
+  mutate(source = ifelse(is.na(ref_id), 'Cufflinks', 'Reference'))
+
+transcripts_collated
+```
+
+For each gene, collate gene names 
+```{r}
+genes_collated <- map(lncrna_name_table$gene_id %>% unique(), function(i) {
+  gene_subset <- filter(lncrna_name_table, gene_id == i)
+  
+  # since gene_name was set to gene_id if missing, remove the gene_id from the name and collapse the rest
+  gene_names <- gene_subset %>% pull(gene_name) %>% unique() %>% na.omit() %>% sort() %>% str_subset(i, negate = TRUE) %>% paste0(collapse = ':') 
+  
+  if(gene_names == '') {
+    gene_names <- i #maintain NA for genes without reference overlap
+  }
+
+  tibble('gene_id' = i,
+         'gene_name' = gene_names)
+}) %>% bind_rows() 
+
+genes_collated
+
+```
+All names 
+```{r}
+all_names_collated <- inner_join(genes_collated, transcripts_collated) 
+all_names_collated %>% add_count(gene_id) %>% arrange(-n)
+```
+
+Add back to reference
+```{r}
+lncrna_gtf_renamed <- lncrna_gtf %>% 
+  as.data.frame() %>% 
+  select(-source,
+         -gene_name, # remove old ids
+         -transcript_name,
+         -ref_id) %>% 
+  left_join(all_names_collated) %>% # replace with new
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) %>% 
+  filter(type != 'gene',
+         type != 'transcript')
+
+lncrna_gtf_renamed
+```
+
+Minimal metadata
+```{r}
+metadata <- lncrna_gtf_renamed@elementMetadata %>% 
+  as_tibble() %>% 
+  select(source, 
+         feature_id,
+         gene_name,
+         gene_id,
+         transcript_name,
+         transcript_id,
+         lh_id) %>% 
+  unique()
+```
+
+Update gene source: if all transcripts have reference id, then set source = 'Reference'. If all Cufflink, then "Cufflinks". If multiple, "Multiple"
+```{r}
+gene_sources <- map(unique(metadata$gene_id), function(i) {
+  sources <- filter(metadata, gene_id == i) %>% pull(source) %>% unique()
+  
+  if(length(sources) > 1) {
+    source <- 'Multiple'
+  } else {
+    source <- sources
+  }
+  
+  tibble('gene_id' = i,
+         'source' = source)  
+  
+}) %>% bind_rows()
+
+gene_sources
+```
+
+## Transcript and gene models
+Redo transcript and gene models
+Use GenomicFeatures to add these
+```{r}
+txdb <- makeTxDbFromGRanges(lncrna_gtf_renamed)
+
+transcript_structure <- transcripts(txdb)
+gene_structure <- genes(txdb)
+```
+
+
+Add missing metadata and to add back to main gtf
+
+```{r}
+transcript_gtf <- transcript_structure %>% 
+  as.data.frame() %>% 
+  mutate(transcript_id = tx_name,
+         type = 'transcript') %>% 
+  left_join(metadata) %>% 
+  select(-tx_id, -tx_name) %>% 
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+
+transcript_gtf
+
+```
+
+```{r}
+gene_gtf <- gene_structure %>% 
+  as.data.frame() %>% 
+  mutate(type = 'gene') %>% 
+  left_join(metadata %>% 
+              select(feature_id,
+                     gene_name,
+                     gene_id, 
+                     lh_id) %>% unique()) %>%
+  left_join(gene_sources) %>% # add source info
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+
+gene_gtf
+```
+
+## Final lncRNA reference
+```{r}
+lncrna_gtf_final <- c(lncrna_gtf_renamed,
+                      transcript_gtf, 
+                      gene_gtf) %>% 
+  sort() %>% 
+  mutate(length = width,
+         library = 'lncRNA',
+         gene_type = 'lncRNA',
+         dual_target = ifelse(gene_name %in% dual_targets$feature_id, TRUE, FALSE)) # if dual targeted from coding library
+
+
+columns_to_export <- c('source', 
+                       'type',
+                       'score',
+                       'phase',
+                       'feature_id',
+                       'gene_id',
+                       'gene_name',
+                       'transcript_name',
+                       'transcript_id',
+                       'exon_id',
+                       'internal_id',
+                       'ref_id',
+                       'class_code',
+                       'lh_id',
+                       'tss_id',
+                       'length',
+                       'gene_type', 
+                       'library',
+                       'dual_target')
+
+
+lncrna_gtf_final <- lncrna_gtf_final[,columns_to_export] 
+lncrna_gtf_final
+```
+## Unify references
+```{r}
+unified_gtf <- c(lncrna_gtf_final, coding_gtf_final) %>% sort()
+unified_gtf
+```
+
+Minimal gtf with only essential metadata; keep all biotypes
+```{r}
+unified_minimal <- unified_gtf %>% select(source, type, score, phase, gene_id, transcript_id, gene_name, feature_id, library, dual_target)
+unified_minimal
+```
+
+Metadata
+```{r}
+unified_metadata <- unified_gtf %>% 
+  mutate(chromosome = seqnames) %>% 
+  as_tibble() %>% 
+  filter(type != 'exon') %>% 
+  select(feature_id, gene_id, gene_name, transcript_name, transcript_id, lh_id, length, gene_type, source, chromosome, type, library, dual_target) %>% unique()
+
+```
+
+t2g table
+```{r}
+unified_t2g <- unified_metadata %>% 
+  filter(type == 'transcript') %>% 
+  select(feature_id, gene_id, gene_name, transcript_name, transcript_id, length, chromosome, library, dual_target) %>% unique()
+```
+
+## Export
+```{r}
+export(unified_minimal, file.path(output_dir, 'unified_minimal.gtf'))
+export(unified_gtf, file.path(output_dir, 'unified.gtf'))
+
+unified_metadata %>% write_tsv(file.path(output_dir, 'unified_metadata.tsv.gz'))
+unified_t2g %>% write_tsv(file.path(output_dir, 'unified_t2g.tsv.gz'))
+```
+
+For cellranger (summarizes at gene id and gene-name level), set gene name and gene_id to feature_id
+```{r}
+unified_minimal %>% 
+  mutate(gene_id = feature_id,
+         gene_name = feature_id) %>% 
+  export(file.path(output_dir, 'unified_for_cellranger.gtf'))
+```
+
+For generating transcript fasta, export exon data only
+```{r}
+unified_gtf %>% 
+  filter(type == 'exon') %>% 
+  export(file.path(output_dir, 'unified_transcripts.gtf'))
+```
+
+gzip all unified reference files to reduce size (and for github )
+```{bash}
+gzip -kf analysis/reference/output/02_unified_reference/*.gtf
+```
+
+## Session info
+```{r}
+sessionInfo()
+```

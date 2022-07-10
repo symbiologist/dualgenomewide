@@ -1,0 +1,167 @@
+---
+title: "Prepare data for sgRNA calling "
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Extract sgRNA data for Joseph Replogle to run his Poisson-Gaussian mixture model for sgRNA calling
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/003_sgrna_calling' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(tictoc)
+```
+
+
+For Joseph Replogle's sgRNA calling algorithm, two input files are required
+A table where each row represents a read aligned to a unique guide identity, cellranger-corrected cell barcode, and cellranger-corrected UMI.
+And a barcodes.tsv of valid cell barcodes
+
+### General tags
+Chromium cellular and molecular barcode information for each read is stored as TAG fields:
+
+Tag	Type	Description
+CB	Z	Chromium cellular barcode sequence that is error-corrected and confirmed against a list of known-good barcode sequences.
+CR	Z	Chromium cellular barcode sequence as reported by the sequencer.
+CY	Z	Chromium cellular barcode read quality. Phred scores as reported by sequencer.
+UB	Z	Chromium molecular barcode sequence that is error-corrected among other molecular barcodes with the same cellular barcode and gene alignment.
+UR	Z	Chromium molecular barcode sequence as reported by the sequencer.
+UY	Z	Chromium molecular barcode read quality. Phred scores as reported by sequencer.
+BC	Z	Sample index read.
+QT	Z	Sample index read quality. Phred scores as reported by sequencer.
+TR	Z	Trimmed sequence. For the Single Cell 3' v1 chemistry, this is trailing sequence following the UMI on Read 2. For the Single Cell 3' v2 chemistry, this is trailing sequence following the cell and molecular barcodes on Read 1.
+xf	i	Extra alignment flags. The bit flags can be interpreted as follows: 1 - The read is confidently mapped to a feature; 2 - The read maps to a feature that the majority of other reads with this UMI did not; 8 - This read is representative for the molecule and can be treated as a UMI count. Bits 4, 16 and 32 are used internally by 10X.
+
+### Feature-specific tags
+fb	Z	Chromium Feature Barcode sequence that is error-corrected and confirmed against known features barcode sequences from the feature reference.
+fr	Z	Chromium Feature Barcode sequence as reported by the sequencer.
+fq	Z	Chromium Feature Barcode read quality. Phred scores as reported by sequencer.
+fx	Z	Feature identifier matched to this Feature Barcode read. Specified in the id column of the feature reference.
+
+Use bamtools filter to extract reads corresponding to features from bam
+
+Subset bam files to feature reads only using 10x instructions
+https://kb.10xgenomics.com/hc/en-us/articles/360022448251-Is-there-way-to-filter-the-BAM-file-produced-by-10x-pipelines-with-a-list-of-barcodes-
+```{bash eval=FALSE}
+BASE=/media/data4/shared/ipsc_manuscript/data/perturbseq/derived/pipestance; # use full path
+cd $BASE;
+mkdir ../sgrna;
+
+THREADS=4 # additional threads for compression
+
+# filter for those with feature barcode (fb), cell barcode (CB), and UMI (UB)
+for SAMPLE in `find $BASE -name 'possorted_genome_bam.bam' | sort -u`;
+do    
+  DIR=$(dirname ${SAMPLE})
+	echo $SAMPLE
+	echo $DIR
+	cd $DIR
+	time samtools view $SAMPLE | LC_ALL=C grep -F fb:Z | LC_ALL=C grep -F CB:Z | LC_ALL=C grep -F UB:Z | samtools view -b -@ $THREADS -o features.bam &
+done
+```
+
+Convert to tables
+```{bash eval=FALSE}
+# filter for those with feature barcode (fb), cell barcode (CB), and UMI (UB)
+for SAMPLE in `find $BASE -name 'features.bam' | sort -u`;
+do
+  DIR=$(dirname ${SAMPLE})
+	echo $SAMPLE
+	echo $DIR
+	cd $DIR
+time samtools view features.bam | awk '{for (i=12; i<=NF; ++i) { if ($i ~ "^CB:Z:|^UB:Z:|^fx:Z:"){ td[substr($i,1,2)] = substr($i,6,length($i)-5); } }; print "@"$1"\t"td["fx"]"\t"td["CB"]"\t"td["UB"] }' > features.txt &
+done
+```
+
+Copy features table to a folder to transfer to Joseph
+```{bash eval=FALSE}
+cd $BASE
+
+for SAMPLE in `find ${BASE} -mindepth 1 -maxdepth 1 -type d -name '*' | sed 's!.*/!!' | sort -u`;
+do
+echo $SAMPLE
+mkdir ../sgrna/${SAMPLE}
+gzip ${SAMPLE}/outs/features.txt
+rsync -avh ${SAMPLE}/outs/features.txt.gz ../sgrna/${SAMPLE}/guide_barcode_reads.txt.gz
+done
+```
+
+Copy barcodes files as well (cellranger + cellbender)
+```{bash eval=FALSE}
+for SAMPLE in `find ${BASE} -mindepth 1 -maxdepth 1 -type d -name '*' | sed 's!.*/!!' | sort -u`;
+do
+echo $SAMPLE
+rsync -avh ${SAMPLE}/outs/cellbender/cellbender_cell_barcodes.csv ../sgrna/${SAMPLE}/barcodes_cellbender.csv
+rsync -avh ${SAMPLE}/outs/filtered_feature_bc_matrix/barcodes.tsv.gz ../sgrna/${SAMPLE}/barcodes_cellranger.tsv.gz
+done
+```
+
+
+
+Take union of cellranger and cellbender barcodes
+```{r}
+samples <- list.dirs('data/perturbseq/derived/sgrna', recursive = F) %>% str_subset('diff|ipsc')
+
+barcodes_table <- map(samples, function(i) {
+  barcodes_cellranger_unified <- read_tsv(file.path(i, 'barcodes_cellranger.tsv.gz'), col_names = FALSE)
+  barcodes_cellbender_unified <- read_csv(file.path(i, 'barcodes_cellbender.csv'), col_names = FALSE)
+  
+  barcodes_intersect <- intersect(barcodes_cellranger_unified$X1,
+                                  barcodes_cellbender_unified$X1) 
+  
+  barcodes_union <- c(barcodes_cellranger_unified$X1,
+                      barcodes_cellbender_unified$X1) %>% 
+    unique()
+  
+  barcodes_union %>% as.data.frame() %>% write_tsv(file.path(i, 'barcodes.tsv.gz'), col_names = FALSE)
+  
+  tibble(sample = basename(i),
+         barcode = barcodes_union,
+         pipeline = case_when(
+           barcode %in% barcodes_intersect ~ 'All',
+           barcode %in% barcodes_cellranger_unified$X1 ~ 'cellranger unified',
+           barcode %in% barcodes_cellbender_unified$X1 ~ 'cellbender unified'
+         ))
+}) %>% 
+  bind_rows()
+```
+
+Send data to Joseph Replogle!  
+
+## Export
+```{r}
+barcodes_table %>% select(-pipeline) %>% write_tsv(file.path(analysis_dir, 'barcodes_table.tsv.gz'))
+
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

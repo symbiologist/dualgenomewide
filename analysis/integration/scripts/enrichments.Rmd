@@ -1,0 +1,163 @@
+---
+title: "Enrichment of external datasets"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+## Purpose
+Identify external datasets of interest with enrichments for screen hits
+
+## Setup 
+### Working directory
+#### Set working directory to project directory (ipsc_manuscript)
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file()) 
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(patchwork)
+library(ggthemes)
+library(pheatmap)
+```
+
+### Load themes and functions
+```{r}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+
+theme_set(theme_publication())
+```
+
+
+### Directories
+```{r}
+analysis_dir <- 'analysis/integration/output/enrichment'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+```
+
+```{r}
+master <- read_tsv('analysis/integration/output/00_integrate/master_wide.tsv.gz')
+```
+
+
+```{r}
+variables <- str_subset(colnames(master), 'ext')
+variables
+```
+
+```{r}
+enrich <- map(variables, function(i) {
+  map(c('Coding', 'lncRNA'), function(which_library) {
+    map(c('Differentiation', 'Dual', 'Proliferation', 'All', 'Differentiation+Dual', 'Proliferation+Dual'), function(which_pheno) {
+      
+      enrich_subset <- master %>% 
+        filter(neighbor_overall_status != 'Neighbor hit',
+               library == which_library) %>% 
+        select(feature_id, primary_pheno, dataset = {{i}})
+      
+      if(nrow(enrich_subset) > 0) {
+        # primary pheno
+        if(which_pheno == 'All') {
+          pheno_subset <- c('Differentiation', 'Dual', 'Proliferation')
+        } else if (which_pheno == 'Differentiation+Dual') {
+          pheno_subset <- c('Differentiation', 'Dual')
+        } else if (which_pheno == 'Proliferation+Dual') {
+          pheno_subset <- c('Proliferation', 'Dual')
+        } else {
+          pheno_subset <- which_pheno
+        }
+        
+        hits <- enrich_subset %>% filter(primary_pheno %in% pheno_subset) %>% pull(feature_id)  
+        overlapping_features <- enrich_subset %>% filter(dataset == 1) %>% pull(feature_id) 
+        
+        universe <- enrich_subset %>% pull(feature_id) %>% unique()
+        
+        #Test enrichment for hits
+        enrichment_results <- enrichment_test(list1 = hits,
+                                              list2 = overlapping_features,
+                                              cat1 = c('Hit', 'Non-hit'),
+                                              cat2 = c('Overlap', 'Non-overlap'),
+                                              background = universe,
+                                              print = FALSE)
+        
+        double_positive_features <- intersect(hits, overlapping_features)
+        
+        tibble(library = which_library,
+               primary_pheno = which_pheno,
+               dataset = i,
+               odds = enrichment_results$fisher$estimate,
+               pval = enrichment_results$fisher$p.value,
+               n_overlaps = double_positive_features %>% n_distinct(),
+               n_hits = length(hits),
+               n_features = length(overlapping_features),
+               f_hits = round(n_overlaps/n_hits, 3))
+        
+      } else {
+        
+        tibble(library = which_library,
+               primary_pheno = which_pheno,
+               dataset = i,
+               region = region,
+               odds = 0,
+               pval = 1,
+               n_overlaps = 0,
+               n_hits = 0,
+               n_features = 0,
+               f_hits = 0)
+      }
+      
+    }) %>% bind_rows()
+  }) %>% bind_rows() 
+}) %>% bind_rows() 
+  
+enrich 
+```
+
+
+## Enhancer
+```{r}
+enhancer_summary <- master %>% 
+  select(feature_id:primary_pheno, 
+         contains('FANTOM'),
+  ) %>% 
+  mutate(fantom_enhancer = rowSums(select(., contains('FANTOM'))),
+         status = ifelse(primary_pheno == 'None', 'Non-hit', 'Hit')) %>% 
+  select(feature_id:primary_pheno, fantom_enhancer, everything())
+
+enhancer_summary %>% 
+  filter(fantom_enhancer > 1) %>% 
+  group_by(library, status) %>% 
+  tally() %>% 
+   left_join(enhancer_summary %>% 
+              group_by(library) %>% 
+              tally() %>% 
+              dplyr::rename(total = n)) %>% 
+  mutate(frac = n / total)
+```
+```{r}
+enhancer_summary %>% 
+  filter(fantom_enhancer > 1) %>% 
+  group_by(library) %>% 
+  tally() %>% 
+  left_join(enhancer_summary %>% 
+              group_by(library) %>% 
+              tally() %>% 
+              dplyr::rename(total = n)) %>% 
+  mutate(frac = n / total)
+```
+
+## Export 
+```{r eval=FALSE}
+enrich %>% write_tsv(file.path(analysis_dir, 'enrich.tsv.gz'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```

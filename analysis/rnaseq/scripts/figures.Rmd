@@ -1,0 +1,230 @@
+---
+title: "Figures from Transcriptomic Analysis"
+author: "David Wu"
+output: html_notebook
+---
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(patchwork)
+library(ggcorrplot)
+library(pheatmap)
+library(extrafont)
+library(RColorBrewer)
+loadfonts()
+```
+
+### Load themes and functions
+```{r}
+source('analysis/universal/themes.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/universal/functions.R') # themes for all project components
+
+source('analysis/rnaseq/scripts/functions.R') # functions for this subcomponent
+```
+
+### Output directory
+```{r}
+figures_dir <- 'figures/rnaseq'
+dir.create(figures_dir, showWarnings = FALSE)
+```
+
+
+
+# Expression clusters
+```{r, fig.height=6, fig.width=12}
+expression_clusters <- read_tsv('analysis/rnaseq/output/04_expression_clusters/expression_clusters.tsv.gz')
+
+line_alpha <- 0.05
+line_size = 0.05
+
+detected <- expression_clusters %>% 
+  filter(cluster != 'Undetected', # exclude undetected transcripts
+         expression_fraction == cluster_fraction) %>% # plot the correct fraction (total or polya) for each feature
+  cluster_plots(line_alpha = line_alpha, line_size = line_size, subtitle = TRUE) 
+
+unassigned <- expression_clusters %>% 
+  filter(cluster == 0, # exclude unassigned
+         expression_fraction == cluster_fraction) %>% # plot the correct fraction (total or polya) for each feature
+  mutate(cluster = 'Unassigned') %>% # change label for plotting
+  cluster_plots(color_palette = 'manual', colors = 'grey50', line_alpha = line_alpha, line_size = line_size, subtitle = TRUE, title_prefix = '', exclude = FALSE) 
+
+undetected <- expression_clusters %>% 
+  filter(cluster == 'Undetected', 
+         expression_fraction == 'polyA') %>% 
+  cluster_plots(color_palette = 'manual', colors = 'transparent', title_prefix = '', exclude = FALSE, subtitle = TRUE)
+
+p1 <- wrap_plots(c(detected[2:5], unassigned, detected[6:9], undetected),
+                 nrow = 2)
+
+p1
+
+save_figure(plot = p1,
+            filename = 'expression_clusters',
+            directory = figures_dir,
+            h = 6, 
+            w = 12)
+```
+# Grey
+```{r, fig.height=6, fig.width=12}
+expression_clusters <- read_tsv('analysis/rnaseq/output/04_expression_clusters/expression_clusters.tsv.gz')
+
+line_alpha <- 0.05
+line_size = 0.05
+
+detected <- expression_clusters %>% 
+  filter(cluster != 'Undetected', # exclude undetected transcripts
+         expression_fraction == cluster_fraction) %>% # plot the correct fraction (total or polya) for each feature
+  cluster_plots(line_alpha = line_alpha, line_size = line_size, subtitle = TRUE, hide_axis = TRUE, color_palette = 'manual', colors = rep('grey90', 10)) 
+
+unassigned <- expression_clusters %>% 
+  filter(cluster == 0, # exclude unassigned
+         expression_fraction == cluster_fraction) %>% # plot the correct fraction (total or polya) for each feature
+  mutate(cluster = 'Unassigned') %>% # change label for plotting
+  cluster_plots(color_palette = 'manual', colors = 'grey40', line_alpha = line_alpha, line_size = line_size, subtitle = TRUE, hide_axis = TRUE, title_prefix = '', exclude = FALSE) 
+
+undetected <- expression_clusters %>% 
+  filter(cluster == 'Undetected', 
+         expression_fraction == 'polyA') %>% 
+  cluster_plots(color_palette = 'manual', colors = 'transparent', title_prefix = '', exclude = FALSE, subtitle = TRUE, hide_axis = TRUE)
+
+p1 <- wrap_plots(c(detected[2:5], unassigned, detected[6:9], undetected),
+                 nrow = 2)
+
+save_figure(plot = p1,
+            filename = 'expression_clusters_grey',
+            directory = figures_dir,
+            device = 'png',
+            h = 6, 
+            w = 12)
+
+p1
+```
+# Median clusters
+```{r, fig.height=6, fig.width=12}
+median_clusters <- read_tsv('analysis/rnaseq/output/04_expression_clusters/all_medians.tsv')
+
+median_detected <- median_clusters %>% 
+  cluster_plots(line_alpha = 0.8, line_size = 1, group = 'cluster', subtitle = TRUE) 
+
+median_unassigned <- median_clusters %>% 
+  filter(cluster == 0) %>% 
+  mutate(cluster = 'Unassigned') %>% 
+  cluster_plots(line_alpha = 0.8, line_size = 1, color_palette = 'manual', colors = 'grey', group = 'cluster', subtitle = TRUE, exclude = FALSE, title_prefix = '') 
+
+p2 <- c(median_detected[2:5], median_unassigned, median_detected[6:9]) %>% wrap_plots(nrow = 2)
+
+save_figure(plot = p2,
+            filename = 'median_clusters',
+            directory = figures_dir,
+            h = 6, 
+            w = 12,
+            dpi = 300)
+
+p2
+```
+
+## Heatmap
+```{r}
+foldchanges <- read_tsv('analysis/rnaseq/output/07_dynamic_expression/foldchanges_long.tsv.gz')
+
+# variance-stabilized data
+vsd <- read_rds('data/rnaseq/derived/tximport/deseq.rds')$vsd
+```
+### Select DE genes
+```{r}
+top_fc <- foldchanges %>% 
+  filter(pvalue < 0.05,
+         condition == 'polyA',
+         abs(log2fc) > 0.5) %>% 
+  add_count(feature_id) %>% 
+  group_by(feature_id) %>% 
+  summarize(max = max(abs(log2fc)),
+            med = median(abs(log2fc)),
+            n = n) %>% 
+  ungroup() %>% 
+  mutate(library = ifelse(str_detect(feature_id, '^LH'), 'lncRNA', 'Coding'))
+  
+top_fc
+```
+```{r}
+top_fc %>% 
+  ggplot(aes(x = n)) +
+  geom_histogram() +
+  facet_wrap(~library, scales = 'free_y')
+  
+```
+```{r}
+top_fc %>% 
+  ggplot(aes(x = med)) +
+  geom_histogram() +
+  facet_wrap(~library, scales = 'free_y')
+```
+
+## lncRNA
+```{r}
+
+redblue <- colorRampPalette(rev(brewer.pal(11, 'RdBu')))
+
+polya_samples <- str_subset(vsd$sample, pattern = 'polyA')
+lncrna_features <- top_fc %>% filter(library == 'lncRNA', n > 3, med > 1) %>% pull(feature_id) %>% unique()
+
+lncrna_heatmap <- pheatmap(assay(vsd)[lncrna_features, polya_samples], 
+                           cluster_cols = F,
+                           cluster_rows = T,
+                           show_colnames = F,
+                           show_rownames = F, 
+                           scale = 'row',
+                           clustering_distance_rows = 'correlation',
+                           clustering_method = 'average',
+                           treeheight_row = 0,
+                           color = redblue(255))
+
+save_figure(plot = lncrna_heatmap,
+            filename = 'lncrna_heatmap',
+            directory = figures_dir,
+            h = 4,
+            w = 4)
+
+
+```
+
+### Coding
+
+```{r}
+coding_subset <- top_fc %>% filter(library == 'Coding', n > 3, med > 1) %>% pull(feature_id) %>% unique()
+
+coding_heatmap <- pheatmap(assay(vsd)[coding_subset, polya_samples], 
+                           cluster_cols = F,
+                           cluster_rows = T,
+                           show_colnames = F,
+                           show_rownames = F, 
+                           scale = 'row',
+                           clustering_distance_rows = 'correlation',
+                           clustering_method = 'average',
+                           treeheight_row = 0,
+                           color = redblue(255))
+
+save_figure(plot = coding_heatmap,
+            filename = 'coding_heatmap',
+            directory = figures_dir,
+            h = 4,
+            w = 4)
+
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+
+

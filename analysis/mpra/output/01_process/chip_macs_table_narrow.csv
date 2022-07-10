@@ -1,0 +1,14 @@
+H3K27ac_0hr_rep1,data/mpra/derived/chip_bam//H3K27ac_0hr_rep1.bam,data/mpra/derived/chip_bam//input_0hr_rep1.bam,data/mpra/derived/chip_macs/H3K27ac_0hr_rep1,H3K27ac,0hr,rep1,H3K27ac,Narrow
+H3K27ac_0hr_rep2,data/mpra/derived/chip_bam//H3K27ac_0hr_rep2.bam,data/mpra/derived/chip_bam//input_0hr_rep2.bam,data/mpra/derived/chip_macs/H3K27ac_0hr_rep2,H3K27ac,0hr,rep2,H3K27ac,Narrow
+H3K27ac_12hr_rep1,data/mpra/derived/chip_bam//H3K27ac_12hr_rep1.bam,data/mpra/derived/chip_bam//input_12hr_rep1.bam,data/mpra/derived/chip_macs/H3K27ac_12hr_rep1,H3K27ac,12hr,rep1,H3K27ac,Narrow
+H3K27ac_12hr_rep2,data/mpra/derived/chip_bam//H3K27ac_12hr_rep2.bam,data/mpra/derived/chip_bam//input_12hr_rep2.bam,data/mpra/derived/chip_macs/H3K27ac_12hr_rep2,H3K27ac,12hr,rep2,H3K27ac,Narrow
+H3K27ac_24hr_rep1,data/mpra/derived/chip_bam//H3K27ac_24hr_rep1.bam,data/mpra/derived/chip_bam//input_24hr_rep1.bam,data/mpra/derived/chip_macs/H3K27ac_24hr_rep1,H3K27ac,24hr,rep1,H3K27ac,Narrow
+H3K27ac_24hr_rep2,data/mpra/derived/chip_bam//H3K27ac_24hr_rep2.bam,data/mpra/derived/chip_bam//input_24hr_rep2.bam,data/mpra/derived/chip_macs/H3K27ac_24hr_rep2,H3K27ac,24hr,rep2,H3K27ac,Narrow
+H3K27ac_3hr_rep1,data/mpra/derived/chip_bam//H3K27ac_3hr_rep1.bam,data/mpra/derived/chip_bam//input_3hr_rep1.bam,data/mpra/derived/chip_macs/H3K27ac_3hr_rep1,H3K27ac,3hr,rep1,H3K27ac,Narrow
+H3K27ac_3hr_rep2,data/mpra/derived/chip_bam//H3K27ac_3hr_rep2.bam,data/mpra/derived/chip_bam//input_3hr_rep2.bam,data/mpra/derived/chip_macs/H3K27ac_3hr_rep2,H3K27ac,3hr,rep2,H3K27ac,Narrow
+H3K27ac_48hr_rep1,data/mpra/derived/chip_bam//H3K27ac_48hr_rep1.bam,data/mpra/derived/chip_bam//input_48hr_rep1.bam,data/mpra/derived/chip_macs/H3K27ac_48hr_rep1,H3K27ac,48hr,rep1,H3K27ac,Narrow
+H3K27ac_48hr_rep2,data/mpra/derived/chip_bam//H3K27ac_48hr_rep2.bam,data/mpra/derived/chip_bam//input_48hr_rep2.bam,data/mpra/derived/chip_macs/H3K27ac_48hr_rep2,H3K27ac,48hr,rep2,H3K27ac,Narrow
+H3K27ac_6hr_rep1,data/mpra/derived/chip_bam//H3K27ac_6hr_rep1.bam,data/mpra/derived/chip_bam//input_6hr_rep1.bam,data/mpra/derived/chip_macs/H3K27ac_6hr_rep1,H3K27ac,6hr,rep1,H3K27ac,Narrow
+H3K27ac_6hr_rep2,data/mpra/derived/chip_bam//H3K27ac_6hr_rep2.bam,data/mpra/derived/chip_bam//input_6hr_rep2.bam,data/mpra/derived/chip_macs/H3K27ac_6hr_rep2,H3K27ac,6hr,rep2,H3K27ac,Narrow
+H3K27ac_72hr_rep1,data/mpra/derived/chip_bam//H3K27ac_72hr_rep1.bam,data/mpra/derived/chip_bam//input_72hr_rep1.bam,data/mpra/derived/chip_macs/H3K27ac_72hr_rep1,H3K27ac,72hr,rep1,H3K27ac,Narrow
+H3K27ac_72hr_rep2,data/mpra/derived/chip_bam//H3K27ac_72hr_rep2.bam,data/mpra/derived/chip_bam//input_72hr_rep2.bam,data/mpra/derived/chip_macs/H3K27ac_72hr_rep2,H3K27ac,72hr,rep2,H3K27ac,Narrow

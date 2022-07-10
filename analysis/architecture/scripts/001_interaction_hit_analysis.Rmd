@@ -1,0 +1,1499 @@
+---
+title: "Genomic interaction analysis"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Purpose
+Analyze interactions data in context of screen hits
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load libraries
+```{r message=FALSE}
+library(tidyverse)
+library(GenomicRanges)
+library(GenomicFeatures)
+library(GenomicInteractions)
+library(rtracklayer)
+library(plyranges)
+library(ggforce)
+library(ggthemes)
+library(rcartocolor)
+library(pheatmap)
+library(extrafont)
+```
+
+### Directories
+```{r}
+analysis_dir <- 'analysis/architecture/output/001_interaction_hit_analysis'
+figure_dir <- 'figures/architecture'
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(figure_dir, showWarnings = FALSE)
+```
+
+### Functions and themes
+```{r}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+#source('') # functions for this component
+
+```
+
+###Interaction data
+```{r}
+interaction_master <- read_tsv('analysis/architecture/output/000_interaction/interaction_master.tsv.gz')
+```
+
+### Screen data
+```{r}
+neighbor_integration <- read_tsv('analysis/screen/output/03_neighbors/neighbor_hits.tsv.gz')
+neighbor_wide <- read_tsv('analysis/screen/output/03_neighbors/neighbor_wide.tsv.gz')
+```
+
+
+
+### Feature subset
+```{r}
+interaction_features <- c(interaction_master$feature_id.x %>% unique(),
+                          interaction_master$feature_id.y %>% unique()) %>% unique()
+
+screen_features <- neighbor_integration$feature_id %>% unique()
+```
+
+```{r}
+interaction_master %>% group_by(category) %>% summarize(median_dist = median(distance))
+```
+```{r}
+assays <- c('Differentiation', 'Proliferation')
+libraries <- c('Coding', 'lncRNA')
+distances <- c(1e4, 1e5, 1e6, 1e7, 1e8)
+```
+
+## Analysis of linear distances to neighbor hits
+
+```{r fig.height=4, fig.width=3}
+plot_input <- 
+  neighbor_integration %>% 
+  filter(library == 'lncRNA',
+         full_status != 'Neighbor hit',
+         locus_ambiguity == 'Non-ambiguous',
+         assay == 'Differentiation')
+
+p <- bind_rows(plot_input %>% filter(status == 'Hit') %>% mutate(group = 'Hits'), plot_input %>% mutate(group = 'All')) %>% 
+  ggplot(aes(y = neighbor_hit_distance, 
+             x = group,
+             fill = group)) +
+  theme_publication() +
+  geom_boxplot(alpha = 0.5,
+               outlier.shape = NA) +
+  scale_y_log10(breaks = c(1, 10, 100, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8),
+                labels = c('1 bp', '10 bp', '100 bp', '1 kb', '10 kb', '100 kb', '1 Mb', '10 Mb', '100 Mb'),
+                limits = c(1, 1e8)) +
+  scale_fill_manual(values = c('grey50', 'dodgerblue4')) +
+  labs(x = '',
+       y = 'Distance to Nearest Coding Hit') +
+  theme(axis.title.y = element_text(size = 9),
+        axis.text = element_text(size = 7))
+
+save_figure(plot = p,
+            directory = figure_dir,
+            w = 2,
+            h = 3,
+            filename = 'distance_boxplot'
+            )
+
+p
+```
+
+```{r}
+p_all <- neighbor_integration %>% 
+  filter(library == 'lncRNA',
+         locus_ambiguity == 'Non-ambiguous',
+         assay == 'Differentiation') %>% 
+  ggplot(aes(x = neighbor_hit_distance + 1)) +
+  theme_publication() +
+  geom_histogram(alpha = 0.8, position = 'identity', bins = 100, fill = 'grey50') + 
+  scale_x_log10(breaks = c(1, 10, 100, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8),
+                labels = c('1 bp', '10 bp', '100 bp', '1 kb', '10 kb', '100 kb', '1 Mb', '10 Mb', '100 Mb'),
+                limits = c(1, 1e8)) +
+  labs(x = 'Distance') +
+  scale_fill_manual(values = c('orangered', 'grey60'))
+
+p_all
+```
+
+###Statistics
+```{r}
+neighbor_distances <- neighbor_integration %>% 
+  filter(full_status != 'Neighbor hit',
+         locus_ambiguity == 'Non-ambiguous') %>% 
+  select(assay, library, full_status, neighbor_hit_distance) %>% 
+  mutate(log10_distance = log10(neighbor_hit_distance + 1))
+```
+
+```{r}
+map(assays, function(i) {
+  map(libraries, function(j) {
+    
+    neighbor_distances_subset <- neighbor_distances %>% filter(assay == i, library == j)
+    wilcox_res <- wilcox.test(neighbor_distances_subset %>% filter(full_status == 'Hit') %>% pull(log10_distance),
+                              neighbor_distances_subset %>% pull(log10_distance))
+  
+    tibble(assay = i,
+           library = j,
+           wilcox_pval = wilcox_res$p.value)
+  }) %>% bind_rows()
+}) %>% bind_rows() %>% 
+  mutate(wilcox_padj = p.adjust(wilcox_pval, method = 'BH'))
+```
+
+
+Are neighbors coexpressed?
+```{r}
+cor_threshold <- 0.5
+
+neighbor_hit_cor_long <- 
+  neighbor_integration %>% 
+  mutate(combination = ifelse(library == 'Coding', 
+                              paste(feature_id, neighbor_hit_id, sep = ':'),
+                              paste(neighbor_hit_id, feature_id, sep = ':')),
+         cor_category = case_when(
+           neighbor_hit_cor > cor_threshold ~ 'Positive',
+           neighbor_hit_cor < -cor_threshold ~ 'Negative',
+           TRUE ~ 'Non-correlated')) %>% 
+  select(status = full_status,
+         feature_id,
+         neighbor_hit_id,
+         library,
+         assay,
+         combination,
+         direction,
+         neighbor_direction,
+         neighbor_hit_distance,
+         neighbor_hit_cor,
+         cor_category)
+            
+neighbor_hit_cor_long
+
+```
+
+
+Median correlation?
+```{r}
+neighbor_hit_cor_long %>% 
+  filter(status != 'Neighbor hit') %>% 
+  drop_na() %>% 
+  group_by(status, direction, assay) %>% 
+  summarize(median_cor = median(neighbor_hit_cor))
+```
+
+
+```{r}
+neighbor_hit_cor_long %>% 
+  summarize(median = median(neighbor_hit_cor, na.rm = TRUE))
+```
+
+### Are neighbors enriched for correlated or anti-correlated expression?
+```{r}
+neighbor_hit_cor_enrichment_table <- neighbor_hit_cor_long %>% 
+  filter(status != 'Neighbor hit') %>% 
+  select(combination, library, assay, status, cor_category, status, neighbor_hit_distance)
+
+neighbor_hit_cor_enrichment_table
+```
+```{r}
+neighbor_subset <- neighbor_hit_cor_enrichment_table %>% 
+  filter(library == 'lncRNA',
+         neighbor_hit_distance > 0)
+
+correlated_combinations <-  neighbor_subset %>% filter(cor_category == 'Positive') %>% pull(combination)
+
+hit_combinations <- neighbor_subset %>% filter(status == 'Hit') %>% pull(combination)
+
+cor_enrichment <- enrichment_test(list1 = correlated_combinations,
+                                  list2 = hit_combinations,
+                                  cat1 = c('Correlated', 'Non-correlated'),
+                                  cat2 = c('Hit', 'Non-hit'),
+                                  background = neighbor_subset$combination)
+```
+
+```{r}
+neighbor_hit_cor_enrichment <- map(c(assays, 'All'), function(i){
+  map(libraries, function(j){
+    map(distances, function(k) {
+      map(c('Positive', 'Negative'), function(l) {
+        
+        if(i == 'All') {
+          neighbor_subset <- neighbor_hit_cor_enrichment_table %>% 
+            filter(library == j)  
+        } else {
+          neighbor_subset <- neighbor_hit_cor_enrichment_table %>% 
+            filter(assay == i,
+                 library == j)  
+        }
+        
+        
+        correlated_combinations <- neighbor_subset %>% filter(cor_category == l, neighbor_hit_distance < k) %>% pull(combination)
+        hit_combinations <- neighbor_subset %>% filter(status == 'Hit') %>% pull(combination)
+        
+        cor_enrichment <- enrichment_test(list1 = correlated_combinations,
+                                          list2 = hit_combinations,
+                                          cat1 = c('Correlated', 'Non-correlated'),
+                                          cat2 = c('Hit', 'Non-hit'),
+                                          background = neighbor_subset$combination)
+        
+        tibble(assay = i,
+               library = j,
+               distance = k,
+               cor_category = l,
+               n_overlap = intersect(correlated_combinations, hit_combinations) %>% length(),
+               odds = cor_enrichment$fisher$estimate,
+               conf1 = cor_enrichment$fisher$conf.int[1],
+               conf2 = cor_enrichment$fisher$conf.int[2],
+               pval = cor_enrichment$fisher$p.value)    
+      }) %>% bind_rows()
+    }) %>% bind_rows()
+  }) %>% bind_rows()
+}) %>% bind_rows() %>% 
+  mutate(log2odds = log2(odds),
+         padj = p.adjust(pval, method = 'BH'),
+         significant = ifelse(padj < 0.05, TRUE, FALSE))
+
+neighbor_hit_cor_enrichment 
+```
+
+```{r fig.height = 6, fig.width = 8}
+neighbor_hit_cor_enrichment %>% 
+  ggplot(aes(x = distance,
+             y = log2(odds),
+             fill = significant)) +
+  geom_bar(stat = 'identity') +
+  scale_x_log10()+
+  facet_wrap(~assay + library + cor_category, nrow = 3)
+```
+
+Odds
+```{r}
+p <- neighbor_hit_cor_enrichment %>% 
+  filter(library == 'lncRNA',
+         assay == 'All',
+         cor_category == 'Positive') %>% 
+  ggplot(aes(x = distance,
+             y = odds,
+             fill = significant)) +
+  geom_bar(stat = 'identity') +
+  geom_errorbar(aes(ymin = conf1,
+                    ymax = conf2),
+                width = 0.2) +
+  scale_x_log10(breaks = c(1e4, 1e5, 1e6, 1e7,1e8),
+                labels = c('10kb', '100kb', '1Mb', '10Mb', '100Mb'))+
+  scale_fill_manual(values = c('grey80', 'red')) +
+  geom_hline(yintercept = 1, linetype = 'dashed') +
+  labs(y = 'Odds of correlated expression',
+       x = 'Distance')
+
+save_figure(plot = p,
+            directory = figure_dir,
+            w = 4,
+            h = 3,
+            filename = 'odds_distance_cor'
+            )
+p
+```
+Number
+```{r}
+neighbor_hit_cor_enrichment %>% 
+  filter(library == 'lncRNA',
+         assay == 'All',
+         cor_category == 'Positive')
+```
+
+### Are neighbors likely to have the same pheno direction?
+
+```{r}
+neighbor_direction <- neighbor_integration %>% 
+  filter(full_status == 'Hit') %>% 
+  select(feature_id, library, assay, direction, neighbor_direction, pheno, neighbor_hit_id, neighbor_hit_distance, neighbor_pheno, neighbor_hit_cor) %>% 
+  mutate(combination = paste(feature_id, neighbor_hit_id, sep = ':'),
+         neighbor_directionality = ifelse(neighbor_pheno < 0, 'Negative', 'Positive'))
+
+neighbor_direction
+```
+
+```{r}
+neighbor_direction_enrich <- map(c(assays, 'All'), function(i) {
+  map(libraries, function(j) {
+    map(distances, function(k) {
+      
+      if(i == 'All') {
+        neighbor_direction_enrichment <- neighbor_direction %>% filter(library == j, neighbor_hit_distance < k)
+      } else {
+        neighbor_direction_enrichment <- neighbor_direction %>% filter(assay == i, library == j, neighbor_hit_distance < k)
+      }
+      
+      hit1 <- neighbor_direction_enrichment %>% filter(direction == 'Positive') %>% pull(feature_id)
+      hit2 <- neighbor_direction_enrichment %>% filter(neighbor_directionality == 'Positive') %>% pull(feature_id)
+      hit_all <- neighbor_direction_enrichment %>% pull(feature_id) %>% unique()
+      
+      enrich <- enrichment_test(list1 = hit1,
+                                list2 = hit2,
+                                cat1 = c('Positive', 'Negative'),
+                                cat2 = c('Positive', 'Negative'),
+                                background = hit_all)
+      
+      tibble(assay = i,
+             library = j,
+             distance = k,
+             n_overlap = intersect(hit1, hit2) %>% length(),
+             n_diagonal = enrich$contingency[1,1] + enrich$contingency[2,2],
+             n_total = length(hit_all),
+             f_shared = round(n_diagonal/n_total, 3),
+             odds = enrich$fisher$estimate,
+             conf1 = enrich$fisher$conf.int[1],
+             conf2 = enrich$fisher$conf.int[2],
+             pval = enrich$fisher$p.value)
+      
+      
+    }) %>% bind_rows()
+  }) %>% bind_rows()
+}) %>% bind_rows() %>% 
+  mutate(log2odds = log2(odds),
+         padj = p.adjust(pval, method = 'BH'),
+         significant = ifelse(padj < 0.05, TRUE, FALSE))
+
+neighbor_direction_enrich
+
+```
+```{r}
+neighbor_direction_enrich %>% filter(assay == 'All', library =='lncRNA')
+```
+
+Odds 
+```{r fig.height = 4, fig.width=12}
+neighbor_direction_enrich %>% 
+  ggplot(aes(x = distance,
+             y = odds,
+             fill = significant)) +
+  geom_bar(stat = 'identity') +
+  scale_x_log10() +
+  facet_wrap(~library + assay, nrow = 2, scales = 'free_y')
+```
+
+```{r}
+neighbor_direction_enrich %>% 
+  ggplot(aes(x = distance,
+             y = f_shared,
+             fill = significant)) +
+  geom_bar(stat = 'identity') +
+  scale_x_log10() +
+  facet_wrap(~library + assay, nrow = 2)
+```
+Fraction shared
+```{r fig.width = 6, fig.height=4}
+p <- neighbor_direction_enrich %>% 
+  filter(library == 'lncRNA',
+         assay == 'All') %>% 
+  ggplot(aes(x = distance,
+             y = f_shared,
+             fill = significant)) +
+  geom_bar(stat = 'identity') +
+  scale_x_log10(breaks = c(1e4, 1e5, 1e6, 1e7,1e8),
+                labels = c('10kb', '100kb', '1Mb', '10Mb', '100Mb'))+
+  scale_fill_manual(values = c('grey80', 'red')) +
+  geom_hline(yintercept = 0.5, linetype = 'dashed') +
+  ylim(c(0,1)) +
+  labs(y = 'Fraction with shared direction',
+       x = 'Distance')
+
+save_figure(plot = p,
+            directory = figure_dir,
+            w = 4,
+            h = 3,
+            filename = 'fshared_distance'
+            )
+p
+```
+Odds
+```{r}
+p <- neighbor_direction_enrich %>% 
+  filter(library == 'lncRNA',
+         assay == 'All') %>% 
+  ggplot(aes(x = distance,
+             y = odds,
+             fill = significant)) +
+  geom_bar(stat = 'identity') +
+  scale_x_log10(breaks = c(1e4, 1e5, 1e6, 1e7,1e8),
+                labels = c('10kb', '100kb', '1Mb', '10Mb', '100Mb'))+
+  scale_fill_manual(values = c('grey80', 'red')) +
+  geom_hline(yintercept = 1, linetype = 'dashed') +
+  labs(y = 'Odds of shared direction',
+       x = 'Distance')
+
+save_figure(plot = p,
+            directory = figure_dir,
+            w = 4,
+            h = 3,
+            filename = 'odds_distance'
+            )
+p
+```
+
+
+
+
+## For all hits, do they share the same phenotype direction within a certain distance?
+```{r}
+neighbor_direction_enrichment <- neighbor_direction %>% 
+  filter(library == 'lncRNA') %>% 
+  mutate(feature_id = paste(assay, feature_id)) %>% filter(neighbor_hit_distance < 1e5)
+
+hit1 <- neighbor_direction_enrichment %>% filter(direction == 'Positive') %>% pull(feature_id)
+hit2 <- neighbor_direction_enrichment %>% filter(neighbor_directionality == 'Positive') %>% pull(feature_id)
+
+hit_all <- neighbor_direction_enrichment %>% pull(feature_id) %>% unique()
+
+enrichment_test(list1 = hit1,
+                list2 = hit2,
+                cat1 = c('Positive', 'Negative'),
+                cat2 = c('Positive', 'Negative'),
+                background = hit_all)$fisher  
+```
+
+```{r}
+map(distances, function(k) {
+  neighbor_direction_enrichment <- neighbor_direction %>% mutate(feature_id = paste(assay, feature_id)) %>% filter(neighbor_hit_distance < k)
+  
+  hit1 <- neighbor_direction_enrichment %>% filter(direction == 'Positive') %>% pull(feature_id)
+  hit2 <- neighbor_direction_enrichment %>% filter(neighbor_directionality == 'Positive') %>% pull(feature_id)
+  
+  hit_all <- neighbor_direction_enrichment %>% pull(feature_id) %>% unique()
+  
+  enrich <- enrichment_test(list1 = hit1,
+                                list2 = hit2,
+                                cat1 = c('Positive', 'Negative'),
+                                cat2 = c('Positive', 'Negative'),
+                                background = hit_all)
+      
+      tibble(distance = k,
+             n_overlap = intersect(hit1, hit2) %>% length(),
+             n_diagonal = enrich$contingency[1,1] + enrich$contingency[2,2],
+             n_total = length(hit_all),
+             f_shared = round(n_diagonal/n_total, 3),
+             odds = enrich$fisher$estimate,
+             pval = enrich$fisher$p.value)
+}) %>% bind_rows() %>% 
+  mutate(log2odds = log2(odds),
+         padj = p.adjust(pval, method = 'BH'),
+         significant = ifelse(padj < 0.05, TRUE, FALSE))
+
+
+
+   
+```
+
+```{r}
+neighbor_direction_enrichment %>% filter(neighbor_direction == 'Same')
+```
+### Shared direction and correlation
+```{r}
+neighbor_direction_enrich <- map(c(assays, 'All'), function(i) {
+  map(libraries, function(j) {
+    map(distances, function(k) {
+      
+      if(i == 'All') {
+        neighbor_direction_enrichment <- neighbor_direction %>% filter(library == j, neighbor_hit_distance < k)
+      } else {
+        neighbor_direction_enrichment <- neighbor_direction %>% filter(assay == i, library == j, neighbor_hit_distance < k)
+      }
+      
+      hit1 <- neighbor_direction_enrichment %>% filter(neighbor_direction == 'Same') %>% pull(feature_id)
+      hit2 <- neighbor_direction_enrichment %>% filter(neighbor_hit_cor > cor_threshold) %>% pull(feature_id)
+      hit_all <- neighbor_direction_enrichment %>% pull(feature_id) %>% unique()
+      
+      enrich <- enrichment_test(list1 = hit1,
+                                list2 = hit2,
+                                cat1 = c('Same', 'Opposite'),
+                                cat2 = c('Correlated', 'Uncorrelated'),
+                                background = hit_all)
+      
+      tibble(assay = i,
+             library = j,
+             distance = k,
+             n_overlap = intersect(hit1, hit2) %>% length(),
+             n_total = length(hit_all),
+             f_overlap = n_overlap/n_total,
+             odds = enrich$fisher$estimate,
+             conf1 = enrich$fisher$conf.int[1],
+             conf2 = enrich$fisher$conf.int[2],
+             pval = enrich$fisher$p.value)
+      
+      
+    }) %>% bind_rows()
+  }) %>% bind_rows()
+}) %>% bind_rows() %>% 
+  mutate(log2odds = log2(odds),
+         padj = p.adjust(pval, method = 'BH'),
+         significant = ifelse(padj < 0.05, TRUE, FALSE))
+
+neighbor_direction_enrich
+
+```
+
+Fraction shared
+```{r fig.width = 6, fig.height=4}
+p <- neighbor_direction_enrich %>% 
+  filter(library == 'lncRNA',
+         assay == 'All') %>% 
+  ggplot(aes(x = distance,
+             y = f_overlap,
+             fill = significant)) +
+  geom_bar(stat = 'identity') +
+  scale_x_log10(breaks = c(1e4, 1e5, 1e6, 1e7,1e8),
+                labels = c('10kb', '100kb', '1Mb', '10Mb', '100Mb'))+
+  scale_fill_manual(values = c('grey80', 'red')) +
+  ylim(c(0,1)) +
+  labs(y = 'Fraction with shared direction',
+       x = 'Distance')
+
+save_figure(plot = p,
+            directory = figure_dir,
+            w = 4,
+            h = 3,
+            filename = 'fshared_pheno_cor_distance'
+            )
+p
+```
+Odds
+```{r}
+p <- neighbor_direction_enrich %>% 
+  filter(library == 'lncRNA',
+         assay == 'All') %>% 
+  ggplot(aes(x = distance,
+             y = odds,
+             fill = significant)) +
+  geom_bar(stat = 'identity') +
+  scale_x_log10(breaks = c(1e4, 1e5, 1e6, 1e7,1e8),
+                labels = c('10kb', '100kb', '1Mb', '10Mb', '100Mb'))+
+  scale_fill_manual(values = c('grey80', 'red')) +
+  geom_hline(yintercept = 1, linetype = 'dashed') +
+  labs(y = 'Odds of shared direction',
+       x = 'Distance')
+
+save_figure(plot = p,
+            directory = figure_dir,
+            w = 4,
+            h = 3,
+            filename = 'odds_pheno_cor_distance'
+            )
+p
+```
+
+### How many lncRNAs are within 100kb of neighbor hit with shared direction or expression?
+```{r}
+shared_neighborhood <- neighbor_hit_cor_long %>% 
+  filter(neighbor_hit_distance < 1e5, 
+         status == 'Hit', 
+         neighbor_direction == 'Same' | neighbor_hit_cor > cor_threshold) 
+
+
+shared_neighborhood %>% 
+  select(library, feature_id) %>% 
+  unique() %>% 
+  group_by(library) %>% 
+  tally()
+```
+Total hits
+```{r}
+neighbor_integration %>% filter(full_status == 'Hit') %>% 
+  group_by(library, assay) %>% 
+  tally()
+```
+
+
+## Overlapping, divgent, and antisense loci pairs
+```{r}
+neighbor_integration
+```
+```{r}
+locus_pairs <- neighbor_wide %>%
+  filter(library == 'lncRNA',
+         locus_type != 'Intergenic',
+         diff_full_status != 'Neighbor hit',
+         locus_ambiguity == 'Non-ambiguous') %>% 
+  select(feature_id, gene_name, diff_pheno, diff_full_status, starts_with('locus'), starts_with('diff_neighbor'), starts_with('neighbor'))
+
+locus_pairs
+```
+```{r}
+locus_pairs %>% 
+  ggplot(aes(x = locus_cor)) +
+  geom_histogram() +
+  facet_wrap(~diff_full_status, scales = 'free_y')
+```
+```{r}
+locus_pairs %>% 
+  ggplot(aes(x = locus_cor)) +
+  geom_histogram(bins = 30) 
+```
+
+### Expression correlation
+```{r}
+expression_cor <- read_rds('data/rnaseq/derived/other/expression_cor.rds')
+```
+
+```{r}
+locus_pair_genes <- intersect(locus_pairs$feature_id, rownames(expression_cor))
+screened_genes <- intersect(neighbor_integration %>% filter(library == 'Coding') %>% pull(feature_id), rownames(expression_cor))
+
+#random_cor <- sample(expression_cor[locus_pair_genes, screened_genes], size = nrow(locus_pairs))
+random_set <- expression_cor[locus_pair_genes, screened_genes] %>% as.data.frame() %>% rownames_to_column() %>% as_tibble() %>% pivot_longer(cols = -rowname, names_to = 'gene2', values_to = 'cor')
+random_subset <- random_set %>% group_by(rowname) %>% sample_n(1)
+random_subset %>% 
+  ggplot(aes(x = cor)) +
+  geom_histogram()
+```
+```{r}
+p_locus_pairs <- locus_pairs %>% 
+  ggplot(aes(x = locus_cor^2)) +
+  geom_histogram(bins = 100) +
+  labs(x = 'R^2',
+       y = 'Count',
+       title = 'Expression relationship of lncRNA-coding gene pairs')
+
+save_figure(plot = p_locus_pairs,
+            dir = 'figures/architecture',
+            filename = 'histogram_locus_pairs')
+p_locus_pairs
+```
+
+```{r}
+p_random <- random_subset %>% 
+  ggplot(aes(x = cor^2)) +
+  geom_histogram(bins = 100) +
+
+ labs(x = 'R^2',
+       y = 'Count',
+       title = 'Expression relationship of random gene pairs')
+
+save_figure(plot = p_random,
+            dir = 'figures/architecture',
+            filename = 'histogram_random_pairs')
+p_random
+```
+
+
+```{r}
+ks.test(random_subset$cor^2,
+        locus_pairs$locus_cor^2)
+
+plot(ecdf(random_subset$cor^2),  
+     col = "blue") 
+plot(ecdf(locus_pairs$locus_cor^2),  
+     add = TRUE,  
+     lty = "dashed", 
+     col = "red") 
+```
+
+```{r}
+cor_windows <- map(seq(0.1, 1, by = 0.05), function(window) {
+  
+  random_cors <- random_subset %>% filter(cor < window, cor > -window) %>% pull(cor)
+  locus_cors <- locus_pairs %>% filter(locus_cor < window, locus_cor > -window) %>% pull(locus_cor)
+  
+  test_res <- ks.test(random_cors,
+                      locus_cors)  
+  
+  tibble('window' = window,
+         'pvalue' = round(test_res$p.value, 3))
+}) %>% bind_rows()
+
+cor_windows
+  
+  
+
+```
+```{r}
+cor_windows <- map(seq(0.1, 0.9, by = 0.1), function(window) {
+  
+  random_cors <- random_subset %>% filter(cor^2 > window) %>% pull(cor)
+  locus_cors <- locus_pairs %>% filter(locus_cor^2 > window) %>% pull(locus_cor)
+  
+  test_res <- ks.test(random_cors^2,
+                      locus_cors^2)  
+  
+  tibble('window' = window,
+         'pvalue' = round(test_res$p.value, 3))
+}) %>% bind_rows()
+
+cor_windows
+  
+  
+```
+
+```{r}
+ks.test(x = random_subset$cor,
+        y = locus_pairs$locus_cor)
+
+ks.test(x = random_subset$cor,
+        y = locus_pairs %>% filter(locus_type == 'Antisense') %>% pull(locus_cor))
+```
+
+```{r}
+locus_pairs %>% 
+  filter(locus_ambiguity == 'Non-ambiguous') %>% 
+  ggplot(aes(x = locus_cor)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~locus_type, scales = 'free_y')
+```
+```{r}
+locus_pairs %>% 
+  filter(locus_ambiguity == 'Non-ambiguous') %>% 
+  ggplot(aes(x = locus_cor)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~locus_type, scales = 'free_y', nrow = 3)
+```
+```{r}
+locus_pairs %>% 
+  filter(locus_ambiguity == 'Non-ambiguous') %>% 
+  ggplot(aes(x = locus_cor, color = locus_type)) +
+  stat_ecdf()
+```
+
+
+```{r}
+locus_pairs %>% 
+  filter(status == 'Hit',
+         locus_type %in% c('Overlapping', 'Divergent', 'Antisense'),
+         locus_cor > 0.7 | locus_cor < -0.7)
+```
+## Correlated/anticorrelated expression
+```{r}
+locus_pairs %>% 
+  filter(diff_full_status == 'Hit',
+         locus_type %in% c('Overlapping', 'Divergent', 'Antisense'),
+         locus_cor^2 > 0.7)
+```
+Locus pair is a coding hit
+```{r}
+ locus_pairs %>% 
+  filter(diff_full_status == 'Hit',
+         locus_type %in% c('Overlapping', 'Divergent', 'Antisense'),
+         locus_pair_diff_status == 'Hit' )
+```
+```{r}
+ locus_pairs %>% 
+  filter(diff_full_status == 'Hit',
+         locus_type %in% c('Overlapping', 'Divergent', 'Antisense'),
+         locus_pair_diff_status == 'Hit',
+         locus_pair_diff_pheno * diff_pheno > 0)
+```
+```{r}
+locus_pairs %>% 
+  filter(diff_full_status == 'Hit',
+         locus_type %in% c('Overlapping', 'Divergent', 'Antisense'),
+         locus_cor^2 > 0.7 | locus_pair_diff_status == 'Hit' & locus_pair_diff_pheno * diff_pheno > 0)
+```
+
+## Interaction
+### Interaction coexpression
+```{r}
+hit_categories <- c('Coding_Differentiation:lncRNA_Differentiation',
+                    'Coding_Differentiation:lncRNA_Dual',
+                    'Coding_Proliferation:lncRNA_Proliferation',
+                    'Coding_Proliferation:lncRNA_Dual')
+```
+
+```{r}
+interaction_pairs <- interaction_master %>% 
+  select(feature_id.x, 
+         library.x,
+         primary_pheno.x,
+         description.x,
+         Differentiation.x,
+         Proliferation.x,
+         feature_id.y, 
+         library.y,
+         primary_pheno.y,
+         description.y,
+         Differentiation.y,
+         Proliferation.y,
+         tss_distance,
+         category,
+         combination,
+         primary_phenos,
+         status) %>% 
+  unique() 
+
+interaction_pairs 
+```
+
+```{r}
+interaction_pairs %>% 
+  group_by(status) %>% 
+  tally()
+```
+
+## Loop for correlated interaction expression
+```{r}
+cor_features <- intersect(rownames(expression_cor), interaction_features)
+
+interaction_cor <- map(1:nrow(interaction_pairs), function(i) {
+  interaction_pair <- interaction_pairs[i,]
+  
+  
+  if((interaction_pair$feature_id.x %in% cor_features) & (interaction_pair$feature_id.y %in% cor_features)) {
+    output_cor <- expression_cor[interaction_pair$feature_id.x,
+                                 interaction_pair$feature_id.y]
+  } else {
+    output_cor <- NA
+  } 
+  
+  interaction_pair %>% mutate(interaction_cor = output_cor)
+}) %>% bind_rows()
+
+interaction_cor
+```
+
+### Expected by background
+```{r}
+random_pairs <- interaction_pairs %>% 
+  mutate(feature_id.x = sample(feature_id.x), # permute interactions
+         feature_id.y = sample(feature_id.y),
+         combination = ifelse(feature_id.x < feature_id.y, 
+                              paste(feature_id.x, feature_id.y, sep = ':'),
+                              paste(feature_id.y, feature_id.x, sep = ':'))) %>% 
+  filter(feature_id.x != feature_id.y,
+         !combination %in% c(interaction_cor$combination))
+
+random_cor <- map(1:nrow(random_pairs), function(i) {
+  interaction_pair <- random_pairs[i,]
+  
+  if((interaction_pair$feature_id.x %in% cor_features) & (interaction_pair$feature_id.y %in% cor_features)) {
+    output_cor <- expression_cor[interaction_pair$feature_id.x,
+                                 interaction_pair$feature_id.y]
+  } else {
+    output_cor <- NA
+  } 
+  
+  interaction_pair %>% mutate(interaction_cor = output_cor)
+}) %>% bind_rows()
+
+random_cor
+```
+
+```{r}
+interaction_cor$interaction_cor %>% quantile(na.rm = T)
+```
+
+```{r}
+random_cor$interaction_cor %>% quantile(na.rm = T)
+```
+
+```{r}
+bins <- 50
+xlim <- c(-1, 1)
+ylim <- c(0, 310)
+
+p1 <- interaction_cor %>% 
+  ggplot(aes(x = interaction_cor)) +
+  geom_histogram(bins = bins) +
+  xlim(xlim) +
+  ylim(ylim)
+
+p2 <- random_cor %>% 
+  ggplot(aes(x = interaction_cor)) +
+  geom_histogram(bins = bins) +
+  xlim(xlim) +
+  ylim(ylim)
+
+p1 + p2
+```
+
+```{r}
+cor_merge <- bind_rows(interaction_cor %>% mutate(group = 'Interaction'),
+                       random_cor %>% mutate(group = 'Random'))
+cor_merge %>% 
+  ggplot(aes(x = group,
+             y = interaction_cor)) +
+  geom_boxplot()
+```
+
+```{r}
+cor_merge %>% 
+  group_by(group) %>% 
+  filter(interaction_cor > 0.5) %>% 
+  tally()
+```
+Odds of correlated expression between interacting pairs
+```{r}
+interaction_combinations <- cor_merge %>% filter(group == 'Interaction') %>% pull(combination)
+correlated_combinations <- cor_merge %>% filter(interaction_cor > 0.5) %>% pull(combination)
+all_combinations <- cor_merge %>% pull(combination)
+
+enrich <- enrichment_test(list1 = interaction_combinations,
+                          list2 = correlated_combinations,
+                          background = all_combinations)
+
+enrich$fisher$p.value
+```
+
+```{r}
+interaction_cor %>% 
+  filter(status == 'Interaction hit') %>% 
+  mutate(Proliferation_match = ifelse(Proliferation.x == Proliferation.y, 'Match', 'Non-match'),
+         Differentiation_match = ifelse(Differentiation.x == Differentiation.y, 'Match', 'Non-match')) %>% 
+  View()
+```
+
+```{r}
+interaction_full <- interaction_cor %>% 
+  mutate(cor_category = case_when(
+    interaction_cor > cor_threshold ~ 'Positive',
+    interaction_cor < -cor_threshold ~ 'Negative',
+    TRUE ~ 'Non-correlated')) %>% 
+  select(feature_id.x,
+         library.x,
+         primary_pheno.x,
+         feature_id.y,
+         library.y,
+         primary_pheno.y,
+         interaction_cor,
+         cor_category,
+         combination)
+
+interaction_swap <- interaction_full %>% 
+  set_names(c(str_subset(colnames(interaction_full), '\\.y'),
+              str_subset(colnames(interaction_full), '\\.x')),
+            'interaction_cor',
+            'cor_category',
+            'combination') %>% 
+  mutate(combination = paste(feature_id.x, feature_id.y))
+  
+interaction_full <- bind_rows(interaction_full,
+                              interaction_swap)
+
+interaction_full
+```
+```{r}
+interaction_loop <- crossing(library.x = c('Coding', 'lncRNA', 'All'),
+         library.y = c('Coding', 'lncRNA', 'All'),
+         primary_pheno.x = c('Differentiation', 'Differentiation+Dual', 'Proliferation', 'Proliferation+Dual', 'All'),
+         primary_pheno.y = c('Differentiation', 'Differentiation+Dual', 'Proliferation', 'Proliferation+Dual', 'All'))
+
+interaction_loop <- crossing(library.x = c('Coding', 'lncRNA'),
+         library.y = c('Coding', 'lncRNA'),
+         primary_pheno.x = c('Differentiation', 'Proliferation', 'None'),
+         primary_pheno.y = c('Differentiation', 'Proliferation', 'None'))
+```
+
+### Interaction cor vs neighbor cor
+```{r}
+interaction_neighbor_merge <- interaction_full %>% 
+  left_join(neighbor_hit_cor_long %>% 
+              select(feature_id.x = feature_id, assay, neighbor_hit_id, neighbor_hit_distance, neighbor_hit_cor)) %>% 
+  drop_na() %>% 
+  mutate(interaction_cor2 = interaction_cor^2,
+         neighbor_hit_cor2 = neighbor_hit_cor^2,
+         best_cor2 = ifelse(interaction_cor2 > neighbor_hit_cor2, interaction_cor2, neighbor_hit_cor2),
+         which_cor2 = case_when(
+           interaction_cor2 > neighbor_hit_cor2 ~ 'Interaction', 
+           neighbor_hit_cor2 > interaction_cor2 ~ 'Neighbor',
+           interaction_cor2 == neighbor_hit_cor2 ~ 'Equal'))
+
+interaction_neighbor_merge
+```
+```{r}
+interaction_neighbor_merge_unique <- interaction_neighbor_merge %>% 
+  filter(primary_pheno.x != 'None' | primary_pheno.y != 'None') %>% 
+  select(feature_id.x, feature_id.y, neighbor_hit_id, primary_pheno.x, primary_pheno.y, assay, which_cor2, interaction_cor, neighbor_hit_cor) %>% 
+  unique() 
+
+interaction_neighbor_merge_unique %>% 
+  group_by(which_cor2) %>% 
+  tally()
+```
+
+
+
+```{r}
+interaction_neighbor_merge_hit <- interaction_neighbor_merge_unique %>% 
+  filter(primary_pheno.y == assay|primary_pheno.y == 'Dual')
+
+interaction_neighbor_merge_hit
+```
+```{r}
+t.test(interaction_neighbor_merge_hit$interaction_cor^2,
+       interaction_neighbor_merge_hit$neighbor_hit_cor^2)
+```
+
+```{r}
+t.test(interaction_neighbor_merge_unique$interaction_cor^2,
+       interaction_neighbor_merge_unique$neighbor_hit_cor^2)
+```
+
+```{r}
+wilcox.test(interaction_neighbor_merge$interaction_cor^2,
+            interaction_neighbor_merge$neighbor_hit_cor^2)
+```
+
+
+## Are hits more likely to interact with each other?
+```{r}
+  # loop to compare all x and y combinations for enrichment
+
+interaction_enrichment <- map(1:nrow(interaction_loop), function(i) {
+  
+  parameters <- interaction_loop[i,]
+  x.parameters <- parameters %>% select(ends_with('x'))
+  y.parameters <- parameters %>% select(ends_with('y'))
+  
+  x.specifics <- x.parameters[which(x.parameters != 'All')]  
+  y.specifics <- y.parameters[which(y.parameters != 'All')]  
+  
+  if (ncol(x.specifics) == 0) {
+    x.cases <- interaction_full %>% filter(primary_pheno.x != 'None') %>% pull(combination)
+  } else {
+    x.cases <- map(names(x.specifics), function(j) {
+      
+       x.case_params <- str_split(x.parameters[[j]], pattern = '\\+') %>% unlist() # get all the parameters (joined by +)
+      
+      interaction_full %>%
+        filter(get(j) %in% x.case_params) %>% # filter only on specifics
+        pull(combination)
+    }) %>% purrr::reduce(intersect) #intersect all filters
+  }
+  
+  if (ncol(y.specifics) == 0) {
+    y.cases <- interaction_full %>% filter(primary_pheno.y != 'None') %>% pull(combination)
+  } else {
+    y.cases <- map(names(y.specifics), function(j) {
+      y.case_params <- str_split(y.parameters[[j]], pattern = '\\+') %>% unlist() # get all the parameters (joined by +)
+      
+      interaction_full %>%
+        filter(get(j) %in% y.case_params) %>% # filter only on specifics
+        pull(combination)
+    }) %>% purrr::reduce(intersect) #intersect all filters
+  }
+  
+  enrichment_res <- enrichment_test(list1 = x.cases,
+                                    list2 = y.cases,
+                                    print = FALSE,
+                                    background = interaction_full$combination)$fisher
+  
+  tibble(parameters,
+         n_overlap = intersect(x.cases, y.cases) %>% n_distinct(),
+         odds = enrichment_res$estimate,
+         pval = enrichment_res$p.value)
+  
+}) %>% 
+  bind_rows() %>% 
+  mutate(log2odds = log2(odds),
+         description.x = paste(library.x, primary_pheno.x) %>% str_remove(' All|All '),
+         description.y = paste(library.y, primary_pheno.y) %>% str_remove(' All|All '),
+         combination = ifelse(description.x < description.y, 
+                              paste(description.x, description.y, sep = ':'),
+                              paste(description.y, description.x, sep = ':'))) %>% 
+  group_by(combination) %>% 
+  sample_n(1) %>% # select one triangle for padj calculation
+  mutate(padj = p.adjust(pval, method = 'BH')) %>% 
+  ungroup() 
+
+interaction_enrichment
+
+# reflect triangle
+
+interaction_enrichment_swap <- interaction_enrichment 
+interaction_enrichment_swap$library.x <- interaction_enrichment$library.y
+interaction_enrichment_swap$library.y <- interaction_enrichment$library.x
+interaction_enrichment_swap$primary_pheno.x <- interaction_enrichment$primary_pheno.y
+interaction_enrichment_swap$primary_pheno.y <- interaction_enrichment$primary_pheno.x
+interaction_enrichment_swap$description.x <- interaction_enrichment$description.y
+interaction_enrichment_swap$description.y <- interaction_enrichment$description.x
+
+interaction_enrichment <- bind_rows(interaction_enrichment,
+                                    interaction_enrichment_swap) %>% 
+  unique() 
+
+interaction_enrichment %>% filter(padj < 0.05) %>% arrange(-odds)
+
+```
+
+```{r}
+interaction_enrichment_table <- interaction_enrichment %>% 
+  select(description.x, description.y, n_overlap, log2odds, padj, combination) %>% 
+  mutate(log2odds = ifelse(padj > 0.05, 0, log2odds)
+         ,log2odds = ifelse(n_overlap < 10, 0, log2odds)
+         ) %>% 
+  arrange(description.x,
+          description.y)
+
+interaction_enrichment_table
+```
+```{r}
+interaction_enrichment_table %>% filter(description.x == 'lncRNA Differentiation')
+```
+
+
+```{r fig.height = 4, fig.width = 5}
+interaction_enrichment_wide <- interaction_enrichment_table %>% 
+  select(description.x,
+         description.y,
+         log2odds) %>% 
+  pivot_wider(names_from = description.y,
+              values_from = log2odds) %>% 
+  column_to_rownames('description.x')
+
+interaction_enrichment_wide
+
+pheatmap(interaction_enrichment_wide,
+         na_col = 'white',
+         cluster_rows = T,
+         cluster_cols = T,
+         display_numbers = FALSE,
+         breaks = seq(-2, 2, length.out = 101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         filename = file.path(figure_dir, 'interaction_heatmap_dendrogram.pdf'),
+         angle_col = 45,
+         width = 6, 
+         height = 5)
+```
+
+```{r fig.height=4, fig.width=5}
+order <- c('Coding Differentiation',
+           'lncRNA Differentiation',
+           'Coding None',
+           'Coding Proliferation',
+           'lncRNA None',
+           'lncRNA Proliferation')
+
+interaction_enrichment_table <- interaction_enrichment %>% 
+  select(description.x, description.y, n_overlap, log2odds, padj, combination) %>% 
+  mutate(log2odds = ifelse(padj > 0.05, NA, log2odds)
+         ,log2odds = ifelse(n_overlap < 10, NA, log2odds)
+         ) %>% 
+  arrange(description.x,
+          description.y)
+
+interaction_enrichment_wide <- interaction_enrichment_table %>% 
+  select(description.x,
+         description.y,
+         log2odds) %>% 
+  pivot_wider(names_from = description.y,
+              values_from = log2odds) %>% 
+  column_to_rownames('description.x')
+
+
+pheatmap(interaction_enrichment_wide[order, order],
+         na_col = 'white',
+         cluster_rows = F,
+         cluster_cols = F,
+         display_numbers = FALSE,
+         breaks = seq(-2, 2, length.out = 101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         filename = file.path(figure_dir, 'interaction_heatmap.pdf'),
+         width = 5, 
+         height = 4)
+```
+
+
+
+```{r}
+interaction_count_table <- interaction_enrichment %>% 
+  select(description.x, description.y, n_overlap, log2odds, padj) %>% 
+  mutate(n_overlap = log10(n_overlap + 1))
+
+interaction_count_table
+```
+```{r}
+interaction_count_wide <- interaction_count_table %>% 
+  select(description.x,
+         description.y,
+         n_overlap) %>% 
+  pivot_wider(names_from = description.y,
+              values_from = n_overlap) %>% 
+  column_to_rownames('description.x')
+
+interaction_count_wide
+```
+
+### Are close neighbors the same as interaction pairs?
+```{r}
+hit_interactor_subset <- interaction_master %>% 
+  filter(category %in% hit_categories)
+
+hit_pairs <- hit_interactor_subset %>% 
+  select(feature_id.x, feature_id.y, primary_pheno.x, library.x, library.y, interaction_distance = distance) %>% 
+  unique() %>% 
+  mutate(assay = primary_pheno.x)
+
+hit_pairs_coding <- bind_rows(hit_pairs %>% 
+                                filter(library.x == 'Coding') %>% 
+                                select(feature_id = feature_id.x,
+                                       interaction_id = feature_id.y,
+                                       assay,
+                                       interaction_distance),
+                              hit_pairs %>% 
+                                filter(library.y == 'Coding') %>% 
+                                select(feature_id = feature_id.y,
+                                       interaction_id = feature_id.x,
+                                       assay,
+                                       interaction_distance)) 
+
+hit_pairs_lncrna <-  bind_rows(hit_pairs %>% 
+                                 filter(library.x == 'lncRNA') %>% 
+                                 select(feature_id = feature_id.x,
+                                        interaction_id = feature_id.y,
+                                        assay,
+                                        interaction_distance),
+                               hit_pairs %>% 
+                                 filter(library.y == 'lncRNA') %>% 
+                                 select(feature_id = feature_id.y,
+                                        interaction_id = feature_id.x,
+                                        assay,
+                                        interaction_distance)) 
+
+hit_pairs_all_duplicated <- bind_rows(hit_pairs_coding,
+                                      hit_pairs_lncrna) 
+```
+
+```{r}
+hit_pairs_all_duplicated %>% 
+              group_by(feature_id) %>% 
+              top_n(1, -interaction_distance)
+```
+
+
+```{r}
+lncrna_hit_interactors <- hit_pairs_lncrna %>% 
+  pull(feature_id) %>% unique()
+
+lncrna_hit_interactors 
+```
+```{r}
+lncrna_shared_neighborhood <- shared_neighborhood %>% filter(library == 'lncRNA') %>% pull(feature_id) %>% unique()
+lncrna_shared_neighborhood
+```
+
+
+```{r}
+intersect(lncrna_shared_neighborhood, lncrna_hit_interactors)
+```
+
+### Number of interactions per locus
+```{r}
+interaction_tally <- neighbor_integration %>% 
+  filter(full_status != 'Neighbor hit') %>% 
+  select(feature_id, library, primary_pheno) %>% 
+  left_join(interaction_full %>% select(feature_id = feature_id.x) %>% add_count(feature_id) %>% unique()) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         interaction_detected = ifelse(n > 0, 'Yes', 'No')) 
+  
+
+interaction_tally %>% 
+  group_by(library, primary_pheno, interaction_detected) %>% 
+  tally()
+```
+```{r}
+interaction_tally
+```
+```{r}
+interaction_tally <- neighbor_integration %>% 
+  filter(full_status != 'Neighbor hit') %>% 
+  select(feature_id, library, primary_pheno) %>% 
+  unique() %>% 
+  left_join(interaction_full %>% select(feature_id = feature_id.x) %>% add_count(feature_id) %>% unique()) %>% 
+  mutate(n = ifelse(is.na(n), 0, n),
+         interaction_detected = ifelse(n > 0, 'Yes', 'No')) 
+  
+
+interaction_tally %>% 
+  group_by(library, primary_pheno, interaction_detected) %>% 
+  tally()
+```
+
+### Are hits enriched for a detected interaction?
+All hits
+```{r}
+data_subset <- interaction_tally
+
+group1 <- data_subset %>% filter(primary_pheno != 'None') %>% pull(feature_id)
+group2 <- data_subset %>% filter(interaction_detected == 'Yes') %>% pull(feature_id)
+universe <- data_subset %>% pull(feature_id)
+
+enrich <- enrichment_test(list1 = group1,
+                          list2 = group2,
+                          cat1 = c('Hit', 'Non-hit'),
+                          cat2 = c('Interaction', 'No interaction'),
+                          background = universe)
+
+
+```
+
+```{r}
+data_subset <- interaction_tally %>% filter(library == 'lncRNA')
+
+group1 <- data_subset %>% filter(primary_pheno != 'None') %>% pull(feature_id)
+group2 <- data_subset %>% filter(interaction_detected == 'Yes') %>% pull(feature_id)
+universe <- data_subset %>% pull(feature_id)
+
+enrich <- enrichment_test(list1 = group1,
+                          list2 = group2,
+                          cat1 = c('Hit', 'Non-hit'),
+                          cat2 = c('Interaction', 'No interaction'),
+                          background = universe)
+
+
+```
+```{r}
+data_subset <- interaction_tally %>% filter(library == 'Coding')
+
+group1 <- data_subset %>% filter(primary_pheno != 'None') %>% pull(feature_id)
+group2 <- data_subset %>% filter(interaction_detected == 'Yes') %>% pull(feature_id)
+universe <- data_subset %>% pull(feature_id)
+
+enrich <- enrichment_test(list1 = group1,
+                          list2 = group2,
+                          cat1 = c('Hit', 'Non-hit'),
+                          cat2 = c('Interaction', 'No interaction'),
+                          background = universe)
+
+
+```
+By group
+```{r}
+interaction_detection_enrich <- map(assays, function(i) {
+  map(libraries, function(j) {
+
+      data_subset <- interaction_tally %>% filter(library == j)
+      
+      group1 <- data_subset %>% filter(primary_pheno %in% c(i, 'Dual')) %>% pull(feature_id)
+      group2 <- data_subset %>% filter(interaction_detected == 'Yes') %>% pull(feature_id)
+      universe <- data_subset %>% pull(feature_id)
+      
+      enrich <- enrichment_test(list1 = group1,
+                                list2 = group2,
+                                cat1 = c('Hit', 'Non-hit'),
+                                cat2 = c('Interaction', 'No interaction'),
+                                background = universe)
+      
+      tibble(assay = i,
+             library = j,
+             n_overlap = intersect(group1, group2) %>% length(),
+             n_diagonal = enrich$contingency[1,1] + enrich$contingency[2,2],
+             n_total = length(universe),
+             odds = enrich$fisher$estimate,
+             pval = enrich$fisher$p.value)
+      
+      
+  }) %>% bind_rows()
+}) %>% bind_rows() %>% 
+  mutate(log2odds = log2(odds),
+         padj = p.adjust(pval, method = 'BH'),
+         significant = ifelse(padj < 0.05, TRUE, FALSE))
+
+interaction_detection_enrich
+
+```
+
+### Interaction histogram
+
+```{r}
+interaction_hits_table <- interaction_master %>% 
+  mutate(Status = ifelse(category %in% hit_categories, 'Interaction hit', 'Other interaction')) %>% 
+  select(seqnames.x, start.x, start.y, interact_id, distance, Status) %>% 
+  unique()
+
+interaction_hits_table
+```
+
+Interaction distance
+```{r}
+interaction_hits_table %>% 
+  select(Status, interact_id, distance) %>% 
+  unique() %>% 
+  group_by(Status) %>% 
+  summarize(median = median(distance))
+```
+
+
+```{r}
+p <- interaction_hits_table %>% 
+  ggplot(aes(x = distance, fill = Status)) +
+  theme_publication() + 
+  geom_histogram(alpha = 0.8, position = 'identity', binwidth = 0.1) + 
+  theme(legend.position = 'top') +
+  scale_x_log10(breaks = c(1e3, 1e4, 1e5, 1e6, 1e7),
+                labels = c('1 kb', '10 kb', '100 kb', '1 Mb', '10 Mb'),
+                limits = c(1e3, 1e7)) +
+  labs(x = 'Linear distance of long range interaction',
+       y = 'Count') +
+  scale_fill_manual(values = c('red', 'grey90'))
+
+ save_figure(plot = p,
+             directory = figure_dir,
+             filename = 'interaction_histogram',
+             w = 6, 
+             h = 4)
+ 
+ p
+```
+
+```{r}
+interacting_loci <- interaction_hits_table %>% filter(Status == 'Interaction hit') %>% pull(interact_id) %>% unique()
+
+interaction_hits_master <- interaction_master %>% 
+  filter(interact_id %in% interacting_loci,
+         library.x != library.y) %>% 
+  select(interact_id, seqnames.x, start.x, feature_id.x, library.x, start.y, feature_id.y, library.y, distance, primary_pheno.x, primary_pheno.y, tss_distance) 
+
+interaction_hits_master
+```
+```{r}
+interaction_hits_master %>% 
+  select(feature_id.x, feature_id.y) %>% 
+  unique() %>% 
+  arrange(feature_id.x, 
+          feature_id.y)
+```
+
+```{r}
+interaction_pairs %>% 
+  filter(status == 'Interaction hit') %>% 
+  select(feature_id.x, feature_id.y) %>% 
+  unique() %>% 
+  arrange(feature_id.x, 
+          feature_id.y)
+```
+```{r}
+hit_pairs_all_duplicated %>%
+  filter(assay == 'Differentiation') %>% 
+  select(feature_id, interaction_id) %>% unique()
+```
+```{r}
+neighbor_integration %>% filter(feature_id %in% lncrna_hit_interactors, assay == 'Differentiation') %>% View()
+```
+
+
+## Export
+```{r}
+hit_pairs_all_duplicated %>% write_tsv(file.path(analysis_dir, 'hit_pairs_all_duplicated.tsv'))
+shared_neighborhood %>% write_tsv(file.path(analysis_dir, 'shared_neighborhood.tsv'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+
+

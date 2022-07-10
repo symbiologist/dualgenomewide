@@ -1,0 +1,690 @@
+---
+title: "RNA-Seq Time-series Analysis"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(maSigPro)
+library(edgeR)
+library(DESeq2)
+library(patchwork)
+library(ggcorrplot)
+```
+
+### Load themes and functions
+```{r}
+source('analysis/universal/themes.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/rnaseq/scripts/functions.R') # functions for this subcomponent
+```
+
+### Directories
+```{r}
+analysis_dir <- 'analysis/rnaseq/output/04_expression_clusters'
+data_dir <- 'data/rnaseq/derived'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load sample table
+```{r}
+sample_table <- read_tsv('analysis/rnaseq/output/02_sleuth/sample_table.tsv') 
+sample_table
+```
+
+### Load expression data
+```{r}
+sleuth_table <- read_tsv('data/rnaseq/derived/sleuth/counts_table.tsv.gz')
+txi <- read_rds('data/rnaseq/derived/tximport/tximport.rds')
+deseq <- read_rds('data/rnaseq/derived/tximport/deseq.rds')
+```
+
+### Load annotation
+```{r}
+annotation <- read_tsv('analysis/reference/output/02_unified_reference/unified_metadata.tsv.gz')
+annotation
+```
+
+## Analysis
+### PolyA vs Total RNA-Seq
+```{r}
+# Use only up to D10 since this time-point exists for both polyA and total RNA 
+times <- c(0, 4, 6, 8, 10) 
+sample_table <- sample_table %>% filter(time %in% times)
+sleuth_table <- sleuth_table %>% filter(time %in% times)
+polya_samples <- sample_table %>% filter(condition == 'polyA') %>% pull(sample)
+total_samples <- sample_table %>% filter(condition == 'Total') %>% pull(sample)
+
+```
+
+Examine distribution of tpm values
+```{r}
+pseudocount <- 0.001 # for tpm, use a fractional shift which will clearly demarcate 0's
+
+polya_tpm <- sleuth_table %>% 
+  filter(sample %in% polya_samples) %>% 
+  group_by(feature_id, sample) %>% 
+  summarize(tpm = mean(tpm)) %>% 
+  ungroup()
+
+polya_tpm %>% ggplot(aes(x = tpm + pseudocount)) + geom_histogram(bins = 100) + scale_x_log10()
+```
+
+Filter for expressed genes (detected in at least 2 samples)
+```{r}
+tpm_threshold <- 0.1 # aim for sensitivity for this analysis
+
+polya_expressed <- polya_tpm %>% 
+  filter(tpm > tpm_threshold) %>% # filter for tpm threshold
+  ungroup() %>% 
+  add_count(feature_id) %>%  # count features that show up in more than 4 samples
+  filter(n >= 4) %>% 
+  pull(feature_id) %>% unique()
+
+polya_expressed %>% n_distinct()
+```
+
+Same for total RNA
+```{r}
+total_tpm <- sleuth_table %>% 
+  filter(sample %in% total_samples) %>% 
+  group_by(feature_id, sample) %>% 
+  summarize(tpm = mean(tpm)) %>% 
+  ungroup()
+
+total_tpm %>% ggplot(aes(x = tpm + pseudocount)) + geom_histogram(bins = 100) + scale_x_log10()
+```
+```{r}
+tpm_threshold <- 0.1 # aim for sensitivity for this analysis
+
+total_expressed <- total_tpm %>% 
+  filter(tpm > tpm_threshold) %>% # filter for tpm threshold
+  ungroup() %>% 
+  add_count(feature_id) %>%  # count features that show up in more than 4 samples
+  filter(n >= 4) %>% 
+  pull(feature_id) %>% unique()
+
+total_expressed %>% n_distinct()
+```
+
+Check undetected genes (both coding and lncRNA) for expression in total RNA dataset
+```{r}
+polya_undetected_genes <- annotation$feature_id %>% unique() %>% setdiff(polya_expressed)
+polya_undetected_genes %>% n_distinct()
+```
+
+Genes detected in total but not in polyA fraction
+```{r}
+detected_in_total <- intersect(total_expressed, polya_undetected_genes)
+detected_in_total %>% n_distinct()
+```
+Remainder: not detected in either fraction at threshold
+```{r}
+detected <- union(total_expressed, polya_expressed) %>% unique()
+undetected <- setdiff(annotation$feature_id, detected) %>% unique() 
+```
+
+Global view of polyA vs total RNA expression
+```{r}
+polya_total_table <- sleuth_table %>% 
+  filter(time %in% c(0, 8, 10)) %>% 
+  select(feature_id, tpm, time, condition) %>% 
+  group_by(feature_id, time, condition) %>% 
+  summarize(tpm = mean(tpm)) %>% # summarize replicates
+  mutate(tpm = log10(tpm + pseudocount)) %>% 
+  pivot_wider(names_from = condition, values_from = tpm)
+
+polya_total_table
+```
+
+Plot
+```{r}
+polya_total_table %>% 
+  ggplot(aes(x = polyA, y = Total)) + 
+  geom_point(alpha = 0.1) + 
+  coord_equal() +
+  facet_wrap(~time) 
+```
+
+### Prepare matrices 
+Use transformed data from DESeq (pre-computed). Scale the polyA data and use this for maSigPro; integrate total RNA data afterward
+```{r}
+normalized_matrix <- assay(deseq$vsd)
+scaled_matrix <- normalized_matrix[polya_expressed, polya_samples] %>% 
+  scale_matrix_rows()
+
+scaled_matrix[1:5, 1:5] # examine
+```
+
+## Expression clustering
+Set up design table for maSigPro for clustering time-series expression profiles.
+Goal is to analyze bulk of data with the polyA samples (since there are more time-points)
+For transcripts only detected in total RNA, analyze afterward and merge.
+### Design table
+```{r}
+design_table <- sample_table %>% 
+  arrange(time) %>% 
+  mutate(replicates = rep(1:(nrow(sample_table)/2), times = 1, each = 2), # follow maSigPro template in manual
+         group = ifelse(condition == 'polyA', 1, 2)) %>% 
+  select(sample, time, replicates, group) 
+
+design_table_subset <- design_table %>% 
+  filter(sample %in% polya_samples) %>%  # exclude total RNA
+  column_to_rownames(var = 'sample') 
+design_table_subset
+```
+
+### Theta estimation
+Use edgeR to estimate theta value for maSigPro (described in maSigPro manual and also https://support.bioconductor.org/p/105249/)
+theta = 1/dispersion
+```{r}
+edge_group <- as.factor(design_table_subset$time)
+raw_matrix <- as.matrix(txi$counts[, rownames(design_table_subset)]) 
+
+edge <- DGEList(counts = raw_matrix, # edge requires counts; thus use tximport gene-level count data, which is not available through sleuth
+                group = edge_group)
+```
+
+Set up edgeR
+```{r}
+edge <- edge[polya_expressed, ] 
+edge <- calcNormFactors(edge)
+design <- model.matrix(~edge_group)
+edge <- estimateGLMCommonDisp(edge) # use GLM
+theta <- 1/edge$common.dispersion
+theta
+```
+
+### maSigPro
+Prepare parameters and input
+```{r}
+degrees <- 4 # model degree for maSigPro
+k_clusters <- 5 # set k for k clusters to simplify clustering; will additionally use mclust algorithm to automatically determine k
+alpha_level <- 0.1 # cutoffs for significance
+
+# Can either use counts (then specificy counts = TRUE in the fit) or pre-normalized data. These gave similar results, use pre-normalized for speed
+#input_matrix <- txi$counts[polya_expressed, rownames(design_table_subset)] # use raw counts and specificy NGS data in next code chunk
+input_matrix <- normalized_matrix[polya_expressed, rownames(design_table_subset)] # use normalized data (not scaled)
+
+# preview matrix
+input_matrix[1:5,]
+```
+
+Setup regression model
+```{r}
+masigpro <- list()
+masigpro$design <- make.design.matrix(design_table_subset, degree = degrees)
+masigpro$fit <- p.vector(input_matrix, 
+                         masigpro$design, 
+                         Q = alpha_level, 
+                         counts = FALSE, # only true if negative binomial model for NGS data instead of pre-normalized data
+                         theta = theta)
+```
+Number of significant genes
+```{r}
+masigpro$fit$i
+```
+
+T fit
+```{r}
+masigpro$tstep <- T.fit(masigpro$fit, 
+                        step.method = 'two.ways.forward', 
+                        alfa = alpha_level)
+```
+
+Get sig genes
+```{r}
+masigpro$sig <- get.siggenes(masigpro$tstep, rsq = 0.8, vars = "groups") # use high R sq to define clusters, then project clusters downstream
+nrow(masigpro$sig$sig.genes$group$sig.pvalues)
+```
+
+Get cluster assignments
+```{r}
+# bash 
+# Xvfb :0 -ac -screen 0 1960x2000x24 &
+Sys.setenv("DISPLAY"=":0") # necessary for see.genes function to work for some reason
+
+see_genes_mclust <- see.genes(masigpro$sig$sig.genes$group, show.fit = T, dis = masigpro$design$dis, cluster.data = 1, k.mclust = T)
+see_genes_kclust <- see.genes(masigpro$sig$sig.genes$group, show.fit = T, dis = masigpro$design$dis, cluster.data = 1, k = k_clusters)
+
+masigpro$clusters <- left_join(annotation %>% select(feature_id, gene_name, library) %>% unique(),
+  tibble('feature_id' = names(see_genes_mclust$cut),
+         'mclust' = see_genes_mclust$cut,
+         'kclust' = see_genes_kclust$cut)) %>% 
+  pivot_longer(ends_with('clust'), names_to = 'algorithm', values_to = 'cluster') %>% 
+  mutate(cluster = ifelse(is.na(cluster), # if cluster is NA
+                          ifelse(feature_id %in% polya_expressed, # and expressed
+                                 0, # set to cluster 0
+                                 'Undetected'), # otherwise set to undetected
+                          cluster),
+         fraction = case_when( # add 
+           feature_id %in% polya_expressed ~ 'polyA', # if polyA, fraction = polyA
+           feature_id %in% total_expressed ~ 'Total', # otherwise if in total, set to total
+           TRUE ~ 'Undetected'), # for non detected
+         cluster = ifelse(fraction == 'Total', 0, cluster)) %>% # if detected in total, reset to cluster 0
+  select(feature_id, gene_name, library, algorithm, cluster)
+
+masigpro$clusters
+```
+
+Tally cluster by group
+```{r}
+masigpro$clusters %>% 
+  filter(algorithm == 'kclust', !is.na(library)) %>% 
+  select(feature_id, cluster, library) %>% unique() %>% 
+  group_by(library, cluster) %>% tally()
+```
+
+### Integrate total RNA
+Steps to incorporate total RNA-Seq data:
+1. Calculate standardized median cluster expression over time
+2. Finalize cluster assignments (examining kclust and mclust assignments)
+3. Calculate standardized expression for genes detected in total RNA
+4. For undetected genes, rather than rerunning maSigPro, assign these genes to the most correlated cluster (above a threshold). If none are correlated, set to cluster 0
+
+1. Median cluster expression
+```{r}
+scaled_table <- scaled_matrix %>% 
+  matrix2table() %>% 
+  separate(sample, into = c('time', 'condition', 'replicate')) %>% 
+  group_by(feature_id, time) %>% 
+  summarize(scaled_expression = mean(scaled_expression)) %>% # merge replicates
+  ungroup() %>% 
+  mutate(time = as.integer(str_remove(time, 'D'))) %>% 
+  arrange(feature_id, time)
+
+scaled_clusters <- inner_join(masigpro$clusters, scaled_table) # add cluster annotation
+scaled_clusters
+```
+
+```{r}
+cluster_medians <- scaled_clusters %>% 
+  filter(cluster != 'Undetected') %>% 
+  group_by(time, cluster, algorithm) %>% 
+  summarize(scaled_expression = median(scaled_expression)) %>% 
+  ungroup() %>% 
+  arrange(algorithm, cluster, time)
+
+cluster_medians
+```
+
+Plot cluster expression patterns
+mclust clusters
+```{r, fig.width=12, fig.height=6}
+mclust_plots <- cluster_plots(scaled_clusters, which_algorithm = 'mclust')
+mclust_plots %>% wrap_plots(nrow = 2)
+```
+
+kclust clusters
+```{r, fig.height=3, fig.width=10}
+kclust_plots <- cluster_plots(scaled_clusters, which_algorithm = 'kclust')
+kclust_plots %>% wrap_plots(nrow = 1)
+```
+
+Median
+```{r, fig.width=12, fig.height=6}
+cluster_medians %>% cluster_plots(group = 'cluster', 
+                                  which_algorithm = 'mclust', 
+                                  line_size = 1, 
+                                  line_alpha = 0.8) %>% wrap_plots(nrow = 2)
+```
+kclust
+```{r, fig.height=3, fig.width=15}
+cluster_medians %>% cluster_plots(group = 'cluster', 
+                                  which_algorithm = 'kclust', 
+                                  line_size = 1, 
+                                  line_alpha = 0.8) %>% wrap_plots(nrow = 1)
+```
+
+### Project clusters 
+Project on all features to see what correlation distribution looks like
+```{r}
+algorithms <- c('kclust', 'mclust')
+names(algorithms) <- algorithms
+
+projected_clusters <- map(algorithms, function(i) {
+  project_clusters(scaled_clusters %>% filter(algorithm == i), 
+                   cluster_medians %>% filter(algorithm == i, cluster != 0)) %>% 
+    mutate(algorithm = i)
+}) %>% bind_rows()
+
+projected_clusters
+```
+For assigned features, does the top cluster always match the old cluster? About 730 do not match in kclust (of ~6000) and 1503 do not match in mclust (out of ~6000)
+```{r}
+projected_clusters %>% 
+  filter(old_cluster != 0) %>% 
+  mutate(cluster_match = ifelse(old_cluster == top_cluster, TRUE, FALSE)) %>% 
+  group_by(algorithm, cluster_match) %>% tally()
+```
+
+
+Correlation distributions for matched cluster
+```{r, fig.height=6, fig.width=14}
+projected_clusters %>% 
+  filter(old_cluster == top_cluster) %>% 
+  ggplot(aes(x = correlation, fill = top_cluster)) + 
+  xlim(c(0, 1)) + 
+  geom_histogram() + 
+  facet_wrap(~algorithm + top_cluster, 
+             scales = 'free_y',
+             nrow = 2) 
+```
+
+With kclust, some clusters have correlated features. Use unsupervised mclust clusters instead
+```{r}
+projected_clusters %>% 
+  filter(old_cluster != 0) %>% 
+  arrange(correlation)
+```
+
+
+# New clusters
+Hierarchical clustering on clusters
+```{r}
+cor_df <- cluster_medians %>% ungroup() %>% 
+  filter(cluster != 'Undetected',
+         cluster != 0) %>% 
+  mutate(cluster = paste(algorithm, cluster, sep = '_')) %>% 
+  select(-algorithm) %>% 
+  pivot_wider(values_from = scaled_expression, names_from = cluster) %>%
+  select(-time)
+
+cor_mat <- cor_df %>% cor(method = 'pearson')
+cor_p <- cor_df %>% cor_pmat()
+
+ggcorrplot(cor_mat, 
+           hc.order = T, 
+           hc.method = 'complete', 
+           colors = c("#6D9EC1", "white", "#E46726"), 
+           p.mat = cor_p, 
+           sig.level = 0.01,
+           legend.title = 'r') + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 0.5), 
+        legend.title = element_text(hjust = 0.25))
+```
+
+## Merge clusters
+Merged mclust clusters from hierarchical clustering and order by descriptive category
+```{r}
+recluster <- cluster_medians %>% 
+  ungroup() %>% 
+  filter(algorithm == 'mclust') %>% 
+  mutate(new_cluster = case_when(
+    cluster %in% c(4) ~ 1, # monotonic rise
+    cluster %in% c(5) ~ 2, # delayed rise
+    cluster %in% c(6) ~ 3, # early rise
+    cluster %in% c(9) ~ 4, # # inverted U
+    cluster %in% c(2) ~ 5, # monotonic drop
+    cluster %in% c(3) ~ 6, # delayed drop
+    cluster %in% c(1, 7) ~ 7, # early drop
+    cluster %in% c(8) ~ 8, # U-shape
+    cluster == 0 ~ 0)) %>%  
+  select(cluster, new_cluster) %>% 
+  unique()
+
+recluster
+```
+
+Set new clusters and replot
+```{r, fig.height=6, fig.width=12}
+scaled_reclusters <- scaled_clusters %>% 
+  filter(algorithm == 'mclust') %>% 
+  left_join(recluster) %>% 
+  select(-cluster) %>% 
+  dplyr::rename(cluster = new_cluster) %>% 
+  mutate(algorithm = 'reclust') %>% 
+  unique()
+
+scaled_reclusters %>% cluster_plots(which_algorithm = 'reclust') %>% .[-1] %>% wrap_plots(nrow = 2)
+```
+
+```{r}
+recluster_medians <- scaled_reclusters %>% 
+  filter(cluster != 'Undetected') %>% 
+  group_by(time, cluster, algorithm) %>% 
+  summarize(scaled_expression = median(scaled_expression)) %>% 
+  ungroup() %>% 
+  arrange(algorithm, cluster, time)
+
+recluster_medians
+```
+
+```{r, fig.height=6, fig.width=12}
+recluster_median_plots <- recluster_medians %>% cluster_plots(group = 'cluster', 
+                                                              which_algorithm = 'reclust', 
+                                                              line_size = 1, 
+                                                              line_alpha = 0.8) 
+
+c(recluster_median_plots[-1], recluster_median_plots[1]) %>% wrap_plots(nrow = 2)
+```
+
+## Reproject clusters
+```{r}
+reprojected <- project_clusters(scaled_reclusters,
+                                recluster_medians %>% filter(cluster != 0))
+
+reprojected
+```
+
+```{r, fig.height=3, fig.width=12}
+reprojected %>% 
+  filter(old_cluster == top_cluster) %>% 
+  ggplot(aes(x = correlation, fill = top_cluster)) + 
+  xlim(c(0, 1)) + 
+  geom_histogram() + 
+  facet_wrap(~top_cluster, 
+             scales = 'free_y',
+             nrow = 1) 
+```
+
+```{r, fig.height=3, fig.width=12}
+reprojected %>% 
+  filter(old_cluster == 0) %>% 
+  ggplot(aes(x = correlation, fill = top_cluster)) + 
+  xlim(c(0, 1)) + 
+  geom_histogram(bins = 100) + 
+  facet_wrap(~top_cluster, nrow = 1, scales = 'free_y') 
+```
+### Assign clusters
+```{r}
+reprojected_assigned <- scaled_reclusters %>% 
+  inner_join(reprojected) %>% 
+  select(-old_cluster, 
+         -cluster,
+         -top_cluster,
+         -assigned,
+         cluster = new_cluster)
+
+reprojected_assigned
+```
+```{r, fig.height=3, fig.width=15}
+reprojected_assigned %>% cluster_plots(which_algorithm = 'reclust', line_size = 0.1, line_alpha = 0.05) %>% wrap_plots(nrow = 1)
+```
+
+```{r}
+reprojected_medians <- reprojected_assigned %>% 
+  filter(cluster != 'Undetected') %>% 
+  group_by(time, cluster, algorithm) %>% 
+  summarize(scaled_expression = median(scaled_expression)) %>% 
+  ungroup() %>% 
+  arrange(cluster, time)
+
+reprojected_medians
+```
+```{r, fig.height=3, fig.width=15}
+reprojected_medians %>% cluster_plots(group = 'cluster', 
+                                      which_algorithm = 'reclust', 
+                                      line_size = 1, 
+                                      line_alpha = 0.8) %>% wrap_plots(nrow = 1)
+```
+
+### Project total RNA
+Scale
+```{r}
+scaled_total <- normalized_matrix[detected_in_total, total_samples] %>% 
+  scale_matrix_rows()
+
+scaled_total[1:5, 1:5] # examine
+```
+
+Convert to table
+```{r}
+scaled_total_table <- scaled_total %>% 
+  matrix2table() %>% 
+  separate(sample, into = c('time', 'condition', 'replicate')) %>% 
+  group_by(feature_id, time) %>% 
+  summarize(scaled_expression = mean(scaled_expression)) %>% # merge replicates
+  ungroup() %>% 
+  mutate(time = as.integer(str_remove(time, 'D'))) %>% 
+  arrange(feature_id, time)
+  
+scaled_total_precluster <- inner_join(masigpro$clusters, scaled_total_table) %>% filter(algorithm == 'mclust') # these are currently unassigned
+scaled_total_precluster
+```
+
+Project clusters using same time-points
+```{r}
+project_total <- project_clusters(expression_table = scaled_total_precluster,
+                                  reference_table = reprojected_medians %>% filter(time %in% scaled_total_precluster$time))
+
+project_total
+```
+
+Plot correlation distribution
+```{r, fig.height=3, fig.width=15}
+project_total %>% 
+  ggplot(aes(x = correlation, fill = top_cluster)) + 
+  geom_histogram() + 
+  xlim(c(0, 1)) + 
+  facet_wrap(~top_cluster, 
+             scales = 'free_y',
+             nrow = 1) 
+```
+
+Assign clusters
+```{r}
+total_assigned <- scaled_total_precluster %>% 
+  inner_join(project_total) %>% 
+  mutate(algorithm = 'reclust') %>% 
+  select(-old_cluster, 
+         -cluster,
+         -top_cluster,
+         -assigned,
+         cluster = new_cluster)
+
+total_assigned
+```
+
+
+```{r, fig.height=3, fig.width=15}
+total_assigned %>% cluster_plots() %>% wrap_plots(nrow = 1)
+```
+### Integrate data 
+Including ~25k genes not detected and all expression data
+```{r}
+# tpm data, merging replicates
+all_tpm <- sleuth_table %>% 
+  mutate(expression_fraction = condition) %>% 
+  group_by(expression_fraction, feature_id, time) %>% 
+  summarize(tpm = mean(tpm)) %>% 
+  ungroup()
+  
+# Pull all scaled expression and merge replicates
+all_polya <- normalized_matrix[, polya_samples] %>% 
+  scale_matrix_rows() %>% 
+  matrix2table() %>% 
+  inner_join(sample_table) %>% 
+  group_by(feature_id, time) %>% 
+  summarize(scaled_expression = mean(scaled_expression)) %>% 
+  ungroup() %>% 
+  mutate(expression_fraction = 'polyA') %>% 
+  inner_join(all_tpm)
+
+all_total <- normalized_matrix[, total_samples] %>% 
+  scale_matrix_rows() %>% 
+  matrix2table() %>% 
+  inner_join(sample_table) %>% 
+  group_by(feature_id, time) %>% 
+  summarize(scaled_expression = mean(scaled_expression)) %>% 
+  ungroup() %>% 
+  mutate(expression_fraction = 'Total') %>% 
+  inner_join(all_tpm)
+
+all_expression <- bind_rows(all_polya, all_total)
+all_expression
+```
+
+clustering data
+```{r}
+all_clusters <- bind_rows(reprojected_assigned %>% mutate(cluster_fraction = 'polyA'),
+                          total_assigned %>% mutate(cluster_fraction = 'Total')) %>% 
+  select(feature_id, cluster, time, scaled_expression, correlation, cluster_fraction) %>% 
+  unique()
+
+all_clusters
+```
+
+All cluster medians
+```{r}
+all_medians <-  all_clusters %>% 
+  filter(cluster != 'Undetected') %>% 
+  group_by(time, cluster) %>% 
+  summarize(scaled_expression = median(scaled_expression)) %>% 
+  ungroup() %>% 
+  arrange(cluster, time)
+
+all_medians
+```
+
+```{r, fig.height=3, fig.width=15}
+all_medians %>% cluster_plots(group = 'cluster', line_alpha = 0.8, line_size = 1) %>% wrap_plots(nrow = 1)
+```
+
+Integrate
+```{r}
+expression_clusters <- annotation %>% 
+  select(feature_id, gene_name) %>% # use annotation file to anchor table on feature_id and gene_name
+  unique() %>% 
+  left_join(all_clusters %>% select(-scaled_expression, -time) %>% unique()) %>% # add clusters without expression data
+  mutate(cluster = ifelse(is.na(cluster), 'Undetected', cluster),
+         correlation = ifelse(is.na(correlation), 0, correlation)) %>% # fill in NAs for undetected
+  inner_join(all_expression) %>% 
+  arrange(feature_id, expression_fraction, time)
+
+expression_clusters
+```
+
+
+
+```{r, fig.height=3, fig.width=15}
+expression_clusters %>% filter(cluster != 'Undetected', cluster_fraction == expression_fraction) %>% arrange(feature_id, time, cluster_fraction) %>%  cluster_plots(line_alpha = 0.05) %>% wrap_plots(nrow = 1)
+```
+
+## Export
+```{r}
+expression_clusters %>% write_tsv(file.path(analysis_dir, 'expression_clusters.tsv.gz'))
+all_medians %>% write_tsv(file.path(analysis_dir, 'all_medians.tsv'))
+masigpro %>% write_rds(file.path(analysis_dir, 'masigpro.rds'), compress = 'gz')
+
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

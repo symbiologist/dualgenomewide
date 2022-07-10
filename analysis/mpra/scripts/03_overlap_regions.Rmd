@@ -1,0 +1,126 @@
+---
+title: "Overlap MPRA with Screen data"
+output: html_notebook
+---
+
+## Purpose
+Examine overlap of MPRA regions with screen hits
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/epigenomics/output/03_overlap_regions' # analysis file output directory
+data_dir <- 'data/epigenomics/derived/' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(plyranges)
+```
+
+### Import GTF
+```{r}
+unified_gtf <- import('analysis/reference/output/02_unified_reference/unified_minimal.gtf.gz')
+
+unified_gtf
+```
+
+### Import MPRA regions
+```{r eval=FALSE}
+ss <- drive_get('MPRA Regions')
+mpra <- read_sheet(ss, sheet = 'Input')
+mpra
+```
+```{r}
+mpra <- read_rds(file.path(analysis_dir, 'mpra_regions.rds'))
+mpra
+```
+```{r}
+mpra_clean <- mpra %>% 
+  select(region, starts_with('cluster')) %>% 
+  filter(str_detect(region, 'chrUn', negate = TRUE)) %>% 
+  mutate(group = ifelse(str_detect(region, 'controls'), 'Control', 'Target'),
+         region = str_remove(region, 'controls_')) %>% 
+  separate(region, into = c('id', 'chr', 'start', 'end'), remove = FALSE) 
+
+colnames(mpra_clean) <- colnames(mpra_clean) %>% str_remove_all('\\(|\\)|\\-|\\,') %>% str_replace_all(' ', '\\_')
+mpra_clean %>% mutate(star = as.integer(start)) %>% select(-starts_with('cluster')) %>% filter(is.na(star))
+```
+
+```{r}
+mpra_granges <- mpra_clean %>% makeGRangesFromDataFrame(keep.extra.columns = TRUE, ignore.strand = TRUE)
+mpra_granges
+```
+
+## Enrichment analysis
+```{r}
+master <- read_tsv('analysis/integration/output/00_integrate/master_minimal.tsv.gz')
+neighbor_integration <- read_tsv('analysis/screen/output/03_neighbors/neighbor_hits.tsv.gz')
+```
+
+Use a table of all conditions and run loop, returning odds ratio and p-value and n per group
+```{r}
+comparison_table <- crossing(dataset = 'mpra',
+                             assay = c('Proliferation', 'Differentiation'),
+                             library = c('lncRNA', 'Coding'),
+                             comparison = 'full_status',
+                             case = 'Hit',
+                             control = 'Non-hit',
+                             region = c('Promoter', 'Gene Body')) %>% 
+  mutate(id = row_number())
+
+comparison_table
+```
+Loop to analyze all conditions listed in table and summarize
+```{r}
+comparisons <- multi_pipeline(comparison_table = comparison_table,
+                              screen_results = neighbor_integration,
+                              annotation = unified_gtf,
+                              dataset_list = list('mpra' = mpra_granges),
+                              parallel = FALSE)
+
+comparisons_summary <- summarize_pipelines(comparisons)
+
+comparisons_summary %>% arrange(-n_overlaps) %>% select(assay, library, region, odds_ratio, log2_odds, pvalue, n_overlaps, significant) %>% 
+  filter(region == 'Gene Body')
+```
+
+```{r}
+comparisons[[2]]$enrichment_results$contingency 
+mpra_overlaps <- comparisons[[2]]$overlaps$feature_id %>% unique()
+```
+
+## Export
+```{r}
+mpra %>% write_rds(file.path(analysis_dir, 'mpra_regions.rds'))
+
+mpra_granges %>% write_rds(file.path(analysis_dir, 'mpra_ranges.rds'))
+mpra_granges %>% export('data/integration/external/bed/yosef_mpra.bed')
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+

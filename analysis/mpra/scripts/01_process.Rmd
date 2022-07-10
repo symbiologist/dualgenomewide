@@ -1,0 +1,310 @@
+---
+title: "Process RNA-Seq data"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Purpose
+Process RNA-Seq data and run kallisto
+
+## Setup
+### Working directory
+Set working directory to project directory
+```{r setup, include=FALSE}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Output directories
+```{r}
+output_dir <- 'analysis/mpra/output/01_process'
+data_dir <- 'data/mpra/external/fastq'
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Pipeline
+### clumpify 
+Run clumpify on data upstream of all processing (serial)
+```{bash eval=FALSE}
+cd data/mpra/external/
+
+EXT=fastq.gz
+RAM=64
+THREADS=5
+for SAMPLE in `find fastq -type f -name "*.${EXT}" | sed 's!.*/!!' | sed s/.${EXT}//g | sort -u`; do # SE reads
+echo Running ${SAMPLE}
+/home/software/bbmap/clumpify.sh reorder threads=${THREADS} -Xmx${RAM}g zl=6 pigz deleteinput=t in=fastq/${SAMPLE}.${EXT} out=fastq/${SAMPLE}.fq.gz |& tee fastq/${SAMPLE}_clumpify.log
+done; date; echo "All Jobs Complete";
+```
+
+### bbduk
+Run bbduk quality/adapter/kmer trim
+First, run bbduk quality/adapter/kmer trim
+Run on command line, using semaphore to run job
+```{bash eval = FALSE}
+mkdir bbduk
+
+RAM=16; #ram per job
+THREADS=2; #threads per sample
+JOBS=10; #number of concurrent jobs; will pull a job from the queue as soon as a job completes
+
+for SAMPLE in `find fastq -type f -name *.fq.gz | sed 's!.*/!!' | sed s/.fq.gz//g | sort -u`; do
+
+  echo Running ${SAMPLE}
+
+  sem -j ${JOBS} -k time /home/software/bbmap/bbduk.sh \
+    ref=/home/software/bbmap/resources/adapters.fa \
+    threads=${THREADS} \
+    -Xmx${RAM}g \
+    mink=8 \
+    hdist=1 \
+    k=31 \
+    ktrim=r \
+    qtrim=rl \
+    qin=33 \
+    ml=20 \
+    maq=10 \
+    tpe \
+    tbo \
+    ordered=T \
+    zl=6 \
+    in1=fastq/${SAMPLE}.fq.gz \
+    out1=bbduk/${SAMPLE}.fq.gz &> bbduk/${SAMPLE}.log
+  
+done; sem --wait; date; echo 'All Jobs Complete';
+```
+
+### Load libraries
+```{r, echo=FALSE, message=FALSE}
+library(tidyverse)
+```
+
+### Load sequencing table and modify for loop
+```{r}
+sample_table <- read_tsv('analysis/mpra/output/00_download/sample_table.tsv') 
+sample_table
+```
+
+### ChIP-Seq
+```{r}
+chip_table <- sample_table %>%
+  filter(library_strategy == 'ChIP-Seq') %>%
+  select(sample_title, run_accession, library_layout) %>% 
+  separate(sample_title, into = c('target', NA, 'rep', 'condition'), remove = FALSE) %>% 
+  mutate(read1 = paste(run_accession, '.fq.gz', sep = ''),
+         rep = str_replace(rep, 'rr', 'r')) %>% 
+  select(sample = sample_title, 
+         target,
+         condition,
+         rep,
+         read1)
+
+chip_table
+  
+  
+```
+Set up processing table
+```{r}
+chip_dir <- 'data/mpra/derived/chip_bam/'
+dir.create(chip_dir, showWarnings = FALSE, recursive = TRUE)
+
+processing_table <- chip_table %>% 
+  mutate(Sample = sample,
+         Read1 = file.path(data_dir, read1),
+         Output = paste0(chip_dir, target, '_', condition, '_', rep)) %>% 
+  select(Sample, Read1, Output)
+
+processing_table
+processing_table %>% write_csv(file.path(output_dir, 'chip_processing_table.csv'), col_names = F)
+```
+
+
+
+Alignment (SE)
+```{bash eval=FALSE}
+hisat2bam(){
+  hisat2 -p ${2} --summary-file ${3}.log --new-summary -x ${1} -U ${4} -S ${3}.sam
+  samtools view -bSu -@ `expr ${2} - 1` -o ${3}_unsorted.bam ${3}.sam
+  rm ${3}.sam
+  samtools sort -@ `expr ${2} - 1` -o ${3}.bam ${3}_unsorted.bam
+  rm ${3}_unsorted.bam
+}
+
+export -f hisat2bam;
+
+INDEX=/home/genomes/Homo_sapiens/Ensembl/GRCh37/grch37_snp_tran/genome_snp_tran
+THREADS=4;
+JOBS=2;
+PROCESS_FILE=analysis/mpra/output/01_process/chip_processing_table.csv # processing file, where each row corresponds to parameters
+NROWS=`wc -l $PROCESS_FILE | awk '{ print $1 }'` # automatically count number of rows in file
+
+# loop to run through all samples using semaphores to queue jobs
+for i in $(seq 1 ${NROWS}); do # run through sequence of 1 to nrows
+  
+  LINE=`sed "${i}q;d" $PROCESS_FILE` # parameters at nth row
+  IFS=',' read -ra PARAMS <<< "$LINE" # split parameters by comma as delimiter
+  
+  # store temporary variables
+  SAMPLE=${PARAMS[0]}
+  READ1=${PARAMS[1]}
+  OUTPUT=${PARAMS[2]}
+  
+  sem -j ${JOBS} -k time hisat2bam ${INDEX} ${THREADS} ${OUTPUT} ${READ1} 
+
+  # print to screen
+  echo Running Sample $i: $SAMPLE
+  echo Input: $INPUT
+  echo Output: $OUTPUT
+  
+done; sem --wait; date; echo 'All Jobs Complete';
+```
+
+
+### Peak calling
+Peak type table
+```{r}
+library(googlesheets4)
+options(httr_oob_default=TRUE)
+histones <- read_sheet('https://docs.google.com/spreadsheets/d/1FnQWGG4eyWRq5WlZl1pljOocUsEPnNNhr4M73-56g1k/edit#gid=0')
+histones
+```
+
+### ChIP-Seq
+Table of each sample with respective input
+```{r}
+bam_dir <- chip_dir
+bams <- list.files(bam_dir, pattern = '.bam')
+bams
+
+```
+
+```{r}
+bam_table <- 
+  tibble(
+    'Sample' = bams %>% str_remove('.bam'),
+    'Path' = file.path(bam_dir, bams)
+  ) %>% 
+  separate(Sample, into = c('Mark', 'Condition', 'Replicate'), remove = FALSE)
+
+bam_table
+```
+```{r}
+input_table <- 
+  bam_table %>%
+  filter(Mark == 'input') %>% 
+  select(-Sample, -Mark) %>% 
+  dplyr::rename(Input = Path)
+
+input_table
+```
+
+```{r}
+macs_output_dir <- 'data/mpra/derived/chip_macs'
+dir.create(macs_output_dir, showWarnings = FALSE)
+
+macs_table <- 
+  bam_table %>% 
+  filter(Mark != 'input') %>% 
+  left_join(histones) %>% 
+  left_join(input_table) %>% 
+  mutate(Output = file.path(macs_output_dir, Sample)) %>% 
+  select(Sample, Path, Input, Output, everything())
+
+macs_table %>% write_csv(file.path(output_dir, 'chip_macs_table.csv'), col_names = F)
+macs_table %>% filter(Type == 'Broad') %>% write_csv(file.path(output_dir, 'chip_macs_table_broad.csv'), col_names = F)
+macs_table %>% filter(Type == 'Narrow') %>% write_csv(file.path(output_dir, 'chip_macs_table_narrow.csv'), col_names = F)
+macs_table
+```
+
+IDR table
+```{r}
+idr_dir <- 'data/mpra/derived/chip_idr'
+dir.create(idr_dir)
+
+idr_table <- macs_table %>% 
+  select(Sample, Output, Type, Replicate) %>% 
+  mutate(Group = Sample %>% str_remove('_rep[12]'),
+         Extension = ifelse(Type == 'Narrow', 'narrowPeak', 'broadPeak')) %>% 
+  pivot_wider(-Sample,
+              names_from = Replicate,
+              values_from = Output) %>% 
+  select(Group, rep1, rep2, Extension)
+  
+idr_table %>% write_csv(file.path(output_dir, 'chip_idr_table.csv'), col_names = FALSE)
+idr_table
+```
+
+
+Run MACS2 based on Deniz Goekbuget's version of encode pipeline (https://github.com/dgoekbuget/DG-chip-seq-pipeline/blob/master/macs2.sh)
+```{bash eval=FALSE}
+conda activate macs2
+
+while read -r LINE
+do
+    (IFS=',' read -ra SAMPLE <<< "$LINE"
+    
+    NAME=${SAMPLE[0]}
+    SAMPLE_BAM=${SAMPLE[1]}
+    INPUT_BAM=${SAMPLE[2]}
+    OUTPUT=${SAMPLE[3]}
+    
+    echo $NAME
+    echo ${OUTPUT}
+    
+    mkdir ${OUTPUT}
+    
+    time macs2 callpeak -t $SAMPLE_BAM -c $INPUT_BAM \
+-n macs2 --outdir ${OUTPUT} -f BAM -g hs --broad -p 1e-2 --nomodel --shift 0 -B --SPMR --extsize 200 --keep-dup all --verbose 1 |& tee ${OUTPUT}/log.txt
+    ) &
+
+done < analysis/mpra/output/01_process/chip_macs_table_broad.csv; 
+
+while read -r LINE
+do
+   (IFS=',' read -ra SAMPLE <<< "$LINE"
+    
+    NAME=${SAMPLE[0]}
+    SAMPLE_BAM=${SAMPLE[1]}
+    INPUT_BAM=${SAMPLE[2]}
+    OUTPUT=${SAMPLE[3]}
+    
+    echo $NAME
+    echo ${OUTPUT}
+    
+    mkdir ${OUTPUT}
+    
+    time macs2 callpeak -t $SAMPLE_BAM -c $INPUT_BAM \
+-n macs2 --outdir ${OUTPUT} -f BAM -g hs -p 1e-2 --nomodel --shift 0 -B --SPMR --extsize 200 --keep-dup all --verbose 1 |& tee ${OUTPUT}/log.txt
+    ) &
+
+done < analysis/mpra/output/01_process/chip_macs_table_narrow.csv; 
+```
+
+Run IDR (https://github.com/nboley/idr)
+```{bash eval=FALSE}
+
+while read -r LINE
+do
+    (IFS=',' read -ra SAMPLE <<< "$LINE"
+    
+    NAME=${SAMPLE[0]}
+    FILE1=${SAMPLE[1]}
+    FILE2=${SAMPLE[2]}
+    TYPE=${SAMPLE[3]}
+    
+    echo $NAME
+    
+    time idr --samples $FILE1/macs2_peaks.$TYPE $FILE2/macs2_peaks.$TYPE --input-file-type $TYPE --plot --output-file data/mpra/derived/chip_idr/${NAME}.bed
+    ) &
+
+done < analysis/mpra/output/01_process/chip_idr_table.csv
+
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

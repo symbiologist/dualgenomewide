@@ -1,0 +1,153 @@
+---
+title: 'Integrate sgRNA Filters '
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+## Purpose
+Analyze and filter sgRNA calls from cellranger
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/004_sgrna_filtering' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(ggExtra)
+library(ggforce)
+```
+
+### Feature reference
+```{r}
+features <- read_csv('data/perturbseq/derived/pipestance/features.csv')
+features
+```
+
+## Results
+Read data in here
+
+```{r}
+filtered_sgrnas_replogle <- read_tsv(file.path(analysis_dir, 'filtered_sgrnas_replogle.tsv.gz')) 
+filtered_sgrnas_cellranger <- read_tsv(file.path(analysis_dir, 'filtered_sgrnas_cellranger.tsv.gz'))
+```
+
+
+```{r}
+library(UpSetR)
+
+statuses <- filtered_sgrnas_replogle$status %>% unique() %>% set_names(.)
+
+replogle <- map(statuses, function(i) {
+  filtered_sgrnas_replogle %>% filter(status == i) %>% pull(unique_cell_id) %>% unique()
+})
+
+cellranger <- map(statuses, function(i) {
+  filtered_sgrnas_cellranger %>% filter(status == i) %>% pull(unique_cell_id) %>% unique()
+})
+
+upset(fromList(list('replogle_singlet' = replogle$Singlet,
+                    'replogle_doublet' = replogle$Doublet,
+                    'replogle_undetermined' = replogle$Undetermined,
+                    'cellranger_singlet' = cellranger$Singlet,
+                    'cellranger_doublet' = cellranger$Doublet,
+                    'cellranger_undetermined' = cellranger$Undetermined)), nsets = 6)
+```
+
+### Combine information for final sgRNA singlet filter
+```{r}
+replogle_singlets <- filtered_sgrnas_replogle %>% filter(status == 'Singlet', rank == 'rank1') %>% pull(unique_cell_id)
+cellranger_singlets <- filtered_sgrnas_cellranger %>% filter(status == 'Singlet', rank == 'rank1') %>% pull(unique_cell_id)
+```
+
+```{r}
+all_singlets <- union(replogle_singlets,
+                      cellranger_singlets)
+
+all_singlets %>% n_distinct()
+```
+
+#### Identify singlets
+```{r}
+pure_singlets <- intersect(replogle_singlets,
+                           cellranger_singlets)
+
+pure_singlets %>% n_distinct()
+```
+
+#### Identify doublets
+```{r}
+all_doublets <-  union(filtered_sgrnas_replogle %>% filter(status == 'Doublet') %>% pull(unique_cell_id),
+                       filtered_sgrnas_cellranger %>% filter(status == 'Doublet') %>% pull(unique_cell_id))
+
+all_doublets %>% n_distinct()
+```
+
+
+#### Remove all doublets
+
+```{r}
+filtered_singlets <- all_singlets %>% setdiff(all_doublets) 
+
+filtered_singlets %>% n_distinct()
+```
+
+```{r}
+filtered_sgrnas <- bind_rows(
+  filtered_sgrnas_replogle %>% 
+    filter(unique_cell_id %in% filtered_singlets),
+  filtered_sgrnas_cellranger %>% 
+    filter(unique_cell_id %in% setdiff(filtered_singlets, filtered_sgrnas_replogle$unique_cell_id))) %>% 
+  filter(rank == 'rank1') %>% 
+  select(-status, -rank) %>% 
+  mutate(singlet_status = case_when(
+    unique_cell_id %in% pure_singlets ~ 'Pure',
+    unique_cell_id %in% replogle_singlets ~ 'Replogle',
+    unique_cell_id %in% cellranger_singlets ~ 'cellranger'))
+
+filtered_sgrnas
+```
+### Count
+```{r}
+filtered_sgrnas %>% 
+  group_by(sample) %>% 
+  tally()
+```
+```{r}
+filtered_sgrnas %>% 
+  group_by(condition) %>% 
+  tally()
+```
+
+## Export
+```{r}
+filtered_sgrnas %>% write_tsv(file.path(analysis_dir, 'filtered_sgrnas.tsv.gz'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,115 @@
+---
+title: "Integrate Perturb-Seq data"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Use CCA to integrate batches
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/008_integration' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(Seurat)
+```
+
+### Import data
+Given results of QC analysis, perform downstream pipeline using all filtered singlets (but keep QC metrics)
+```{r}
+seurats <- read_rds('data/perturbseq/derived/seurat/unified_cellranger_qc.rds')
+seurats
+```
+
+
+## Integration
+### Set up
+```{r}
+dims_to_integrate <- 1:30
+```
+
+### Integrate
+Use reference-based since all samples are similar
+Use largest sample as reference (for each condition)
+Much faster to run on command line
+SCTransform in conjunction with CCA
+```{r}
+tic()
+
+seurat_list <- seurats %>% 
+  map(SCTransform, verbose = TRUE)
+
+largest_sample <- map(seurat_list, ncol) %>% unlist() %>% sort(decreasing = TRUE) %>% names() %>% .[1]
+reference_sample <- which(names(seurat_list) == largest_sample)
+
+integration_features <- SelectIntegrationFeatures(object.list = seurat_list,
+                                                  nfeatures = 5000)
+
+seurat_list <- PrepSCTIntegration(object.list = seurat_list, 
+                                  assay = 'SCT',
+                                  anchor.features = integration_features,
+                                  verbose = TRUE)
+
+anchors <- FindIntegrationAnchors(object.list = seurat_list, # this step takes a while
+                                  normalization.method = 'SCT',
+                                  anchor.features = integration_features,
+                                  dims = dims_to_integrate,
+                                  reference = reference_sample,
+                                  verbose = TRUE)
+
+integrated <- IntegrateData(anchorset = anchors,
+                            normalization.method = 'SCT',
+                            dims = dims_to_integrate,
+                            verbose = TRUE)
+
+integrated
+
+
+toc()
+
+integrated <- integrated %>% CellCycleScoring(s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+
+# Export
+integrated %>% write_rds(file.path(data_dir, 'unified_cellranger_sct.rds'))
+
+
+Sys.time()
+```
+
+
+## Session info                     
+```{r}
+sessionInfo()
+```
+

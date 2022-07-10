@@ -1,0 +1,127 @@
+---
+title: "Distribution statistics"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Compare distributions of sgRNA categories using multivariate KS test
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Output directory
+```{r}
+analysis_dir <- 'analysis/perturbseq/output/distribution_statistics'
+figures_dir <- 'figures/perturbseq'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(figures_dir, showWarnings = FALSE)
+```
+
+### Custom functions for this notebook
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(GSAR)
+library(tictoc)
+library(parallel)
+library(Peacock.test)
+```
+
+# Load directories
+
+```{r}
+## -------------------------------------------------------------------------------------------------------
+DIR <- 'analysis/perturbseq/output/data_export/'
+pca_file <- 'pca_coordinates.tsv.gz'
+umap_file <- 'umap_coordinates.tsv.gz'
+meta_file <- 'coordinate_metadata.tsv.gz'
+
+dr <- list('pca' = read_tsv(file.path(DIR, pca_file)),
+           'umap' = read_tsv(file.path(DIR, umap_file)))
+           
+meta <- read_tsv(file.path(DIR, meta_file))
+
+combined <- dr$umap %>% 
+  left_join(meta) %>% 
+  filter(diff_full_status != 'Neighbor hit',
+         locus_ambiguity == 'Non-ambiguous' | library == 'Coding') %>% 
+  select(UMAP_1, UMAP_2, library, primary_pheno, diff_hit_direction)
+combined %>% head()
+```
+
+```{r}
+rm(dr)
+rm(meta)
+gc()
+```
+
+
+## Statistics to compare distributions
+### Multivariate KS test
+Run in parallel as each computation can take several hours
+```{r}
+groups <- c('non', 'pos', 'neg')
+
+tic()
+mclapply(groups,
+                   mc.cleanup = TRUE,
+                   mc.cores = length(groups),
+                   function(i) {
+
+           if(i == 'non') {
+             test_subset <- combined %>% filter(primary_pheno %in% c('None', 'Control'))
+           } else if (i == 'pos') {
+             test_subset <- combined %>% filter(diff_hit_direction %in% c('Positive Hit', 'Control'))
+           }  else if (i == 'neg') {
+             test_subset <- combined %>% filter(diff_hit_direction %in% c('Negative Hit', 'Control'))
+           } 
+           
+           test_subset <- test_subset %>% 
+             mutate(group = ifelse(primary_pheno == 'Control', 1, 2)) %>% 
+             group_by(group) %>% 
+             sample_frac(0.5) %>% 
+             ungroup() %>% 
+             select(UMAP_1, UMAP_2, group)
+             
+           tic()
+           ks <- KStest(object = t(as.matrix(test_subset[,c('UMAP_1', 'UMAP_2')])),
+                            group = test_subset$group,
+                            nperm = 1000,
+                            pvalue.only = FALSE)
+           toc()
+           
+           ks %>% write_rds(file.path(analysis_dir, paste0('ks_', i, '.rds')))
+           
+           ks
+})
+
+toc()
+Sys.time()
+
+
+```
+

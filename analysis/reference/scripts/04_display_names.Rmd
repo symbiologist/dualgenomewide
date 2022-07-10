@@ -1,0 +1,34 @@
+---
+title: "Generate Table of Display Names"
+author: "David Wu"
+output: html_notebook
+---
+
+Set working directory to project directory
+```{r setup, include=FALSE}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Output directory
+```{r}
+output_dir <- 'analysis/reference/output/02_unified_reference'
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+t2g <- read_tsv('analysis/reference/output/02_unified_reference/unified_metadata.tsv.gz')
+display_names <- t2g %>% 
+  select(feature_id, gene_name) %>% 
+  unique() %>% 
+  mutate(display_name = ifelse(feature_id != gene_name, 
+                               paste0(feature_id, ': ', gene_name),
+                               feature_id)) 
+
+display_names %>% write_tsv(file.path(output_dir, 'unified_display_names.tsv.gz'))
+```
+

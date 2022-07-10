@@ -1,0 +1,149 @@
+---
+title: "Overlap MPRA epigenomic features"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Purpose
+Import peak files into R and determine overlap with screen features
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(GenomicRanges)
+library(rtracklayer)
+library(plyranges)
+```
+
+### Load themes and functions
+```{r}
+source('analysis/universal/functions.R') # themes for all project components
+
+source('analysis/universal/themes.R') # themes for all project components
+
+theme_set(theme_publication())
+```
+
+### Directories
+```{r}
+analysis_dir <- 'analysis/mpra/output/02_overlap_features'
+data_dir <- 'data/mpra/derived'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+```{r}
+read_idr <- function(path) {
+  path %>% read_tsv(col_names = F) %>% 
+    select(seqnames = X1,
+           start = X2,
+           end = X3,
+           score = X5,
+           strand = X6) %>% 
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)}
+```
+
+```{r}
+idr_table <- bind_rows(read_csv('analysis/mpra/output/01_process/atac_idr_table.csv', col_names = F) %>% mutate(X1 = paste('ATAC_', X1, sep = '')),
+                       read_csv('analysis/mpra/output/01_process/chip_idr_table.csv', col_names = F)) %>% 
+  select(sample = X1, input = X2) %>% 
+  mutate(dir = dirname(input) %>% str_replace('macs', 'idr'),
+         path = paste(dir, '/', str_remove(sample, 'ATAC_'), '.bed', sep = '')) 
+idr_table
+```
+
+```{r message=FALSE}
+idr_bed <- idr_table$path %>% set_names(idr_table$sample)
+
+granges <- map(idr_bed, function(i) {
+  imported <- read_tsv(i, col_names = F) %>% 
+    select(seqnames = X1,
+           start = X2,
+           end = X3,
+           score = X5,
+           strand = X6,
+           signal = X7,
+           pval = X8,
+           qval = X9,
+           summit = X10,
+           localIDR = X11,
+           globalIDR = X12) %>% 
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+  seqlevelsStyle(imported) <- 'UCSC'
+  imported %>% filter(globalIDR > -log10(0.05)) # equivalent to IDR multiple-testing corrected pval 0.05
+  
+  })
+
+
+```
+
+```{r}
+granges[['ATAC_0hr']]
+```
+
+```{r}
+granges[['ATAC_0hr']] %>% filter(globalIDR > -log10(0.05))
+```
+
+```{r}
+granges$ATAC_12hr %>% as.data.frame() %>% 
+  ggplot(aes(y = score,
+             x = globalIDR)) + 
+  geom_point()
+```
+
+### Inspect and update names
+```{r}
+names(granges)
+```
+
+```{r}
+names(granges) <- names(granges) %>% paste0('Yosef_', .)
+```
+
+### Annotation and screen data
+```{r}
+master <-  read_tsv('analysis/integration/output/00_integrate/master_minimal.tsv.gz')
+gtf <- 'analysis/reference/output/02_unified_reference/unified_minimal.gtf'
+reference <- import(gtf)
+
+# Limit analysis to screened genes
+reference_subset <- reference %>% filter(feature_id %in% master$feature_id)
+reference_subset
+```
+
+Find all overlaps
+```{r}
+all_genes <- master$feature_id %>% unique()
+
+overlap_table <- map_dfc(granges, function(i) {
+  overlaps <- find_overlaps(i %>% keepStandardChromosomes(pruning.mode = 'coarse'), reference_subset, maxgap = 1000)
+  overlapped_genes <- overlaps$feature_id %>% unique()
+  setNames(all_genes %in% overlapped_genes, all_genes) %>% as.numeric()
+}) %>% mutate(feature_id = all_genes) %>% 
+  select(feature_id, everything())
+
+overlap_table
+
+```
+
+### Export
+```{r}
+overlap_table %>% write_tsv(file.path(analysis_dir, 'peaks.tsv.gz'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+
+

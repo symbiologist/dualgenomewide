@@ -1,0 +1,222 @@
+---
+title: "Import Perturb-Seq data"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Import raw Perturb-Seq data and filter on full barcodes
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/005_import' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(Seurat)
+library(parallel)
+```
+### Functions
+```{r}
+library(Matrix)
+# cellbender import for Seurat; see https://github.com/broadinstitute/CellBender/issues/66
+
+ReadCB_h5 <- function(filename, use.names = TRUE, unique.features = TRUE) {
+  if (!requireNamespace('hdf5r', quietly = TRUE)) {
+    stop("Please install hdf5r to read HDF5 files")
+  }
+  if (!file.exists(filename)) {
+    stop("File not found")
+  }
+  infile <- hdf5r::H5File$new(filename = filename, mode = 'r')
+  genomes <- names(x = infile)
+  output <- list()
+  if (hdf5r::existsGroup(infile, 'matrix')) {
+    # cellranger version 3
+    message('CellRanger version 3+ format H5')
+    if (use.names) {
+      feature_slot <- 'features/name'
+    } else {
+      feature_slot <- 'features/id'
+    }
+  } else {
+    message('CellRanger version 2 format H5')
+    if (use.names) {
+      feature_slot <- 'gene_names'
+    } else {
+      feature_slot <- 'genes'
+    }
+  }
+  for (genome in genomes) {
+    counts <- infile[[paste0(genome, '/data')]]
+    indices <- infile[[paste0(genome, '/indices')]]
+    indptr <- infile[[paste0(genome, '/indptr')]]
+    shp <- infile[[paste0(genome, '/shape')]]
+    features <- infile[[paste0(genome, '/', feature_slot)]][]
+    barcodes <- infile[[paste0(genome, '/barcodes')]]
+    sparse.mat <- sparseMatrix(
+      i = indices[] + 1,
+      p = indptr[],
+      x = as.numeric(x = counts[]),
+      dims = shp[],
+      giveCsparse = FALSE
+    )
+    if (unique.features) {
+      features <- make.unique(names = features)
+    }
+    rownames(x = sparse.mat) <- features
+    colnames(x = sparse.mat) <- barcodes[]
+    sparse.mat <- as(object = sparse.mat, Class = 'dgCMatrix')
+    # Split v3 multimodal
+    if (infile$exists(name = paste0(genome, '/features'))) {
+      types <- infile[[paste0(genome, '/features/feature_type')]][]
+      types.unique <- unique(x = types)
+      if (length(x = types.unique) > 1) {
+        message("Genome ", genome, " has multiple modalities, returning a list of matrices for this genome")
+        sparse.mat <- sapply(
+          X = types.unique,
+          FUN = function(x) {
+            return(sparse.mat[which(x = types == x), ])
+          },
+          simplify = FALSE,
+          USE.NAMES = TRUE
+        )
+      }
+    }
+    output[[genome]] <- sparse.mat
+  }
+  infile$close_all()
+  if (length(x = output) == 1) {
+    return(output[[genome]])
+  } else{
+    return(output)
+  }
+}
+```
+
+### Import feature reference
+```{r}
+features <- read_csv('data/perturbseq/derived/pipestance/features.csv')
+features
+```
+### Feature calls
+```{r}
+filtered_sgrnas <- read_tsv('analysis/perturbseq/output/004_sgrna_filtering/filtered_sgrnas.tsv.gz') %>% 
+  left_join(features %>% select(guide_identity = id,
+                                guide_target = target_gene_id))
+filtered_sgrnas
+```
+
+### sgRNA metadata to add
+```{r}
+metadata_table <- filtered_sgrnas %>% 
+  select(cell_barcode,
+         sample, 
+         condition,
+         UMI_count, 
+         z_score, 
+         guide_identity,
+         guide_target,
+         singlet_status) 
+
+metadata_table
+```
+
+## Unified
+## Import data and load into Seurat
+### Identify output files
+```{r}
+# Pull out directories of interest
+pipestance_dir <- 'data/perturbseq/derived/pipestance'
+pipestances <- list.dirs(pipestance_dir, full.names = T, recursive = F) %>% str_subset('diff')
+sample_names <- basename(pipestances) %>% set_names(.)
+names(pipestances) <- sample_names
+pipestances
+```
+
+### Import full cellranger data, restricting to sgRNA barcodes filtered by either cellranger or cellbender
+```{r}
+# Read counts matrices and select singlets from sgRNA filtering step
+tic()
+unified_cellranger_matrices <- mclapply(pipestances, function(pipestance) {
+  sample_name <- basename(pipestance)
+  
+  counts_matrix <- Read10X(file.path(pipestance, 'outs/raw_feature_bc_matrix'))
+  
+  barcodes <- filtered_sgrnas %>% 
+    filter(sample == sample_name) %>% 
+    pull(cell_barcode) %>% 
+    intersect(colnames(counts_matrix[['Gene Expression']]))
+  
+  list('gene' = counts_matrix[['Gene Expression']][, barcodes],
+       'grna' = counts_matrix[['CRISPR Guide Capture']][, barcodes])
+}, mc.cores = 10)
+toc()
+```
+
+## Export
+```{r}
+tic()
+unified_cellranger_matrices %>% write_rds(file.path(data_dir, 'unified_cellranger_matrices.rds'), compress = 'gz')
+toc()
+```
+
+## Import full cellbender data, restricting to sgRNA barcodes filtered by either cellranger or cellbender
+```{r}
+# Read counts matrices and select singlets from sgRNA filtering step
+tic()
+unified_cellbender_matrices <- mclapply(pipestances, function(pipestance) {
+  sample_name <- basename(pipestance)
+  
+  counts_matrix <- ReadCB_h5(file.path(pipestance, 'outs/cellbender/cellbender.h5'))
+  
+  barcodes <- filtered_sgrnas %>% 
+    filter(sample == sample_name) %>% 
+    pull(cell_barcode) %>% 
+    intersect(colnames(counts_matrix[['Gene Expression']]))
+  
+  list('gene' = counts_matrix[['Gene Expression']][, barcodes],
+       'grna' = counts_matrix[['CRISPR Guide Capture']][, barcodes])
+}, mc.cores = 10)
+toc()
+```
+
+## Export
+```{r}
+unified_cellbender_matrices %>% write_rds(file.path(data_dir, 'unified_cellbender_matrices.rds'), compress = 'gz')
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```

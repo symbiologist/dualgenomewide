@@ -1,0 +1,91 @@
+---
+title: "Master file"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Master Perturb-Seq metadata file
+
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/perturb_master' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+```
+
+## Import data to integrate
+```{r}
+master <- read_tsv('analysis/integration/output/00_integrate/master_wide.tsv.gz')
+coordinate_metadata <- read_tsv('analysis/perturbseq/output/data_export/coordinate_metadata.tsv.gz')
+cell_states <- read_tsv('analysis/perturbseq/output/cell_states/density_quant.tsv.gz')
+```
+
+
+```{r}
+barcode_counts <- coordinate_metadata %>% 
+  filter(guide_target != 'Non-Targeting') %>% 
+  select(feature_id = guide_target, guide_identity) %>% 
+  separate(guide_identity, into = c(NA, 'guide_no'), sep = '_') %>% 
+  mutate(guide_no = paste('sgrna', guide_no, 'n', sep = '_')) %>% 
+  group_by(feature_id, guide_no) %>% 
+  tally() %>% 
+  pivot_wider(names_from = guide_no,
+              values_from = n) %>% 
+  mutate(sgrna_total_n = sgrna_1_n + sgrna_2_n) %>% 
+  ungroup()
+  
+barcode_counts
+```
+
+### Master table for Perturb-Seq targets
+```{r}
+perturb_master <- barcode_counts %>% 
+  left_join(cell_states %>% dplyr::rename(feature_id = target,
+                                          n_cell_states = n_clusters)) %>% 
+  left_join(master) %>% 
+  select(feature_id, gene_name, library, primary_pheno, diff_hit_direction, diff_full_status, ends_with('_n'), everything()) 
+
+perturb_master
+```
+
+
+## Export
+```{r}
+perturb_master %>% write_tsv(file.path(analysis_dir, 'perturb_master.tsv'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

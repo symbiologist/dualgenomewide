@@ -1,0 +1,593 @@
+---
+title: "Process Epigenomic Data"
+output: html_notebook
+---
+
+## Purpose
+Import ChIP-Seq data from Bing Ren lab
+Epigenomic Analysis of Multilineage Differentiation of Human Embryonic Stem Cells
+Bing Ren lab
+Paper: https://www.sciencedirect.com/science/article/pii/S0092867413004649
+Obtain ENA metadata table from: https://www.ebi.ac.uk/ena/data/view/SRP000941
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/epigenomics/output/01_process' # analysis file output directory
+data_dir <- 'data/epigenomics' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+```
+
+## Download
+Load ENA metadata table
+```{r}
+srp <- read_tsv('analysis/epigenomics/input/SRP000941.txt')
+srp %>% head()
+```
+
+Subset file
+```{r}
+sample_subset <- srp %>% 
+  select(instrument_platform, 
+         library_name, 
+         library_layout, 
+         library_strategy, 
+         library_selection, 
+         experiment_title,
+         sample_alias,
+         sample_title,
+         fastq_bytes,
+         fastq_md5,
+         fastq_aspera,
+         sample_accession,
+         experiment_accession,
+         run_accession) %>%
+  filter(instrument_platform == 'ILLUMINA') %>% 
+  separate(fastq_bytes, into = c('fastq1_bytes', 'fastq2_bytes'), sep = ';') %>% 
+  separate(fastq_md5, into = c('fastq1_md5', 'fastq2_md5'), sep = ';') %>% 
+  separate(fastq_aspera, into = c('fastq1_aspera', 'fastq2_aspera'), sep = ';') %>% 
+  mutate(fastq1_gb = as.numeric(fastq1_bytes)/(1024^3),
+         fastq2_gb = as.numeric(fastq2_bytes)/(1024^3)) %>% 
+  separate(experiment_title, into = c(NA, 'experiment_title'), sep = ';') %>% 
+  select(-fastq1_bytes, -fastq2_bytes)
+
+
+sample_subset 
+```
+
+Examine ChIP-Seq files
+```{r}
+sample_subset %>% filter(library_strategy == 'ChIP-Seq')
+```
+Examine possible sample alias names
+```{r}
+sample_subset$sample_alias %>% unique() %>% sort()
+```
+
+Exclude unwanted samples
+```{r}
+exclude <- str_subset(sample_subset$sample_alias %>% unique(), 'IMR90|BMP4|Mesendoderm|MSC|STL')
+exclude
+```
+Subset samples of interest
+```{r}
+chip_subset <- sample_subset %>% 
+  filter(!(sample_alias %in% exclude)) %>% 
+  filter(library_selection == 'ChIP') %>% 
+  separate(experiment_title, into = c(NA, 'experiment_title'), sep = 'Reference Epigenome: ChIP-Seq Analysis of ') %>% 
+  separate(experiment_title, into = c('target', 'cell_type'), sep = ' in ') %>% 
+  mutate(cell_type = str_remove(cell_type, ' Cells')) %>% arrange(cell_type, target) %>% 
+  filter(str_detect(sample_alias, 'H1|NPC')|str_detect(cell_type, 'H1|Neural'))
+
+chip_subset
+```
+
+Calculate total fastq size
+```{r}
+chip_subset %>% pull(fastq1_gb) %>% sum()
+```
+Examine some samples
+```{r}
+chip_subset %>% select(library_name, target, cell_type, sample_alias, sample_accession, experiment_accession, run_accession) %>% arrange(sample_accession, target)
+```
+
+Examine sample alias for files of interest
+```{r}
+chip_subset$sample_alias %>% table()
+```
+Prepare a bash script using ena-fast-download.py (https://github.com/wwood/ena-fast-download) that uses aspera-connect
+Previously already set up aspera
+```{r}
+paste('ena-fast-download.py', chip_subset$run_accession) %>% 
+  write(file.path(data_dir, 'external/fastq', 'aspera.txt'))
+```
+
+Get input files for ChIP-Seq data
+```{r}
+input_subset <- sample_subset %>% 
+  filter(!(sample_alias %in% exclude)) %>% 
+  filter(str_detect(experiment_title, pattern = 'Input')) %>% 
+  separate(experiment_title, into = c(NA, 'cell_type'), sep = 'Reference Epigenome: ChIP-Seq Input from ') %>% 
+  mutate(cell_type = str_remove(cell_type, ' Cells')) %>%
+  filter(str_detect(sample_alias, 'H1|NPC')|str_detect(cell_type, 'H1|Neural'))
+
+input_subset
+```
+
+Calculate size
+```{r}
+input_subset %>% pull(fastq1_gb) %>% sum()
+```
+
+```{r}
+input_subset %>% select(library_name, cell_type, sample_alias, sample_accession, experiment_accession, run_accession) %>% arrange(sample_accession)
+```
+
+```{r}
+neural_subset <- chip_subset %>% select(library_name, target, cell_type, sample_alias, sample_accession, experiment_accession, run_accession) %>% filter(str_detect(cell_type, 'Neural'))
+neural_subset
+```
+```{r}
+neural_subset %>% select(sample_alias, sample_accession) %>% unique()
+```
+```{r}
+input_subset %>% filter(sample_accession %in% neural_subset$sample_accession)
+```
+
+Prepare script
+```{r}
+paste('ena-fast-download.py', input_subset$run_accession) %>% 
+  write(file.path(data_dir, 'external/fastq', 'input_aspera2.txt'))
+```
+
+Run script
+```{bash}
+BASE=/media/data4/dwu/genomics/data/epigenomics/roadmap
+cd $BASE
+mkdir fastq bam
+cd fastq
+
+while read LIST; do
+$LIST; 
+done < aspera.txt
+
+while read LIST; do
+#$LIST; 
+done < input_aspera.txt
+```
+
+## Process
+```{r}
+input_subset %>% arrange(library_name)
+```
+```{r}
+chip_subset %>% arrange(library_name)
+```
+
+```{r}
+input_subset %>% select(sample_alias, run_accession) %>% filter(sample_alias %in% chip_subset$sample_alias) %>% arrange(sample_alias)
+```
+
+Merge and export sample table
+```{r}
+sample_table <- chip_subset %>% bind_rows(input_subset %>% mutate(target = 'input'))
+sample_table %>% write_csv(file.path(analysis_dir, 'roadmap_sample_table.csv'))
+```
+
+Alignment following their methods:
+For H1 and the H1 derived cells, ChIP-seq reads were aligned to the H1-modified reference genome with Bowtie (version 0.12). We used the first 25 bp for the alignment and only reads with less than two mismatches were accepted. To generate the ChIP-seq signals for each histone modification shown in the UCSC genome browser, we normalized the read counts for both the ChIP and the input samples by computing the number of reads per kilobase of bin per million reads sequenced (RPKM). The RPKM values for the ChIP signal were then subtracted by those for the input signal as described previously (Hawkins et al., 2010) and were shown as the UCSC genome browser tracks. For the downstream data analyses, RPKM values were averaged for each bin between replicates. To minimize the batch and cell type variation, the RPKM values were further normalized through Z-score transformation, by subtracting the mean of RPKM across the genome and divided by the standard deviation of RPKM across the genome.
+
+### First, bbduk to trim
+```{bash}
+BASE=data/epigenomics/raw/
+INDEX=/home/genomes/Homo_sapiens/Ensembl/GRCh37/grch37_snp_tran/genome_snp_tran
+cd $BASE
+mkdir bam bbduk clumpify
+TYPE=fastq.gz
+THREADS=2; #threads per sample; use no more than available threads
+RAM=8; #ram per job; use no more than 300 GB in total (for 20 concurrent jobs, this should be set to 300 / 20 = 15)
+JOBS=20; #number of concurrent jobs; will pull a job from the queue as soon as a job completes
+
+for SAMPLE in `find fastq -type f -name *.${TYPE} | sed 's!.*/!!' | sed s/.${TYPE}//g | sort -u`; do
+echo Running ${SAMPLE}
+sem -j ${JOBS} -k time /home/software/bbmap/bbduk.sh ref=/home/software/bbmap/resources/adapters.fa mink=8 hdist=1 k=31 ktrim=r qtrim=r threads=${THREADS} -Xmx${RAM}g -ftr=25 tpe tbo in1=fastq/${SAMPLE}.${TYPE} out1=bbduk/${SAMPLE}.fq.gz &> bbduk/${SAMPLE}.log
+done; sem --wait; date; echo 'All Jobs Complete'; 
+
+for SAMPLE in `find fastq -type f -name *.${TYPE} | sed 's!.*/!!' | sed s/.${TYPE}//g | sort -u`; do
+echo Running ${SAMPLE}
+sem -j ${JOBS} -k time /home/software/bbmap/clumpify.sh reorder threads=${THREADS} -Xmx${RAM}g in1=bbduk/${SAMPLE}.fq.gz out1=clumpify/${SAMPLE}.fq.gz &> clumpify/${SAMPLE}.log
+done; sem --wait; date; echo 'All Jobs Complete'; 
+```
+
+Use hisat2 instead of bowtie on grch37
+
+```{bash}
+hisat2bam(){
+  hisat2 -p ${2} --summary-file bam/${4}.log --new-summary -x ${1} -U ${3}/${4}.fq.gz -S bam/${4}.sam
+  samtools view -bSu -@ `expr ${2} - 1` -o bam/${4}_unsorted.bam bam/${4}.sam
+  rm bam/${4}.sam
+  samtools sort -@ `expr ${2} - 1` -o bam/${4}.bam bam/${4}_unsorted.bam
+  rm bam/${4}_unsorted.bam
+}
+
+export -f hisat2bam;
+
+DIR=clumpify;
+
+for SAMPLE in `find fastq -type f -name *.${TYPE} | sed 's!.*/!!' | sed s/.${TYPE}//g | sort -u`; do
+echo Running ${SAMPLE}
+sem -j ${JOBS} -k time hisat2bam ${INDEX} ${THREADS} ${DIR} ${SAMPLE}
+done; sem --wait; date; echo 'All Jobs Complete'; 
+
+```
+
+# Restart here
+MACS peaks, combining inputs to call peaks
+```{r}
+library(tidyverse)
+sample_table <- read_csv('/media/data4/dwu/genomics/analysis/output/20200131_roadmap_sample_table.csv')
+
+```
+Merge bam files of different sequencing runs of the same library
+```{r}
+libraries <- sample_table %>% select(run_accession, sample_alias, library_name) %>% 
+  mutate(path = paste(run_accession, '.bam', sep = '')) %>% 
+  add_count(library_name) %>% arrange(-n)
+libraries
+```
+
+```{r}
+merge_libraries <- libraries %>% filter(n > 1)
+to_merge <- map(merge_libraries$library_name %>% unique(), function(i) {
+  file_names <- merge_libraries %>% filter(library_name == i) %>% pull(path) %>% unique() %>% paste0(collapse = ' ')
+  list('library' = i,
+       'input' = file_names,
+       'output' = paste(i, '.bam', sep = ''))
+}) %>% bind_rows()
+to_merge
+```
+```{r}
+no_merge <- libraries %>% filter(n == 1) %>% select(library_name, path) %>% mutate(output = paste(library_name, '.bam', sep = '')) 
+no_merge
+```
+
+```{r}
+to_merge %>% write_csv('/media/data4/dwu/genomics/data/epigenomics/roadmap/bam/to_merge.csv', col_names = F)
+no_merge %>% write_csv('/media/data4/dwu/genomics/data/epigenomics/roadmap/bam/no_merge.csv', col_names = F)
+```
+
+samtools merge (or rename, for no_merge samples)
+```{bash}
+BASE=/media/data4/dwu/genomics/data/epigenomics/roadmap/bam
+THREADS=2;
+cd ${BASE};
+
+while read -r LINE
+do
+    (IFS=',' read -ra SAMPLE <<< "$LINE"
+    
+    LIBRARY=${SAMPLE[0]}
+    INPUT=${SAMPLE[1]}
+    OUTPUT=${SAMPLE[2]}
+    
+    echo $LIBRARY
+    samtools merge -@ $THREADS $OUTPUT $INPUT
+    ) &
+
+done < to_merge.csv; 
+
+
+while read -r LINE
+do
+    (IFS=',' read -ra SAMPLE <<< "$LINE"
+    
+    LIBRARY=${SAMPLE[0]}
+    INPUT=${SAMPLE[1]}
+    OUTPUT=${SAMPLE[2]}
+    
+    echo $LIBRARY
+    mv $INPUT $OUTPUT
+    ) &
+
+done < no_merge.csv; 
+
+# clean up by removing SRR files and indexing remaining samples
+rm SRR*
+
+
+```
+
+
+
+```{r}
+chip <- sample_table %>% 
+  filter(target != 'input') %>% 
+  mutate(condition = ifelse(str_detect(cell_type, 'hESC'), 'hESC', 'NSC')) %>% 
+  select(condition, target, library_name, sample_alias, sample_path = library_name) %>% unique()
+chip
+```
+
+```{r}
+input <- sample_table %>% filter(target == 'input') %>% 
+  mutate(condition = ifelse(str_detect(cell_type, 'hESC'), 'hESC', 'NSC')) %>% 
+  select(condition, library_name, sample_alias, input_path = library_name) %>% unique()
+input 
+```
+
+```{r}
+rejoin <- chip %>% full_join(input) %>% drop_na()
+rejoin
+```
+
+```{r}
+rejoin$target %>% n_distinct()
+```
+
+```{r}
+rejoin %>% drop_na() %>% pull(target) %>% n_distinct()
+```
+
+```{r}
+rejoin %>% select(condition, target) %>% unique()
+```
+
+
+```{r}
+setdiff(rejoin$target %>% unique(), rejoin %>% drop_na() %>% pull(target) %>% unique())
+```
+
+Peak type table
+```{r}
+library(googlesheets4)
+options(httr_oob_default=TRUE)
+histones <- read_sheet('https://docs.google.com/spreadsheets/d/1FnQWGG4eyWRq5WlZl1pljOocUsEPnNNhr4M73-56g1k/edit#gid=0')
+histones
+```
+
+
+Only run rejoined; sort to biological replicates and select samples with most similar read depth
+Add histone broad vs narrow peak (https://www.encodeproject.org/chip-seq/histone/)
+```{r}
+
+base_dir <- '/media/data4/shared/ipsc_manuscript/data/epigenomics/derived/bam/'
+rejoin_filtered <- rejoin %>% 
+  drop_na() %>% 
+  filter(sample_alias != 'CDI-01') %>% 
+  mutate(target = str_remove(target, '\\.')) %>% 
+  group_by(condition, target) %>% 
+  add_tally(name = 'total_replicates') %>%
+  mutate(sample_path = paste(base_dir, sample_path, '.bam', sep = ''),
+         input_path = paste(base_dir, input_path, '.bam', sep = ''),
+         size = file.size(sample_path)/1e6) %>% 
+  arrange(-size) %>% 
+  mutate(replicate = 1:n(),
+         sample = paste(condition, target, replicate, sep = '_')) %>% 
+  ungroup() %>% 
+  left_join(histones %>% select(target = Name, type = Type)) %>% 
+  mutate(type = ifelse(is.na(type), 'Broad', type))
+rejoin_filtered %>% arrange(sample, replicate)
+```
+
+```{r}
+rejoin_filtered %>% select(sample, sample_path, input_path) 
+
+rejoin_filtered %>% write_csv('data/epigenomics/derived/macs2/macs_table_all.csv')
+
+rejoin_filtered %>% filter(type == 'Broad') %>% 
+  select(sample, sample_path, input_path) %>% 
+  write_csv('data/epigenomics/derived/macs2/macs_table_broad.csv', col_names = F)
+
+rejoin_filtered %>% filter(type == 'Narrow') %>% 
+  select(sample, sample_path, input_path) %>% 
+  write_csv('data/epigenomics/derived/macs2/macs_table_narrow.csv', col_names = F)
+```
+
+Set up replicates for IDR table
+```{r}
+idr_table <- rejoin_filtered %>% 
+  filter(total_replicates >= 2) %>% 
+  select(sample, condition, target, replicate, total_replicates, type, size) %>% 
+  mutate(output = paste(condition, target, sep = '_'),
+         extension = ifelse(type == 'Narrow', 'narrowPeak', 'broadPeak'),
+         path = paste('macs2/', sample, '/macs2_peaks.', extension, sep = '')) %>% 
+  group_by(output) %>% 
+  top_n(n = 2, wt = size) %>%  
+  select(output, extension, replicate, path) %>% 
+  pivot_wider(names_from = replicate, values_from = path) %>% 
+  select(output, `1`, `2`, extension)
+idr_table 
+```
+
+```{r}
+
+idr_table %>% write_csv('data/epigenomics/derived/idr/idr_table.csv', col_names = F)
+```
+
+Run MACS2 based on Deniz Goekbuget's version of encode pipeline (https://github.com/dgoekbuget/DG-chip-seq-pipeline/blob/master/macs2.sh)
+```{bash}
+BASE=/media/data4/shared/ipsc_manuscript/data/epigenomics/derived
+THREADS=15;
+cd ${BASE};
+
+conda activate macs2
+
+while read -r LINE
+do
+    (IFS=',' read -ra SAMPLE <<< "$LINE"
+    
+    NAME=${SAMPLE[0]}
+    SAMPLE_BAM=${SAMPLE[1]}
+    INPUT_BAM=${SAMPLE[2]}
+    
+    echo $NAME
+    
+    mkdir macs2/${NAME}
+    
+    time macs2 callpeak -t $SAMPLE_BAM -c $INPUT_BAM \
+-n macs2 --outdir macs2/${NAME} -f BAM -g hs --broad -p 1e-2 --nomodel --shift 0 -B --SPMR --extsize 200 --keep-dup all |& tee macs2/${NAME}/log.txt
+    ) &
+
+done < macs2/macs_table_broad.csv; 
+
+while read -r LINE
+do
+    (IFS=',' read -ra SAMPLE <<< "$LINE"
+    
+    NAME=${SAMPLE[0]}
+    SAMPLE_BAM=${SAMPLE[1]}
+    INPUT_BAM=${SAMPLE[2]}
+    
+    echo $NAME
+    
+    mkdir macs2/${NAME}
+    
+    time macs2 callpeak -t $SAMPLE_BAM -c $INPUT_BAM \
+-n macs2 --outdir macs2/${NAME} -f BAM -g hs -p 1e-2 --nomodel --shift 0 -B --SPMR --extsize 200 --keep-dup all |& tee macs2/${NAME}/log.txt
+    ) &
+
+done < macs2/macs_table_narrow.csv; 
+```
+
+Run IDR (https://github.com/nboley/idr)
+```{bash}
+
+while read -r LINE
+do
+    (IFS=',' read -ra SAMPLE <<< "$LINE"
+    
+    NAME=${SAMPLE[0]}
+    FILE1=${SAMPLE[1]}
+    FILE2=${SAMPLE[2]}
+    TYPE=${SAMPLE[3]}
+    
+    echo $NAME
+    
+    time idr --samples $FILE1 $FILE2 --input-file-type $TYPE --plot --output-file idr/${NAME}.bed
+    ) &
+
+done < idr/idr_table.csv
+
+```
+
+
+
+Generate bigWig with deeptools
+```{bash}
+JOBS=40
+mkdir bigwig
+
+for SAMPLE in `find bam -type f -name *.bam | sed 's!.*/!!' | sed s/.bam//g | sort -u`; do
+echo Running ${SAMPLE}
+sem -j ${JOBS} -k time samtools index bam/${SAMPLE}.bam
+done; sem --wait; date; echo 'All Jobs Complete';
+
+for SAMPLE in `find bam -type f -name *.bam | sed 's!.*/!!' | sed s/.bam//g | sort -u`; do
+echo Running ${SAMPLE}
+sem -j ${JOBS} -k time bamCoverage -b bam/${SAMPLE}.bam -o bigwig/${SAMPLE}.bw &> bigwig/${SAMPLE}.log
+done; sem --wait; date; echo 'All Jobs Complete';
+```
+
+
+### merge bams for visualization
+### Epigenomics file metadata
+```{r}
+sample_table <- read_csv('analysis/epigenomics/output/01_process/roadmap_sample_table.csv') %>% 
+  mutate(cell_type = ifelse(str_detect(cell_type, 'hESC'), 'hESC', 'NSC'),
+         target = str_remove(target, '\\.'),
+         condition = paste(cell_type, target, sep = '_'))
+
+sample_table
+```
+
+
+
+
+# Merge bam files for visualization
+```{r}
+bams <- list.files(file.path(data_dir, 'bam'), pattern = '.bam$') %>% str_remove('.bam')
+
+bam_metadata <- sample_table %>% select(library_name, target, cell_type, condition) %>% filter(library_name %in% bams)
+
+bam_metadata
+```
+```{r}
+merge_table <- map(bam_metadata$condition %>% unique(), function(i) {
+  bams_to_merge <- bam_metadata %>% filter(condition == i) %>% pull(library_name) %>% paste0('.bam') 
+  
+  bams_to_merge <- paste('bam/', bams_to_merge, collapse = ' ', sep = '')
+  
+  tibble('condition' = i,
+         'files' = bams_to_merge)
+}) %>% bind_rows()
+
+merge_table %>% write_csv(file.path(data_dir, 'bam_merge/merge.csv'), col_names = F)
+
+merge_table
+```
+### Merge bams
+```{bash eval=FALSE}
+cd data/epigenomics/derived
+
+THREADS=24
+
+while read -r LINE
+do
+    (IFS=',' read -ra SAMPLE <<< "$LINE"
+    
+    CONDITION=${SAMPLE[0]}
+    INPUT=${SAMPLE[1]}
+    
+    echo $CONDITION
+    echo "merging $INPUT"
+    samtools merge bam_merge/${CONDITION}.bam $INPUT
+    ) 
+
+done < bam_merge/merge.csv; date; echo 'complete'
+
+
+```
+
+### bigwig
+```{bash}
+JOBS=40
+mkdir bigwig_merge
+
+for SAMPLE in `find bam_merge -type f -name *.bam | sed 's!.*/!!' | sed s/.bam//g | sort -u`; do
+echo Running ${SAMPLE}
+sem -j ${JOBS} -k time samtools index bam_merge/${SAMPLE}.bam
+done; sem --wait; date; echo 'All Jobs Complete';
+
+for SAMPLE in `find bam_merge -type f -name *.bam | sed 's!.*/!!' | sed s/.bam//g | sort -u`; do
+echo Running ${SAMPLE}
+sem -j ${JOBS} -k time bamCoverage -b bam_merge/${SAMPLE}.bam -o bigwig_merge/${SAMPLE}.bw &> bigwig_merge/${SAMPLE}.log
+done; sem --wait; date; echo 'All Jobs Complete';
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

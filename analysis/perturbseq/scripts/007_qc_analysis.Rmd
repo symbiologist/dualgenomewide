@@ -1,0 +1,661 @@
+---
+title: "QC analysis of Perturb-Seq data"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Identify QC clusters and run pipeline to examine what cell type clusters they correspond to downstream
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Functions 
+```{r}
+tabulate_frequency <- function(metadata_table,
+                               group1 = guide_target,
+                               group2 = seurat_clusters,
+                               rename = TRUE) {
+  frequency_table <- 
+      metadata_table %>% 
+    mutate_all(as.factor) %>% 
+    mutate_all(droplevels) %>% 
+    dplyr::select({{group1}}, 
+                  {{group2}}) 
+  
+  if(rename) {
+    colnames(frequency_table) <- c('target', 'cluster')
+  }
+
+  frequency_table %>% table()
+  
+}
+
+calculate_proportions <- function(frequency_table) {
+  
+  target_proportion <- prop.table(frequency_table, margin = 1) %>% 
+    as.data.frame() %>% 
+    as_tibble() %>% 
+    mutate(target_proportion = round(Freq, 3)) %>% 
+    dplyr::select(-Freq)
+  
+  cluster_proportion <- prop.table(frequency_table, margin = 2) %>% 
+    as.data.frame() %>% 
+    as_tibble() %>% 
+    mutate(cluster_proportion = round(Freq, 3)) %>% 
+    dplyr::select(-Freq)
+  
+  frequency_long <- frequency_table %>% 
+    as.data.frame() %>% 
+    as_tibble()
+  
+  colnames(frequency_long) <- c('target', 'cluster', 'n_overlap')
+  
+  cluster_totals <- colSums(frequency_table) %>% 
+    as.data.frame() %>% 
+    rownames_to_column()
+  
+  colnames(cluster_totals) <- c('cluster', 'n_cluster')
+  
+  target_totals <- rowSums(frequency_table) %>% 
+    as.data.frame() %>% 
+    rownames_to_column()
+  colnames(target_totals) <- c('target', 'n_target')
+  
+  proportion_table <- inner_join(cluster_proportion,
+                                 target_proportion) %>% 
+    inner_join(frequency_long) %>% 
+    inner_join(target_totals) %>% 
+    inner_join(cluster_totals) %>% 
+    mutate(max_proportion = ifelse(cluster_proportion > target_proportion, cluster_proportion, target_proportion),
+           score = round(cluster_proportion * target_proportion, 3)) %>% 
+    arrange(-max_proportion)
+  
+  proportion_table
+  
+}
+
+proportion_histograms <- function(proportion_table) {
+  list(proportion_table %>% ggplot(aes(x = cluster_proportion)) + geom_histogram() + scale_x_log10(),
+       proportion_table %>% ggplot(aes(x = target_proportion)) + geom_histogram() + scale_x_log10(),
+       proportion_table %>% ggplot(aes(x = score)) + geom_histogram() + scale_x_log10()) %>% 
+    wrap_plots()
+}
+
+create_proportion_matrix <- function(frequency_table) {
+  target_proportion <- prop.table(frequency_table, margin = 1)
+  
+  cluster_proportion <- prop.table(frequency_table, margin = 2)
+  
+  list('cluster' = as.matrix(cluster_proportion),
+       'target' = as.matrix(target_proportion))
+}
+
+proportion_analysis <- function(metadata_table,
+                               group1 = guide_target,
+                               group2 = seurat_clusters,
+                               rename = TRUE,
+                               heatmap_names = FALSE) {
+  
+  condition <- metadata_table$condition %>% unique()
+  object <- metadata_table$object %>% unique()
+  
+  freq_table <- metadata_table %>% 
+    tabulate_frequency(group1 = {{group1}},
+                       group2 = {{group2}},
+                       rename = rename)
+  
+  prop_table <- freq_table %>% calculate_proportions()
+  prop_matrix <- freq_table %>% create_proportion_matrix()
+  prop_hist <- prop_table %>% proportion_histograms()
+  
+  cluster_heatmap <- pheatmap(t(prop_matrix$cluster), 
+                              scale = 'column', 
+                              clustering_distance_rows = 'correlation', 
+                              clustering_distance_cols = 'correlation',
+                              main = paste(condition, object, 'cluster'),
+                              show_colnames = heatmap_names)
+  
+  target_heatmap <- pheatmap(t(prop_matrix$target), 
+                             scale = 'column', 
+                             clustering_distance_rows = 'correlation', 
+                             clustering_distance_cols = 'correlation',
+                             main = paste(condition, object, 'target'),
+                             show_colnames = heatmap_names)
+    
+  heatmaps <- list('cluster' = cluster_heatmap,
+                   'target' = target_heatmap)
+  
+  list('frequency' = freq_table,
+       'proportions' = prop_table,
+       'matrix' = prop_matrix,
+       'histogram' = prop_hist,
+       'heatmap' = heatmaps)
+}
+```
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/007_qc_analysis' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(Seurat)
+library(plotly)
+library(cluster)
+library(pheatmap)
+```
+
+## cellranger
+## Import Seurat object
+```{r}
+seurats <- read_rds('data/perturbseq/derived/seurat/unified_cellranger.rds')
+```
+```{r}
+seurats
+```
+
+
+```{r}
+# other cutoffs
+umi_cutoff <- 2000
+complexity_cutoff <- 1000
+```
+
+```{r fig.height=8, fig.width=16}
+seurats %>% 
+  map(seurat_statsplot, vline = umi_cutoff, hline = complexity_cutoff) %>% 
+  wrap_plots(nrow = 2)
+```
+
+```{r fig.height=8, fig.width=16}
+seurats %>% 
+  map(seurat_statsplot, x = 'percent_mito', y = 'percent_ribo', logx = F, logy = F, median_lines = F) %>% 
+  wrap_plots(nrow = 2)
+```
+
+```{r fig.height=8, fig.width=16}
+seurats %>% 
+  map(seurat_statsplot, x = 'percent_mito', y = 'nFeature_RNA', logx = F, logy = F, median_lines = F) %>% 
+  wrap_plots(nrow = 2)
+```
+
+Perform k-medioid clustering to roughly partition cells based on QC metrics  
+Set k = 3
+```{r fig.height=8, fig.width=16}
+tic()
+seurats <- map(seurats, function(seurat) {
+  cat(paste(seurat@project.name, '\n'))
+  qc_metrics <- seurat@meta.data[,c(
+    'nFeature_RNA', # just use nFeature since it is nearly redundant with nUMI
+    'percent_ribo',
+    'percent_mito'
+  )] %>% 
+    rownames_to_column() %>% 
+    mutate_at(vars(contains('_')), log10) %>% # log transform 
+    mutate_if(is.numeric, scale) %>% # scale for clustering
+    column_to_rownames()
+  
+  # # kmeans
+  clusters <- kmeans(qc_metrics, 3, nstart = 30)
+  cluster_labels <- clusters$cluster
+  
+  # use consistent coloring
+  qc_metrics$cluster <- cluster_labels
+
+  
+  cluster_tabulate <- cluster_labels %>% table() %>% sort(decreasing = T)
+  
+  # order clusters by mitochondrial percentage
+  qc_summary <- qc_metrics %>% group_by(cluster) %>% summarize_all(median)
+  cluster_order <- qc_summary %>% arrange(percent_mito) %>% pull(cluster)
+  
+  cluster_labels[cluster_labels == cluster_order[1]] <- 'QC1'
+  cluster_labels[cluster_labels == cluster_order[2]] <- 'QC2'
+  cluster_labels[cluster_labels == cluster_order[3]] <- 'QC3'
+
+seurat <- AddMetaData(seurat, data.frame('qc_cluster' = as.factor(cluster_labels)))
+
+})
+toc()
+
+map(seurats, function(seurat) {
+  seurat@meta.data %>% 
+  ggplot(aes(x = percent_ribo,
+             y = log10(nCount_RNA),
+             color = qc_cluster)) + 
+  geom_point(alpha = 0.1, size = 0.5) +
+  scale_color_few() +
+    ggtitle(seurat@project.name) + 
+    theme(legend.position = 'bottom')
+}) %>% wrap_plots(nrow = 2)
+```
+```{r fig.height=8, fig.width=16}
+map(seurats, function(seurat) {
+  seurat@meta.data %>% 
+  ggplot(aes(x = percent_mito,
+             y = log10(nFeature_RNA),
+             color = qc_cluster)) + 
+  geom_point(alpha = 0.1, size = 0.5) +
+  scale_color_few() +
+    ggtitle(seurat@project.name) + 
+    theme(legend.position = 'bottom')
+}) %>% wrap_plots(nrow = 2)
+```
+```{r fig.height=8, fig.width=16}
+map(seurats, function(seurat) {
+  seurat@meta.data %>% 
+  ggplot(aes(x = percent_ribo,
+             y = log10(nFeature_RNA),
+             color = qc_cluster)) + 
+  geom_point(alpha = 0.5, size = 0.25) +
+  scale_color_few() +
+    ggtitle(seurat@project.name) + 
+    theme(legend.position = 'bottom')
+}) %>% wrap_plots(nrow = 2)
+```
+
+
+### Facet by QC cluster
+```{r fig.height=12, fig.width=16}
+map(seurats, function(seurat) {
+  seurat@meta.data %>% 
+    ggplot(aes(x = percent_ribo,
+               y = log10(nCount_RNA),
+               color = qc_cluster)) + 
+    geom_point(alpha = 0.8, size = 0.25) +
+    scale_color_few() +
+    facet_wrap(~qc_cluster, nrow = 2) + 
+    ggtitle(seurat@project.name) + 
+    theme(legend.position = 'bottom')
+}) %>% wrap_plots(nrow = 2)
+```
+```{r}
+seurat <- seurats$diff_1
+    
+plot_ly(seurat@meta.data,
+        x = ~log10(nFeature_RNA),
+        y = ~log10(percent_mito),
+        z = ~log10(percent_ribo),
+        color = ~qc_cluster,
+        marker = list(size = 5))
+```
+
+
+```{r}
+seurats %>% write_rds(file.path(data_dir, 'unified_cellranger_qc.rds'))
+```
+
+
+## Pipeline
+Proceed with basic pipeline to understand how much QC affects downstream analyses
+### Set up
+```{r}
+conditions <- list('diff' = seurats)
+
+dims_to_integrate <- 1:30
+```
+
+### Integration 
+Use reference-based since all samples are similar
+Use largest sample as reference (for each condition)
+```{r}
+tic()
+merged <- map(conditions, function(i) {
+  
+  seurat_list <- i %>% 
+    map(NormalizeData) %>% 
+    map(FindVariableFeatures, 
+        selection.method = 'vst', 
+        nfeatures = 1000)
+  
+  largest_sample <- map(seurat_list, ncol) %>% unlist() %>% sort(decreasing = TRUE) %>% names() %>% .[1]
+  reference_sample <- which(names(seurat_list) == largest_sample)
+  
+  integration_features <- SelectIntegrationFeatures(object.list = seurat_list,
+                                                    nfeatures = 1000)
+  
+  anchors <- FindIntegrationAnchors(object.list = seurat_list,
+                                    anchor.features = integration_features,
+                                    dims = dims_to_integrate,
+                                    reference = reference_sample)
+  
+  integrated <- IntegrateData(anchorset = anchors,
+                              dims = dims_to_integrate)
+  
+  integrated
+})
+toc()
+```
+
+
+### Dimensionality reduction
+```{r}
+calculate_dims <- 50
+
+merged <- merged %>% 
+  map(ScaleData) %>% 
+  map(RunPCA, npcs = calculate_dims) 
+
+merged %>% map(ElbowPlot, ndims = calculate_dims)
+```
+
+
+
+```{r}
+significant_dims <- 1:30
+k <- 30
+neighbors <- 30
+min_dist <- 0.1
+n_epochs <- 200
+umap_seed <- 20191214
+threads <- 24
+
+tic()
+merged <- merged %>% map(FindNeighbors, dims = significant_dims, k.param = neighbors) # for SNN, use lower K 
+toc()
+
+tic()
+merged <- merged %>% map(FindClusters, algorithm = 1, resolution = 1.6) # use high resolution to find subclusters
+toc()
+```
+
+
+```{r}
+tic()
+merged <- merged %>% map(RunUMAP, 
+                         dims = significant_dims, 
+                         reduction = 'pca', 
+                         reduction.name = 'umap',
+                         n.components = 2, 
+                         n.neighbors = k, 
+                         min.dist = min_dist,
+                         n.epochs = n_epochs,
+                         n_threads = 24,
+                         seed.use = umap_seed)
+toc()
+
+merged %>% map(seurat_plot, reduction = 'umap', feature = 'ident', do.label = T) %>% wrap_plots()
+```
+```{r}
+tsne_seed <- umap_seed
+theta <- 0.3
+iter <- 1000
+tic()
+merged <- merged %>% map(RunTSNE, 
+                         dims = significant_dims, 
+                         reduction = 'pca', 
+                         tsne.method = 'FIt-SNE', 
+                         fast_tsne_path = '/home/software/FIt-SNE/bin/fast_tsne', 
+                         max_iter = iter, 
+                         nthreads = threads,
+                         theta = theta, 
+                         perplexity = k,
+                         seed.use = tsne_seed);
+toc()
+
+merged %>% map(seurat_plot, reduction = 'tsne', 
+               feature = 'ident', 
+               size = 0.5, alpha = 0.5, color_package = 'hues', color_scale = 'pimp', do.label = T,
+               show.legend = F) %>% wrap_plots()
+```
+
+Check original QC clusters
+```{r}
+merged %>% map(seurat_plot, reduction = 'umap', feature = 'qc_cluster', size = 0.3, alpha = 0.1, color_package = 'carto', color_scale = 'Prism', do.label = T) %>% wrap_plots()
+```
+```{r}
+merged %>% map(seurat_plot, reduction = 'tsne', feature = 'qc_cluster', size = 0.3, alpha = 0.3, color_package = 'carto', color_scale = 'Prism', do.label = T) %>% wrap_plots()
+```
+
+Plot mitochondrial content
+```{r}
+merged %>% map(seurat_feature, reduction = 'umap', gene = 'percent_mito', size = 0.3, alpha = 0.3, colors = c('grey80', 'grey80', 'dodgerblue4')) %>% wrap_plots()
+```
+
+```{r}
+merged %>% map(seurat_feature, reduction = 'umap', gene = 'percent_ribo', size = 0.3, alpha = 0.3, colors = c('grey80', 'grey80', 'dodgerblue4')) %>% wrap_plots()
+```
+
+```{r}
+merged %>% map(seurat_feature, reduction = 'umap', gene = 'nFeature_RNA', size = 0.3, alpha = 0.3, colors = c('grey80', 'grey80', 'dodgerblue4')) %>% wrap_plots()
+```
+## Cluster analysis
+### Are specific sgRNAs enriched in any of the low QC clusters?
+```{r}
+groups <- c('diff') %>% set_names(.)
+
+cluster_table <- map(groups, function(i) {
+  merged[[i]]@meta.data %>% 
+    rownames_to_column('barcode')
+})
+  
+cluster_table
+```
+
+### Frequency analysis
+QC frequency
+```{r}
+qc_frequency <- map(groups, function(i) {
+  freq <- cluster_table[[i]] %>% 
+    tabulate_frequency(group1 = qc_cluster,
+                       group2 = seurat_clusters)
+  
+  prop <- calculate_proportions(freq) %>% mutate(condition = i)
+})
+
+qc_frequency
+```
+
+Which cell clusters overlap with low QC clusters?
+```{r}
+qc_frequency$diff %>% 
+  filter(target != 'QC2',
+         cluster_proportion > 0.2) 
+```
+
+```{r}
+low_qc_clusters <- map(groups, function(i) {
+  qc_frequency[[i]] %>% 
+  filter(target == 'QC3',
+         cluster_proportion > 0.2) %>% 
+  pull(cluster)
+})
+
+low_qc_clusters
+```
+
+Are any targets enriched?
+```{r}
+target_frequency <- map(groups, function(i) {
+  freq <- cluster_table[[i]] %>% 
+    tabulate_frequency(group1 = guide_target,
+                       group2 = seurat_clusters)
+  
+  prop <- calculate_proportions(freq) %>% mutate(condition = i)
+})
+
+target_frequency
+```
+
+```{r}
+target_frequency$diff %>% 
+  filter(cluster %in% low_qc_clusters$diff)
+```
+
+For targets found in poor QC clusters, some appear to be enriched for certain sgRNAs. 
+Therefore, as a first pass, keep all filtered singlets for downstream analysis. Maintain QC cluster metadata in seurat object for future filtering if desired.
+
+If further filtering is desired, identify barcodes using mixture model cutoffs.
+```{r}
+barcodes_to_remove <- map(groups, function(i) {
+  merged[[i]]@meta.data %>% 
+    rownames_to_column() %>% 
+    filter(seurat_clusters %in% low_qc_clusters[[i]]) %>% 
+    mutate(cell_barcode = str_sub(rowname, end = -3)) %>% 
+    select(cell_barcode, orig.ident)
+}) %>% bind_rows()
+
+barcodes_to_remove
+```
+
+### QC filter using k-means groups and additional cutoffs based on mixture models
+Set up mixture model cutoffs
+
+Mixture model on QC metrics
+```{r fig.height=8, fig.width=16}
+map(seurats, function(seurat) {
+  
+  data_input <- seurat@meta.data$nFeature_RNA %>% log10()
+  mixture <- mixture_model(data_input)
+  
+  mixture$plot +
+    ggtitle(seurat@project.name) 
+  
+  
+}) %>% wrap_plots(nrow = 2)
+
+```
+Ribo fraction
+```{r fig.height=8, fig.width=16}
+map(seurats, function(seurat) {
+  data_input <- seurat@meta.data$percent_ribo %>% log10()
+  
+  mixture <- mixture_model(data_input)
+  mixmod <- mixture$model
+  
+  mixture$plot +
+    ggtitle(seurat@project.name) 
+  
+  
+}) %>% wrap_plots(nrow = 2)
+```
+
+Mito fraction
+```{r fig.height=8, fig.width=16}
+map(seurats, function(seurat) {
+  data_input <- seurat@meta.data$percent_mito 
+  
+  mixture <- mixture_model(data_input)
+  
+  mixture$plot +
+    ggtitle(seurat@project.name) 
+  
+  
+}) %>% wrap_plots(nrow = 2)
+```
+
+## Visualize
+```{r fig.height=16, fig.width=14}
+map(seurats, function(seurat) {
+  barcodes_to_remove_subset <- barcodes_to_remove %>% 
+    filter(orig.ident == seurat@project.name) %>% 
+    pull(cell_barcode)
+  
+  # nFeature
+  feature_mixture <- mixture_model(seurat@meta.data$nFeature_RNA %>% log10())
+  
+  # ribo
+  ribo_mixture <- mixture_model(seurat@meta.data$percent_ribo %>% log10())
+  
+  # mito
+  mito_mixture <- mixture_model(seurat@meta.data$percent_mito)
+  
+  barcodes_to_keep <- rownames_to_column(seurat@meta.data, 'cell_barcode') %>% 
+    filter(
+      !(cell_barcode %in% barcodes_to_remove_subset)) %>% 
+    pull(cell_barcode)
+  
+  seurat@meta.data %>% 
+    rownames_to_column('cell_barcode') %>% 
+    mutate('QC' = ifelse(cell_barcode %in% barcodes_to_keep, 'Include', 'Exclude')) %>% 
+    ggplot(aes(x = percent_ribo,
+               y = log10(nFeature_RNA),
+               color = QC)) + 
+    geom_point(alpha = 0.8, size = 0.25) +
+    scale_color_few() +
+    ggtitle(seurat@project.name) + 
+    theme(legend.position = 'bottom') +
+    facet_wrap(~QC, nrow = 2)
+  
+}) %>% wrap_plots(nrow = 2)
+```
+
+Filter using QC as well as mixture model cutoffs
+```{r}
+# seurats <- seurats %>% map(function(seurat) {
+#   
+#    barcodes_to_remove_subset <- barcodes_to_remove %>% 
+#      filter(orig.ident == seurat@project.name) %>% 
+#      pull(cell_barcode)
+#    
+#    # nFeature
+#    feature_mixture <- mixture_model(seurat@meta.data$nFeature_RNA %>% log10())
+#   
+#    # ribo
+#    ribo_mixture <- mixture_model(seurat@meta.data$percent_ribo %>% log10())
+#    
+#    # mito
+#    mito_mixture <- mixture_model(seurat@meta.data$percent_mito)
+#    
+#    barcodes_to_keep <- rownames_to_column(seurat@meta.data, 'cell_barcode') %>% 
+#      filter(
+#        qc_cluster != 'QC3',
+#        !(cell_barcode %in% barcodes_to_remove_subset)) %>% 
+#      pull(cell_barcode)
+#    
+#    subset(seurat, cells = barcodes_to_keep)
+# })
+# 
+# seurats
+```
+### Final visualization
+```{r fig.height=8, fig.width=16}
+map(seurats, function(seurat) {
+  seurat@meta.data %>% 
+  ggplot(aes(x = percent_ribo,
+             y = log10(nFeature_RNA),
+             color = qc_cluster)) + 
+  geom_point(alpha = 0.5, size = 0.25) +
+  scale_color_few() +
+    ggtitle(seurat@project.name) + 
+    theme(legend.position = 'bottom')
+}) %>% wrap_plots(nrow = 2)
+
+```
+## Export
+```{r}
+seurats %>% write_rds(file.path(data_dir, 'unified_cellranger_qc.rds'))
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+

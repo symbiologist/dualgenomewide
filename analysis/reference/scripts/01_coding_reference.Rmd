@@ -1,0 +1,316 @@
+---
+title: 'Prepare Ensembl Coding Reference '
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Purpose
+Prepare Ensembl reference gtf used for generating hCRISPRi sgRNA library for downstream merge with lncRNA gtf
+
+## Set up
+### Set working directory to project directory
+```{r setup, include=FALSE}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Output directory
+```{r}
+output_dir <- 'analysis/reference/output/01_coding_reference'
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+### Load libraries
+```{r, echo=FALSE, message=FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(GenomicFeatures)
+library(plyranges)
+```
+
+### Import
+hCRISPRi libraries were built from GRCh37.p13 using Ensembl/Gencode and RefSeq annotations (Horlbeck et al., eLife 2016)
+The genome sequence and reference annotations were downloaded (data/reference and analysis/reference/input)
+Fasta and Ensembl GTF source: https://www.gencodegenes.org/human/release_19.html
+
+```{r}
+gencode <- import('analysis/reference/input/gencode.v19.annotation.gtf.gz')
+gencode
+```
+
+Library table of coding genes
+```{r}
+library_table <- read_tsv('analysis/screen/input/ScreenProcessing/library_tables/CRISPRi_v2_human_librarytable.txt')
+library_table
+```
+
+Genes in library and gencode
+```{r}
+library_genes_intersect <- gencode$gene_name %>% intersect(library_table$gene) 
+library_genes_intersect %>% n_distinct()
+```
+
+Mark genes assayed in the sgRNA library, and exclude some misc RNA categories.
+However, include ribosomal/mitochondrial/pseudogenes/lncRNAS (for accurate RNA-Seq quantitation, and to match up when unifying references)
+
+```{r}
+gencode$gene_type %>% table()
+```
+
+## Filtering
+Genes to include/exclude
+```{r}
+gencode_metadata <- gencode %>% as_tibble()
+
+# Filter on main gene_types
+gene_types_to_include <- c('protein_coding',
+                           'pseudogene', 
+                           'antisense', 
+                           'lincRNA', 
+                           'processed_transcript', 
+                           'polymorphic_pseudogene', 
+                           'sense_intronic', 
+                           'sense_overlapping')
+
+gene_types_to_exclude <- setdiff(gencode_metadata$gene_type, gene_types_to_include)
+
+# Include these gene sets
+gene_ids_to_include <- gencode_metadata %>% filter(gene_name %in% library_genes_intersect | # library genes
+                                                     str_detect(gene_name, '^RPS|^RPM|^RPL') | # ribosomal genes
+                                                     seqnames == 'chrM' | # mitochondrial genes
+                                                     gene_type %in% gene_types_to_include) %>% pull(gene_id) %>% unique() # gene types shown above
+
+gene_ids_to_exclude <- gencode_metadata %>% filter(gene_type %in% gene_types_to_exclude) %>% pull(gene_id) %>% unique()
+
+filtered_gene_ids <- setdiff(gene_ids_to_include, gene_ids_to_exclude)
+```
+
+Filter and select columns of interest.
+```{r}
+gencode_subset <- gencode %>% 
+  filter(gene_id %in% filtered_gene_ids) %>%
+  sort() %>% 
+  mutate(library = ifelse(gene_name %in% library_genes_intersect, 'Coding', NA),
+         length = width,
+         ref_id = transcript_id,
+         class_code = NA,
+         internal_id = gene_id,
+         lh_id = NA,
+         tss_id = NA,
+         feature_id = gene_name,
+         gene_id = str_sub(gene_id, end = 15), # remove version numbers from gencode ids
+         transcript_id = str_sub(transcript_id, end = 15)) %>% 
+  select(source, 
+         type,
+         score,
+         phase,
+         feature_id,
+         gene_name,
+         gene_id,
+         transcript_name,
+         transcript_id,
+         exon_id,
+         internal_id,
+         ref_id,
+         class_code,
+         lh_id,
+         tss_id,
+         length,
+         gene_type,
+         transcript_type,
+         gene_status,
+         transcript_status,
+         library)
+gencode_subset
+```
+
+### Duplicates
+Identify duplicates (1 gene name, 2 gene_ids) that exist in the sgRNA library (105 gene names, 210 gene_ids)
+```{r}
+gencode_duplicates <- gencode_subset %>% 
+  filter(type == 'gene', library == 'Coding') %>% 
+  as_tibble() %>% 
+  select(gene_name, gene_id, gene_type) %>% 
+  unique() %>% 
+  add_count(gene_name) %>% 
+  filter(n > 1)
+
+gencode_duplicates
+```
+Pull TSS 
+```{r}
+tss_table <- read_csv('analysis/reference/input/20150611_TSS_table_grouped_extended.csv')
+tss_table
+```
+Determine which gene_id to assign to feature
+```{r}
+closest_tss <- gencode_subset %>% 
+  filter(gene_name %in% gencode_duplicates$gene_name, type == 'gene') %>% 
+  resize(width = 1) %>% 
+  as_tibble() %>% 
+  select(gene_name, gene_id, gene_type, source, chromosome = seqnames, start) %>% 
+  inner_join(tss_table %>% select(gene_name = gene, chromosome, position)) %>% 
+  mutate(distance = abs(start - position)) %>% 
+  unique()
+
+closest_tss
+```
+
+Assign features to closest TSS (almost all have 1 within 1 kb, a few within 2 kb).
+For the genes that do not make this table, update their gene_name, feature_id, and library columns in the final gencode output. 
+This will prevent duplicates downstream. These now need to have a merged gene model as well
+```{r}
+tss_matches <- closest_tss %>% 
+  group_by(gene_name) %>% 
+  top_n(n = -1, wt = distance) %>% 
+  filter(distance < 2000) %>% 
+  add_count(gene_name) %>% 
+  arrange(-n)
+
+tss_matches
+```
+
+Merge gene_ids for genes sharing the same start site and gene name
+```{r}
+merged_gene_ids <- tss_matches %>% filter(n > 1) %>% 
+  group_by(gene_name) %>% 
+  summarize(new_gene_id = paste(gene_id, collapse = ':'),
+            new_gene_type = paste(gene_type, collapse = ':'),
+            new_source = paste(source, collapse = ':'))
+
+merged_gene_ids
+```
+Identify untargeted duplicate features for updating gene_name, feature_id, and library status
+```{r}
+untargeted_features <- setdiff(gencode_duplicates$gene_id, tss_matches$gene_id)
+```
+
+## Merge back
+Merge back to gtf
+```{r}
+gencode_updated <- gencode_subset %>% 
+  as_tibble() %>% 
+  left_join(merged_gene_ids) %>% 
+  mutate(gene_id = ifelse(is.na(new_gene_id), gene_id, new_gene_id), # update merged gene_ids
+         gene_type = ifelse(is.na(new_gene_type), gene_type, new_gene_type),
+         source = ifelse(is.na(new_source), source, new_source),
+         gene_name = ifelse(gene_id %in% untargeted_features, paste(gene_name, '.2', sep = ''), gene_name), # append .2 for duplicated untargeted features
+         feature_id = gene_name, # reupdate all feature ids
+         library = ifelse(gene_id %in% untargeted_features, NA, library)) %>% # remove library status
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+
+gencode_updated
+```
+Check to ensure updates occurred as expected
+```{r}
+gencode_updated %>% filter(gene_id %in% untargeted_features)
+```
+
+```{r}
+gencode_updated %>% filter(gene_name %in% merged_gene_ids$gene_name)
+```
+
+```{r}
+gencode_updated %>% filter(type == 'gene') %>% as_tibble() %>% select(source:feature_id) %>% unique() %>% filter(feature_id == 'EFNA3')
+```
+
+### Rebuild gene models
+```{r}
+txdb <- makeTxDbFromGRanges(gencode_updated)
+gene_structure <- genes(txdb)
+gene_structure
+```
+```{r}
+gencode_subset %>% filter(type == 'gene')
+```
+
+```{r}
+gencode_gene_metadata <- gencode_updated %>% 
+  filter(type == 'gene') %>% 
+  mutate(transcript_id = gene_id, 
+         transcript_name = gene_name,
+         exon_id = NA,
+         ref_id = gene_id,
+         internal_id = gene_id,
+         phase = NA) %>% 
+  as_tibble() %>% 
+  select(source,
+         type,
+         score,
+         phase,
+         feature_id,
+         gene_name,
+         gene_id,
+         transcript_name,
+         transcript_id,
+         exon_id,
+         internal_id,
+         ref_id,
+         class_code,
+         lh_id,
+         tss_id,
+         gene_type,
+         library) %>% 
+  unique()
+
+
+gencode_gene_metadata %>% arrange(feature_id) %>% filter(library == 'Coding')
+```
+Convert to GRanges
+```{r}
+gene_gtf <- gene_structure %>% 
+  as.data.frame() %>% 
+  mutate(type = 'gene') %>% 
+  left_join(gencode_gene_metadata) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+
+gene_gtf
+```
+
+## Finalize
+```{r}
+gencode_final <- gencode_updated %>% 
+  filter(type != 'gene') %>% 
+  c(gene_gtf) %>% 
+  mutate(length = width) %>% # recalculate lengths
+  sort() %>% 
+  select(source,
+         type,
+         score,
+         phase,
+         feature_id,
+         gene_name,
+         gene_id,
+         transcript_name,
+         transcript_id,
+         exon_id,
+         internal_id,
+         ref_id,
+         class_code,
+         lh_id,
+         tss_id,
+         length,
+         gene_type,
+         transcript_type,
+         transcript_status,
+         library)
+
+```
+
+## Export
+```{r}
+gencode_final %>% export('analysis/reference/output/01_coding_reference/coding.gtf')
+```
+
+gzip
+```{bash}
+gzip --keep -f analysis/reference/output/01_coding_reference/coding.gtf
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

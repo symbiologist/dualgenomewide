@@ -1,0 +1,118 @@
+---
+title: "Data export"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Export data in friendly formats
+
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/data_export' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(Seurat)
+```
+
+## Import object
+```{r}
+integrated <- read_rds('data/perturbseq/derived/seurat/unified_cellranger_sct.rds')
+```
+
+## Coordinates
+```{r}
+umap_coordinates <- Embeddings(integrated, reduction = 'umap') %>% 
+  as.data.frame() %>% 
+  rownames_to_column('barcode')
+
+umap3d_coordinates <- Embeddings(integrated, reduction = 'umap3d') %>% 
+  as.data.frame() %>% 
+  rownames_to_column('barcode')
+
+pca_coordinates <- Embeddings(integrated, reduction = 'pca') %>% 
+  as.data.frame() %>% 
+  rownames_to_column('barcode') 
+
+```
+
+### Metadata
+```{r}
+coordinate_metadata <- integrated@meta.data %>% 
+  rownames_to_column('barcode') %>% 
+  select(barcode, 
+         guide_identity, 
+         guide_target, 
+         library, 
+         primary_pheno, 
+         diff_hit_direction, 
+         diff_full_status,
+         diff_pheno,
+         cluster = leiden_cluster_hi, 
+         low_res_cluster,
+         trajectory,
+         singlet_status, 
+         qc_cluster,
+         nCount_RNA, 
+         nFeature_RNA, 
+         grna_UMI_count = UMI_count,
+         sample,
+         starts_with('locus'),
+         contains('time'))
+
+coordinate_metadata
+```
+```{r}
+pca_obj <- integrated@reductions$pca
+pca_obj
+```
+
+## Export
+```{r}
+pca_obj %>% write_rds(file.path(analysis_dir, 'pca_obj.rds'))
+
+coordinate_metadata %>% write_tsv(file.path(analysis_dir, 'coordinate_metadata.tsv.gz'))
+
+umap_coordinates %>% write_tsv(file.path(analysis_dir, 'umap_coordinates.tsv.gz'))
+umap3d_coordinates %>% write_tsv(file.path(analysis_dir, 'umap3d_coordinates.tsv.gz'))
+pca_coordinates %>% write_tsv(file.path(analysis_dir, 'pca_coordinates.tsv.gz'))
+
+umap_coordinates %>% left_join(coordinate_metadata) %>% write_tsv(file.path(analysis_dir, 'umap_meta.tsv.gz'))
+umap3d_coordinates %>% left_join(coordinate_metadata) %>% write_tsv(file.path(analysis_dir, 'umap3d_meta.tsv.gz'))
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+

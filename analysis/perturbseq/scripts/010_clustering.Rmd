@@ -1,0 +1,175 @@
+---
+title: "Clustering of Perturb-Seq data"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Run clustering on PCA data
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/010_clustering' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(tictoc)
+library(Seurat)
+library(leiden)
+```
+
+## Globals
+Quick umap parameters for test plotting; see 011_dimensionality_reduction for final UMAP parameters
+```{r}
+calculate_dims <- 50
+significant_dims <- 1:30
+k <- 30
+neighbors <- 25
+min_dist <- 0.05
+n_epochs <- 250
+umap_seed <- 737697
+algorithm <- 'both'
+louvain_resolution <- c(0.6, 0.8, 1.0)
+leiden_resolution <- c(0.6, 0.8, 1.0)
+```
+
+# Clustering on SCT data
+## Import integrated object
+```{r}
+merged <- read_rds('data/perturbseq/derived/seurat/unified_cellranger_sct.rds')
+merged
+```
+### Scale data
+```{r}
+# check if SCT
+if(any(str_detect(names(merged@assays), 'SCT'))) {
+  scale_data <- FALSE
+  assay_name <- 'SCT'
+} else {
+  scale_data <- TRUE
+  assay_name <- 'RNA'
+}
+
+if(scale_data) {
+  merged <- merged %>% 
+    ScaleData()
+  
+  merged <- merged %>% ScaleData(assay = 'integrated')
+}
+
+merged
+```
+
+
+### PCA
+```{r}
+merged <- merged %>% RunPCA(assay = 'integrated',
+                             npcs = calculate_dims)
+
+merged %>% ElbowPlot(ndims = calculate_dims)
+```
+
+### Clustering 
+```{r}
+tic()
+merged <- merged %>% FindNeighbors(assay = 'integrated',
+                                   dims = significant_dims, 
+                                   k.param = neighbors)
+
+toc()
+
+# louvain alg
+if(algorithm == 'louvain' | algorithm == 'both') {
+  tic()
+  merged <- merged %>% FindClusters(assay = 'integrated', algorithm = 1, resolution = louvain_resolution)
+  
+  names(merged@meta.data)[which(names(merged@meta.data) == paste0('integrated_snn_res.', max(louvain_resolution)))] <- 'louvain_cluster_hi'
+  names(merged@meta.data)[which(names(merged@meta.data) == paste0('integrated_snn_res.', median(louvain_resolution)))] <- 'louvain_cluster_mid'
+  names(merged@meta.data)[which(names(merged@meta.data) == paste0('integrated_snn_res.', min(louvain_resolution)))] <- 'louvain_cluster_lo'
+
+toc()  
+} 
+
+# leiden alg; need to assign manually
+if (algorithm == 'leiden' | algorithm == 'both') {
+  
+  tic()
+  merged <- merged %>% FindClusters(assay = 'integrated', algorithm = 4, resolution = leiden_resolution, method = 'igraph')
+  names(merged@meta.data)[which(names(merged@meta.data) == paste0('integrated_snn_res.', max(leiden_resolution)))] <- 'leiden_cluster_hi'
+  names(merged@meta.data)[which(names(merged@meta.data) == paste0('integrated_snn_res.', median(leiden_resolution)))] <- 'leiden_cluster_mid'
+  names(merged@meta.data)[which(names(merged@meta.data) == paste0('integrated_snn_res.', min(leiden_resolution)))] <- 'leiden_cluster_lo'
+  
+  toc()
+}
+```
+
+
+
+### Visualization
+Test UMAP for a quick check on clustering; optimize parameters in dimensionality reduction notebook
+```{r fig.height=6, fig.width=6}
+tic()
+test <- merged %>% RunUMAP(assay = 'integrated',
+                           dims = significant_dims, 
+                           reduction = 'pca', 
+                           reduction.name = 'umap',
+                           n.components = 2, 
+                           n.neighbors = k, 
+                           min.dist = min_dist,
+                           n.epochs = n_epochs,
+                           seed.use = umap_seed)
+toc()
+
+test %>% seurat_plot(reduction = 'umap', feature = 'ident', do.label = T) %>% wrap_plots()
+```
+
+
+## Visualize Cell cycle
+```{r}
+test %>% seurat_features(reduction = 'umap', gene.list = 'S.Score') 
+```
+```{r}
+test %>% seurat_features(reduction = 'umap', gene.list = 'G2M.Score') 
+```
+
+## Export
+```{r}
+merged %>% write_rds(file.path(data_dir, 'unified_cellranger_sct_clustered.rds'))
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+

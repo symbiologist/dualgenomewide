@@ -1,0 +1,535 @@
+---
+title: "Perturbation diversity"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Analyze diverse perturbation effects
+
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Output directory
+```{r}
+analysis_dir <- 'analysis/perturbseq/output/cell_state_frequency'
+figures_dir <- 'figures/perturbseq'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(figures_dir, showWarnings = FALSE)
+```
+
+```{r}
+library(extrafont)
+```
+
+### Load files
+## Coordinates and metadata
+```{r}
+DIR <- 'analysis/perturbseq/output/data_export/'
+pca_file <- 'pca_coordinates.tsv.gz'
+umap_file <- 'umap_coordinates.tsv.gz'
+meta_file <- 'coordinate_metadata.tsv.gz'
+
+dr <- list('pca' = read_tsv(file.path(DIR, pca_file)),
+           'umap' = read_tsv(file.path(DIR, umap_file)))
+           
+meta <- read_tsv(file.path(DIR, meta_file))
+
+coordinates_hclust <- read_tsv('analysis/perturbseq/output/density_clustering/coordinates_hclust.tsv.gz')
+```
+```{r}
+joined_data <- coordinates_hclust %>% 
+  left_join(meta %>% dplyr::select(target = guide_target, library, diff_hit_direction, diff_full_status, diff_pheno, locus_ambiguity) %>% unique()) %>% 
+  filter(library == 'Coding' | locus_ambiguity == 'Non-ambiguous', diff_full_status != 'Neighbor hit', diff_hit_direction != 'Non-hit') 
+
+joined_data
+```
+
+### Fully annotate table
+```{r}
+nsc_states <- c(16, 12, 9, 23, 24, 3, 14, 27, 20, 21, 13, 6, 28)
+cycling_states <- c(18, 4, 10, 25, 15, 8, 5)
+ectoderm_states <- c(2, 11, 19, 1)
+other_states <- c(26, 17, 7, 29, 22)
+
+nonneural_states <- c(ectoderm_states, other_states)
+nonneural_states <- ectoderm_states
+apoptotic_states <- c(20)
+
+state_types <- joined_data %>% 
+  group_by(target, library, diff_hit_direction, hc_cluster) %>% 
+  mutate(max_z = max(z)) %>% 
+  group_by(target, library, diff_hit_direction, hc_cluster, max_z) %>% 
+  summarize(density = quantile(z, probs = 0.5)) %>% 
+  unique() %>% 
+  mutate(trajectory = case_when(
+    hc_cluster %in% nsc_states ~ 'NSC',
+    hc_cluster %in% cycling_states ~ 'Cell Cycle',
+    hc_cluster %in% ectoderm_states ~ 'Ectoderm',
+    hc_cluster %in% other_states ~ 'Other'),
+    neural = ifelse(hc_cluster %in% nonneural_states, 'Non-neural', 'Neural'),
+    apoptosis = ifelse(hc_cluster %in% apoptotic_states, 'Apoptosis', 'Non-apoptosis')) %>% 
+  group_by(target) %>% 
+  add_count(name = 'n_states') %>% 
+  mutate(states = ifelse(
+    n_states > 2, 
+    '3+',
+    '1-2'),
+    density_zscore = scale(density)) %>% 
+  ungroup() 
+
+state_types  
+```
+
+### For negative hits, what are the most frequent patterns of preventing neural induction?
+```{r}
+frequency_table <- state_types %>%   
+  filter(diff_hit_direction == 'Negative Hit') %>% 
+  group_by(library, hc_cluster) %>% 
+  add_count(name = 'cell_state_frequency') %>% 
+  arrange(-cell_state_frequency) %>% 
+  ungroup()
+
+frequency_table
+  
+```
+
+```{r}
+frequency_table %>% 
+  ggplot(aes(x = reorder(hc_cluster, -cell_state_frequency),
+             y = cell_state_frequency,
+             fill = library)) +
+  geom_bar(stat = 'identity',
+           position = 'dodge') +
+  facet_wrap(~library)
+```
+```{r}
+frequency_table %>% 
+  group_by(library, hc_cluster) %>% 
+  tally() %>% 
+  arrange(-n)
+  
+```
+```{r}
+top_states <- frequency_table %>% 
+  group_by(target) %>% 
+  top_n(1, density) %>% 
+  ungroup() %>% 
+  group_by(library) %>% 
+  add_count(hc_cluster, name = 'top_state_frequency') %>% 
+  arrange(-top_state_frequency)
+
+
+intermediate <- top_states %>% filter(hc_cluster %in% c(2, 6, 13)) %>% pull(target) %>% unique()
+apoptotic <- top_states %>% filter(hc_cluster %in% c(20, 27)) %>% pull(target) %>% unique()
+nonneural <- top_states %>% filter(hc_cluster %in% ectoderm_states) %>% pull(target) %>% unique()
+cycling <- top_states %>% filter(hc_cluster %in% cycling_states) %>% pull(target) %>% unique()
+nsc <-  top_states %>% filter(hc_cluster %in% nsc_states) %>% pull(target) %>% unique()
+
+category_tally <- 
+  top_states %>% 
+  select(target, library, n_states, states, top_state = hc_cluster, top_state_frequency) %>%
+  mutate(category = case_when(target %in% intermediate ~ 'Intermediate',
+                              target %in% apoptotic  ~ 'Apoptosis',
+                              target %in% cycling ~ 'Cycling', 
+                              target %in% nonneural ~ 'Non-CNS',
+                              target %in% nsc ~ 'NSC',
+                              TRUE ~ 'Other'),
+         category = factor(category))
+category_tally
+```
+```{r}
+library_totals <- category_tally %>% select(target, library) %>% unique() %>% group_by(library) %>% tally(name = 'total')
+library_totals
+```
+
+
+```{r}
+category_summary <- category_tally %>% 
+  select(library, category) %>% 
+  table() %>% 
+  as_tibble() %>% 
+  left_join(library_totals) %>% 
+  mutate(frac = round(n / total, 3))
+
+category_summary
+```
+```{r}
+category_summary %>% 
+  filter(category %in% c('Intermediate', 'Apoptosis', 'Non-CNS')) %>% 
+  ggplot(aes(x = category,
+             y = frac,
+             fill = library)) +
+  geom_bar(stat = 'identity',
+           position = 'dodge') +
+  scale_fill_discrete(drop=FALSE) +
+          scale_x_discrete(drop=FALSE) +
+  labs(x = '',
+       y = 'Proportion') +
+  theme(legend.position = 'top')
+```
+
+### Abortive vs permissive state
+```{r}
+abortive <- frequency_table %>% 
+  group_by(target) %>% 
+  top_n(1, density) %>% 
+  filter(hc_cluster %in% c(21, 14, 3, 13, 6, 20))
+
+abortive %>% 
+  ungroup() %>% 
+  filter(library == 'Coding') %>% 
+  add_count(hc_cluster) %>% 
+  arrange(-n)
+```
+```{r}
+frequency_table %>% 
+  group_by(target) %>% 
+  top_n(1, density) %>% 
+  filter(library == 'Coding') %>% 
+  ungroup() %>% 
+  add_count(hc_cluster) %>% 
+  arrange(-n) %>% 
+  select(target, hc_cluster, n_states, n)
+```
+
+
+```{r}
+abortive %>% group_by(library) %>% tally() %>% 
+  left_join(library_totals) %>% 
+  mutate(frac = n/total)
+```
+
+```{r}
+permissive <- 
+  frequency_table %>% 
+  filter(states == '3+') %>% 
+  group_by(target, trajectory) %>% 
+  add_count(name = 'n_trajectories') %>% 
+  ungroup() %>% 
+  select(target, library, n_states, n_trajectories) %>% 
+  unique() %>% 
+  arrange(n_trajectories)
+
+permissive %>% 
+  filter(n_trajectories > 1) %>% 
+  group_by(library) %>% 
+  tally() %>% 
+  left_join(library_totals) %>% 
+  mutate(frac = n/total)
+```
+
+### Trajectories per target
+```{r}
+n_trajectories <- frequency_table %>% 
+  filter(trajectory != 'Other') %>% 
+  select(target, trajectory) %>% 
+  unique() %>% 
+  group_by(target) %>% 
+  add_count(name = 'n_trajectories') %>% 
+  select(-trajectory) %>% 
+  ungroup() %>% 
+  unique()
+
+n_trajectories
+```
+
+```{r}
+plot_input <- frequency_table %>% 
+  left_join(n_trajectories) %>% 
+  mutate(n_trajectories = ifelse(is.na(n_trajectories), 1, n_trajectories)) %>% # for hits in "Other" trajectory
+  group_by(target) %>% 
+  top_n(1, density) %>% 
+  mutate(abortive = ifelse(hc_cluster %in% c(21, 14, 3, 13, 6, 20, 27), 'Yes', 'No')) %>% 
+  select(target, library, top_state = hc_cluster, n_states, states, n_trajectories, abortive) %>% 
+  mutate(group = case_when(
+    top_state %in% c(21, 14, 3, 13, 6) ~ 'Stalled',
+    top_state %in% c(20, 27) ~ 'Apoptosis',
+    n_trajectories > 1 ~ 'Multiple trajectories',
+    TRUE ~ 'Other'
+  ))
+  # mutate(group = case_when(
+  #   n_trajectories == 1 & top_state %in% c(21, 14, 3, 13, 6) ~ 'Stalled',
+  #   n_trajectories == 1 & top_state %in% c(20, 27) ~ 'Apoptosis',
+  #   n_trajectories > 1 ~ 'Multiple trajectories',
+  #   TRUE ~ 'Other'
+  # ))
+
+plot_input
+```
+
+```{r}
+totals <- plot_input %>% 
+  group_by(library) %>% 
+  tally(name ='total')
+
+group_tally <- plot_input %>% 
+  group_by(group, library) %>% 
+  tally() %>% 
+  ungroup() %>% 
+  left_join(totals) %>% 
+  mutate(frac = round(n/total, 3))
+ 
+group_tally
+```
+
+### Test plots
+```{r}
+p_pie <- group_tally %>% 
+  group_by(library) %>% 
+  mutate(group = factor(group, levels = c('Stalled', 'Apoptosis', 'Other', 'Multiple trajectories'))) %>% 
+  arrange(group) %>% 
+  mutate(prop = frac) %>%
+  mutate(ypos = cumsum(prop) - 0.5 * prop ) %>% 
+  mutate(label = paste0(round(prop * 100), '%')) %>% 
+  ggplot(aes(x = '',
+             y = frac,
+             fill = group)) +
+  geom_bar(stat = 'identity', width = 1, color = 'black', alpha = 1) +
+  geom_text(aes(y = (1 - ypos), label = label), color = 'black') + 
+  coord_polar('y', start = 0) +
+  facet_wrap(~library) +
+  #scale_fill_few() + 
+  scale_fill_manual(values = c('dodgerblue3', 'dodgerblue4','grey90', 'orangered')) +
+  theme_void() 
+
+save_figure(p_pie,
+            dir = 'figures/perturbseq',
+            filename = 'pie_abortive_vs_permissive')
+
+p_pie
+```
+
+
+### Enrichment stats
+```{r}
+enrich_input <- plot_input %>% select(target, library, group) %>% 
+  filter(group != 'Other')
+  
+  
+in_category <- enrich_input %>% filter(group %in% c('Stalled', 'Apoptosis')) %>% pull(target)
+in_category <- enrich_input %>% filter(group %in% 'Multiple trajectories') %>% pull(target)
+is_coding <- enrich_input %>% filter(library == 'Coding') %>% pull(target)
+
+enrich_res <- enrichment_test(list1 = is_coding,
+                              list2 = in_category,
+                              cat1 = c('Coding', 'lncRNA'),
+                              cat2 = c('In', 'Out'),
+                              background = enrich_input$target,
+                              print = T)$fisher
+```
+
+
+### Separate calculations
+```{r}
+abortive_tally <- frequency_table %>% 
+  group_by(target, trajectory) %>% 
+  add_count(name = 'n_trajectories') %>% 
+  group_by(target) %>% 
+  top_n(1, density) %>% 
+  mutate(abortive = ifelse(hc_cluster %in% c(21, 14, 3, 13, 6, 20, 27), 'Yes', 'No'),
+         permissive = ifelse(n_trajectories > 1, 'Yes', 'No')) %>% 
+  select(target, library, top_state = hc_cluster, n_states, states, n_trajectories, abortive, permissive) %>% 
+  mutate(group = case_when(
+    top_state %in% c(21, 14, 3, 13, 6) ~ 'Stalled',
+    top_state %in% c(20, 27) ~ 'Apoptosis',
+    TRUE ~ 'Other'
+  ))
+
+abortive_tally
+```
+
+
+```{r}
+abortive_totals <- abortive_tally %>% 
+  group_by(library) %>% 
+  tally(name = 'total')
+
+abortive_totals
+
+abortive_prop <- abortive_tally %>% 
+  group_by(library, abortive) %>% 
+  tally() %>% 
+  ungroup() %>% 
+  left_join(abortive_totals) %>% 
+  mutate(frac = round(n/total, 3))
+
+abortive_prop
+```
+```{r}
+permissive_prop <- abortive_tally %>% 
+  group_by(library, permissive) %>% 
+  tally() %>% 
+  ungroup() %>% 
+  left_join(abortive_totals) %>% 
+  mutate(frac = round(n/total, 3))
+permissive_prop
+```
+
+
+### Pie charts separate
+```{r}
+p_pie1 <- abortive_prop %>% 
+  group_by(library) %>% 
+  mutate(group = factor(abortive, levels = c('Yes', 'No'))) %>% 
+  arrange(group) %>% 
+  mutate(prop = frac) %>%
+  mutate(ypos = cumsum(prop) - 0.5 * prop ) %>% 
+  mutate(label = paste0(round(prop * 100), '%')) %>% 
+  ggplot(aes(x = '',
+             y = frac,
+             fill = group)) +
+  geom_bar(stat = 'identity', width = 1, color = 'black', alpha = 1) +
+  geom_text(aes(y = (1 - ypos), label = label), color = 'black') + 
+  coord_polar('y', start = 0) +
+  facet_wrap(~library) +
+  #scale_fill_few() + 
+  scale_fill_manual(values = c('dodgerblue3', 'grey90')) +
+  theme_void() + 
+  theme(legend.position = 'none',
+        plot.title = element_text(hjust = 0.5)) +
+  labs(title = 'Abortive')
+
+p_pie2 <- permissive_prop %>% 
+  group_by(library) %>% 
+  mutate(group = factor(permissive, levels = c('Yes', 'No'))) %>% 
+  arrange(group) %>% 
+  mutate(prop = frac) %>%
+  mutate(ypos = cumsum(prop) - 0.5 * prop ) %>% 
+  mutate(label = paste0(round(prop * 100), '%')) %>% 
+  ggplot(aes(x = '',
+             y = frac,
+             fill = group)) +
+  geom_bar(stat = 'identity', width = 1, color = 'black', alpha = 1) +
+  geom_text(aes(y = (1 - ypos), label = label), color = 'black') + 
+  coord_polar('y', start = 0) +
+  facet_wrap(~library) +
+  #scale_fill_few() + 
+  scale_fill_manual(values = c('orangered', 'grey90')) +
+  theme_void() +
+  theme(legend.position = 'none',
+        plot.title = element_text(hjust = 0.5)) +
+  labs(title = 'Permissive')
+
+p_pies <- p_pie1 + p_pie2
+
+save_figure(p_pies,
+            dir = 'figures/perturbseq',
+            filename = 'pie_separate_abortive_vs_permissive')
+
+p_pies
+```
+### Rho vs multi state
+```{r}
+rho_analysis <- plot_input %>% 
+  left_join(joined_data %>% 
+              select(target, diff_hit_direction, diff_full_status, diff_pheno) %>% 
+              unique())
+
+rho_analysis
+```
+```{r}
+cor_input <- rho_analysis %>% filter(library == 'Coding')
+cor.test(cor_input$n_trajectories,
+         cor_input$diff_pheno,
+         method = 'pearson')
+```
+```{r}
+cor_input <- rho_analysis %>% filter(library == 'lncRNA')
+cor.test(cor_input$n_trajectories,
+         cor_input$diff_pheno,
+         method = 'pearson')
+```
+
+```{r}
+cor_input <- rho_analysis
+cor.test(cor_input$n_trajectories,
+         cor_input$diff_pheno,
+         method = 'pearson')
+```
+```{r}
+p_rho <- rho_analysis %>% 
+  ggplot(aes(x = n_trajectories,
+             y = diff_pheno)) +
+  geom_point(alpha = 1) +
+  geom_smooth(method = 'lm', se = FALSE) +
+  labs(x = '# trajectories',
+       y = 'rho') + 
+  ylim(c(-3.1, 0))
+
+save_figure(p_rho,
+            dir = 'figures/perturbseq',
+            filename = 'cor_rho_vs_trajectories')
+
+
+p_rho
+```
+```{r}
+p_rho_sina <- rho_analysis %>% 
+  filter(group %in% c('Stalled', 'Apoptosis', 'Multiple trajectories')) %>% 
+  ggplot(aes(x = abortive,
+             y = diff_pheno,
+             group = abortive)) +
+  geom_sina(alpha = 0.5) +
+  #geom_boxplot() +
+  geom_errorbar(stat = "summary",
+                width=0.2,
+                color = 'orangered') +
+  ylim(c(-3.1, 0)) +
+  labs(x = '',
+       y = 'Rho')
+
+
+save_figure(p_rho_sina,
+            dir = 'figures/perturbseq',
+            filename = 'sina_rho')
+
+p_rho_sina
+```
+```{r}
+test_input <- rho_analysis %>% 
+  filter(group %in% c('Stalled', 'Apoptosis', 'Multiple trajectories')) 
+
+t.test(rho_analysis %>% filter(group %in% c('Stalled', 'Apoptosis')) %>% pull(diff_pheno),
+            rho_analysis %>% filter(group %in% 'Multiple trajectories') %>% pull(diff_pheno))
+```
+
+```{r}
+rho_analysis %>% 
+  ggplot(aes(x = n_trajectories,
+             y = diff_pheno)) +
+  geom_point(alpha = 1) +
+  geom_smooth(method = 'lm', se = FALSE) +
+  labs(x = '# trajectories',
+       y = 'rho') + 
+  facet_wrap(~library,
+             nrow = 1) +
+  ylim(c(-3.1, 0))
+```
+
+
+
+## Session info
+```{r}
+sessionInfo()
+```

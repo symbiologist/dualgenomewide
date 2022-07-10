@@ -1,0 +1,308 @@
+---
+title: "Density plotting"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Plot perturbations as a density plot
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Output directory
+```{r}
+analysis_dir <- 'analysis/perturbseq/output/density'
+figures_dir <- 'figures/perturbseq'
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(figures_dir, showWarnings = FALSE)
+```
+
+### Custom functions for this notebook
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(ggforce)
+library(ggrepel)
+library(crayon)
+library(tictoc)
+library(pheatmap)
+```
+
+# Load directories
+
+```{r}
+## -------------------------------------------------------------------------------------------------------
+DIR <- 'analysis/perturbseq/output/data_export/'
+pca_file <- 'pca_coordinates.tsv.gz'
+umap_file <- 'umap_coordinates.tsv.gz'
+meta_file <- 'coordinate_metadata.tsv.gz'
+dr <- list('pca' = read_tsv(file.path(DIR, pca_file)),
+           'umap' = read_tsv(file.path(DIR, umap_file)))
+           
+meta <- read_tsv(file.path(DIR, meta_file))
+```
+
+```{r}
+combined <- dr$umap %>% 
+  left_join(meta) %>% 
+  mutate(diff_hit_direction = factor(diff_hit_direction, levels = c('Positive Hit', 'Negative Hit', 'Non-hit', 'Control')))
+combined %>% head()
+```
+
+### Calculate kernal density 
+```{r fig.height = 2, fig.width = 2}
+density_calculate <- function(umap_coordinates,
+                              xlims,
+                              ylims,
+                              bins,
+                              bw = 'bcv',
+                              custom = NULL) {
+  
+  # bandwidth selector, or manually provide custom bandwidths for x and y
+  if(bw == 'custom') {
+    bw.x <- custom[1]
+    bw.y <- custom[2]
+  } else if(bw == 'bcv') {
+    bw.x <- bw.bcv(umap_coordinates$UMAP_1)
+    bw.y <- bw.bcv(umap_coordinates$UMAP_2)
+  } else if(bw == 'ucv') {
+    bw.x <- bw.ucv(umap_coordinates$UMAP_1)
+    bw.y <- bw.ucv(umap_coordinates$UMAP_2)
+  } else if (bw == 'SJ') {
+    bw.x <- bw.SJ(umap_coordinates$UMAP_1)
+    bw.y <- bw.SJ(umap_coordinates$UMAP_2)
+  } else if (bw == 'nrd0') {
+    bw.x <- bw.nrd0(umap_coordinates$UMAP_1)
+    bw.y <- bw.nrd0(umap_coordinates$UMAP_2)
+  } else {
+    bw.x <- bw.nrd(umap_coordinates$UMAP_1)
+    bw.y <- bw.nrd(umap_coordinates$UMAP_2)
+  }
+  
+  density_computation <- KernSmooth::bkde2D(as.matrix(umap_coordinates[,c('UMAP_1', 'UMAP_2')]),
+                                            bandwidth = c(bw.x, bw.y),
+                                            gridsize = c(bins, bins),
+                                            range.x = list(xlims, ylims))
+  
+  names(density_computation) <- c('x', 'y', 'z')
+  density_table <- crossing(x = density_computation$x,
+                            y = density_computation$y) %>% 
+    arrange(y, x) %>% 
+    mutate(z = as.numeric(density_computation$z),
+           z_scaled = z/max(z), # scale values between 0 and 1
+           z_norm = z/norm(z, '2')) # unit vector normalization
+  
+  density_table
+  
+} 
+normalized_density_plot <- function(umap_coordinates, 
+                                    target = NULL, 
+                                    bins = 100, 
+                                    background = 'Non-Targeting',
+                                    xlims = range(umap_coordinates$UMAP_1), 
+                                    ylims = range(umap_coordinates$UMAP_2), 
+                                    bw = 'custom', 
+                                    custom = c(bw.bcv(combined$UMAP_1) * 8,
+                                               bw.bcv(combined$UMAP_2) * 8),
+                                    expansion = 0.05,
+                                    plot = TRUE,
+                                    rel_threshold = 0, # remove densities below this relative threshold (0 - 1)
+                                    abs_threshold = 0, # remove densities below this absolute threshold
+                                    downsample_points = 1, # if plotting points, downsample to this fraction for computational efficiency
+                                    point_alpha = 0.1, 
+                                    point_size = 0.1,
+                                    point_color = 'grey90',
+                                    clip_zeros = TRUE, # in background normalization, clip densities below 0
+                                    colors = c('transparent', rev(brewer.pal(n = 11, name = "RdYlBu"))[7:11]),
+                                    borders = TRUE,
+                                    table_only = FALSE) {
+  
+  # expand x and y limits if necessary
+  xlims <- xlims %>% range() %>% scales::expand_range(mul = expansion) 
+  ylims <- ylims %>% range() %>% scales::expand_range(mul = expansion) 
+  
+  if(is.null(target)) { 
+    coordinates_subset <- umap_coordinates # use all cells if null
+  } else {
+    coordinates_subset <- umap_coordinates %>% filter(guide_target %in% target)  
+  }
+  
+  # target density 
+  density_target <- density_calculate(coordinates_subset,
+                                      bins = bins,
+                                      xlims = xlims,
+                                      ylims = ylims,
+                                      bw = bw,
+                                      custom = custom) %>% 
+    mutate(z_norm = ifelse(z_scaled < rel_threshold, 0, z_norm), # threshold on densities above relative threshold
+           z_norm = ifelse(z_norm < abs_threshold, 0, z_norm)) # threshold on densities above absolute threshold
+  
+  
+  
+  # background
+  if(!is.null(background)) {
+    
+    #  background
+    coordinates_background <- umap_coordinates %>% filter(guide_target %in% background)
+    
+    density_background <- density_calculate(coordinates_background,
+                                            bins = bins,
+                                            xlims = xlims,
+                                            ylims = ylims,
+                                            bw = bw,
+                                            custom = custom) %>% 
+      mutate(z_norm = ifelse(z_scaled < rel_threshold, 0, z_norm),
+             z_norm = ifelse(z_norm < abs_threshold, 0, z_norm))
+    
+    # background subtraction
+    density_subtraction <- density_target %>% 
+      mutate(z_diff = z_norm - density_background$z_norm,
+             z_scaled = z_diff/max(z_diff),
+             z_diff = ifelse(z_scaled < rel_threshold, 0, z_diff),
+             z_diff = ifelse(z_diff < abs_threshold, 0, z_diff))
+    
+    # set negative density differences to zero
+    if(clip_zeros) {
+      density_subtraction <- density_subtraction %>% 
+        mutate(z_diff = ifelse(z_diff < 0, 0, z_diff),
+               z_diff = ifelse(z_diff < abs_threshold, 0, z_diff),
+               z_diff_scaled = z_diff / max(z_diff))
+    }
+  }
+  
+    # set up plotting parameters
+    color_scale <- colorRampPalette(colors)(bins) # color scale 
+    
+    coordinates_downsample <- umap_coordinates %>% sample_frac(downsample_points) %>% select(UMAP_1, UMAP_2)# downsampled points
+    
+    
+    title <- paste0('sg', target[1])
+    
+    plot_layers <- list(geom_point(inherit.aes = F,
+                                   data = coordinates_downsample, 
+                                   aes(x = UMAP_1, y = UMAP_2),
+                                   alpha = point_alpha,
+                                   color = point_color,
+                                   size = point_size),
+                        geom_contour_filled(bins = bins, aes(alpha = ..level..)),
+                        xlim(xlims),
+                        ylim(ylims),
+                        scale_fill_manual(values = color_scale),
+                        theme_minimal(),
+                        theme(axis.text = element_blank(),
+                              axis.ticks = element_blank(),
+                              axis.line = element_blank(),
+                              plot.title = element_text(face = 'plain', family = 'Arial', size = 10, hjust = 0.5),
+                              panel.grid = element_blank(),
+                              legend.position = 'none',
+                              axis.title = element_blank()))
+    
+    if(borders) {
+      theme_border <- theme(plot.background = element_rect(fill = NA, colour = 'black', size = 0.5))  
+    }
+    
+
+    
+    if(!is.null(background)) {
+      
+      p_subtraction <- density_subtraction %>% 
+        ggplot(aes(x, y, z = z_diff)) +
+        plot_layers 
+ 
+      
+      
+      if(borders) {
+        p_subtraction <- p_subtraction + theme_border
+      }
+      
+      
+      
+      p_output <- p_subtraction
+      
+     
+    }
+    
+    if(table_only) {
+      density_subtraction
+    } else {
+      p_output
+    }
+    
+  
+}
+```
+
+### Plot groups
+```{r fig.height = 2.2, fig.width = 4.4}
+#
+# positive hits
+pos_hits <- combined %>% filter(diff_hit_direction == 'Positive Hit') %>% pull(guide_target) %>% unique()
+neg_hits <- combined %>% filter(diff_hit_direction == 'Negative Hit') %>% pull(guide_target) %>% unique()
+
+# plots
+pos <- normalized_density_plot(combined,
+                               target = pos_hits,
+                               borders = TRUE) 
+neg <- normalized_density_plot(combined,
+                               target = neg_hits)
+pos + neg
+```
+
+
+```{r fig.height = 2.2, fig.width = 2.2}
+smarcc1 <- normalized_density_plot(combined,
+                                   target = 'SMARCC1')
+
+
+smarcc1
+```
+
+
+```{r fig.height = 2.2, fig.width = 2.2}
+paf1 <- normalized_density_plot(combined,
+                                target = 'PAF1')
+paf1
+```
+```{r}
+targets <- combined$guide_target %>% unique() %>% sort() 
+target_density_tables <- lapply(targets, function(i) {
+  normalized_density_plot(combined,
+                          target = i,
+                          table_only = TRUE) %>% 
+    mutate(target = i)
+  
+})
+target_density_tables[[1]]
+```
+
+
+```{r}
+target_density_tables %>% write_rds(file.path(analysis_dir, 'target_density_tables.rds'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,94 @@
+---
+title: "Generate BED files"
+author: "David Wu"
+output: html_notebook
+---
+
+Set working directory to project directory
+```{r setup, include=FALSE}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Output directory
+```{r}
+output_dir <- 'analysis/reference/output/05_bed'
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(rtracklayer)
+library(plyranges)
+```
+
+```{r}
+unified_gtf <- import('analysis/reference/output/02_unified_reference/unified.gtf.gz')
+unified_metadata <- unified_gtf %>% as.data.frame() 
+```
+
+
+### sgRNA coordinates
+#### lncRNA sgRNA tables
+```{r}
+lncrna_sgrna <- read_tsv('analysis/screen/input/ScreenProcessing/library_tables/CRISPRi_v2_human_lincRNA_unique_merged_librarytable.txt')
+lncrna_sgrna
+
+sgrna_screened <- read_tsv('analysis/screen/input/counts/to_process/Common_Initial_R1.counts', col_names = F) %>% 
+  bind_rows(read_tsv('analysis/screen/input/counts/to_process/CRiNCL_Initial_R1.counts', col_names = F)) %>% 
+  filter(X2 > 0) %>% 
+  pull(X1) %>%
+  unique()
+```
+
+
+#### Coding sgRNA tables
+```{r}
+coding_sgrna <- read_tsv('analysis/screen/input/ScreenProcessing/library_tables/CRISPRi_v2_human_librarytable.txt') %>% filter(str_detect(sublibrary, 'top5'))
+coding_sgrna
+```
+
+#### Pull sgRNA coordinates
+```{r}
+lncrna_sgrna_gtf <- lncrna_sgrna %>% 
+  dplyr::filter(`...1` %in% sgrna_screened) %>% 
+  separate(`...1`, into = c(NA, 'temp'), sep = ':') %>% 
+  separate(temp, into = c('tss_id', 'strand', 'start'), sep = '_') %>% 
+  separate(start, into = c('start', NA, NA, NA)) %>% 
+  select(feature_id = gene, start, strand, sequence) %>% 
+  unique() %>% 
+  group_by(feature_id) %>% 
+  mutate(row = row_number(),
+         id = paste(feature_id, row, sep = '_'),
+         end = start) %>% 
+  inner_join(unified_metadata %>% select(feature_id, chr = seqnames) %>% unique()) %>% # get chr
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+
+lncrna_sgrna_gtf
+```
+
+```{r} 
+coding_sgrna_gtf <- coding_sgrna %>% 
+  separate(sgId, into = c(NA, 'strand', 'temp'), sep = '_') %>% 
+  separate(temp, into = c('start', NA), sep = '\\.') %>%
+  select(feature_id = gene, start, strand, sequence) %>% 
+  unique() %>% 
+  group_by(feature_id) %>% 
+  mutate(row = row_number(),
+         id = paste(feature_id, row, sep = '_'),
+         end = start) %>% 
+  inner_join(unified_metadata %>% select(feature_id, chr = seqnames) %>% unique()) %>% # get chr
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+
+coding_sgrna_gtf
+```
+```{r}
+all_sgrna_gtf <- c(coding_sgrna_gtf, lncrna_sgrna_gtf)
+```
+
+## Export
+```{r}
+all_sgrna_gtf %>% mutate(score = 0) %>%  export(file.path(output_dir, 'sgrna.bed'))
+unified_gtf %>% mutate(score = 0) %>% export(file.path(output_dir, 'unified.bed'))
+```
+

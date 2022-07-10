@@ -1,0 +1,127 @@
+---
+title: "CRISPRi sublibrary selection"
+author: "David Wu"
+output: html_notebook
+---
+
+## Purpose
+Select lncRNA sublibraries for screen (not technically feasible to use all sublibraries)
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+```
+
+### Load universal functions and themes
+```{r}
+source('analysis/rnaseq/scripts/functions.R') # functions for this subcomponent
+
+source('analysis/universal/themes.R') # themes for all project components
+
+theme_set(theme_publication())
+```
+
+### Output directory
+```{r}
+output_dir <- 'analysis/rnaseq/output/05_sublibrary'
+dir.create(output_dir, showWarnings = FALSE)
+```
+
+### Load expression clustering data
+```{r}
+expression_clusters <- read_tsv('analysis/rnaseq/output/04_expression_clusters/expression_clusters.tsv.gz')
+expression_clusters
+```
+
+### Load library data
+```{r}
+sgrna_library <- read_tsv('analysis/screen/input/crincl_reference/CRISPRi_v2_human_lincRNA_unique_merged_librarytable.txt')
+sgrna_library
+```
+
+## Analysis
+### Merge data
+Combine expression data with sublibrary information, using mean expression and cluster number  
+Allow duplicates for loci in multiple sublibraries
+Include only lncRNAs (all coding sublibraries will be used)
+
+```{r}
+merged <- inner_join(expression_clusters %>% 
+                       group_by(feature_id, cluster_fraction, cluster) %>% 
+                       summarize(tpm = mean(tpm)),
+                     sgrna_library %>% 
+                       select(feature_id = gene,
+                              sublibrary) %>% 
+                       unique()) %>% 
+  ungroup()
+
+merged
+```
+
+### Select sublibraries
+Feasible to assay ~10,000 loci
+Prefer targets that are detected to undetected
+```{r}
+sublibraries <- merged %>% select(sublibrary, feature_id) %>% unique()
+sublibraries
+```
+Summarize raw tallies of expression fraction of loci per sublibrary
+```{r}
+sublibrary_summary <- merged %>% 
+  group_by(sublibrary, cluster_fraction) %>% 
+  tally() %>% 
+  pivot_wider(values_from = n,
+              names_from = cluster_fraction) %>% 
+  mutate(sublibrary_size = polyA + Total + `NA`,
+         total_detected = polyA + Total,
+         fraction_detected = round(total_detected/sublibrary_size, 2)) %>% 
+  arrange(-fraction_detected) 
+
+sublibrary_summary$cumulative <- cumsum(sublibrary_summary$sublibrary_size)
+
+sublibrary_summary
+```
+
+Since some features are duplicated across libraries, select top libraries with at least 2/3 of features detected (~11k loci) and check if unique loci > 10,000
+```{r}
+selected_sublibraries <- sublibrary_summary %>% filter(fraction_detected > 2/3) %>% pull(sublibrary)
+selected_sublibraries
+```
+
+Only ~9,000 loci
+```{r}
+merged %>% filter(sublibrary %in% selected_sublibraries) %>% select(feature_id) %>% unique()
+```
+
+Include most divergent library to cover more unique loci (Liu, Horlbeck et al Science 2017 supplementary figure S2A)
+```{r}
+selected_sublibraries <- c('cancer_common', 
+                           'k562_hela_mcf7',
+                           'u87_hek',
+                           'u87_unique',
+                           'hff_ips',
+                           'ips_unique',
+                           'common',
+                           'hek_unique',
+                           'u87_unique')
+```
+
+Check final count; close to 11k loci
+```{r}
+merged %>% filter(sublibrary %in% selected_sublibraries) %>% select(feature_id) %>% unique()
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+
+

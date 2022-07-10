@@ -1,0 +1,393 @@
+---
+title: "CRISPR knockdown analysis"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Analyze CRISPR knockdown of target genes
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/crispr_knockdown' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(Seurat)
+```
+
+### Import feature reference
+```{r}
+features <- read_csv('data/perturbseq/derived/pipestance/features.csv')
+```
+### Feature calls
+```{r}
+filtered_sgrnas <- read_tsv('analysis/perturbseq/output/004_sgrna_filtering/filtered_sgrnas.tsv.gz') %>% 
+  left_join(features %>% select(guide_identity = id,
+                                guide_target = target_gene_id)) %>% 
+  select(-condition, -singlet_status)
+```
+### Import screen master data
+```{r}
+master <- read_tsv('analysis/integration/output/00_integrate/master_minimal.tsv.gz')
+```
+
+
+```{r}
+seurats <- read_rds(file.path(data_dir, 'unified_cellranger.rds')) 
+seurats
+```
+
+### Pseudobulk analysis
+```{r}
+targets <- features %>% 
+  filter(target_gene_id != 'Non-Targeting') %>% 
+  pull(target_gene_id) %>% 
+  unique()
+
+analyze_knockdown <- function(seurat, 
+                               target) {
+  
+  which_sample <- seurat@project.name
+  
+  target_cells <- filtered_sgrnas %>% 
+    filter(sample == which_sample, 
+           guide_target == target) %>% 
+    pull(cell_barcode)
+  
+  ntc_cells <- filtered_sgrnas %>% 
+    filter(sample == which_sample, 
+           guide_target == 'Non-Targeting') %>% 
+    pull(cell_barcode)
+  
+  other_cells <- filtered_sgrnas %>% 
+    filter(sample == which_sample, 
+           guide_target != 'Non-Targeting',
+           guide_target != target) %>% 
+    pull(cell_barcode)
+  
+  # matrices
+  target_matrix <- seurat@assays$RNA@counts[, target_cells]
+  ntc_matrix <- seurat@assays$RNA@counts[, ntc_cells]
+  other_matrix <- seurat@assays$RNA@counts[, other_cells]
+  
+  # merge
+  target_merge <- rowSums(target_matrix)
+  ntc_merge <- rowSums(ntc_matrix)
+  other_merge <- rowSums(other_matrix)
+  
+  bulk_matrix <- data.frame('target' = target_merge, 
+                            'ntc' = ntc_merge,
+                            'other' = other_merge) %>% 
+    as.matrix()
+  
+  bulk_cpm <- t(t(bulk_matrix)/colSums(bulk_matrix)) * 1e6
+  
+  # median UMI detected
+  median_umi <- median(seurat@assays$RNA@counts[target, ])
+  total_umi <- sum(seurat@assays$RNA@counts[target, ])
+  total_cells <- ncol(seurat)
+  mean_umi <- total_umi/total_cells
+  
+  # output
+  
+  bulk_target_cpm <- as.data.frame(bulk_cpm) %>% 
+    rownames_to_column('feature_id') %>% 
+    filter(feature_id == !!target) %>% 
+    mutate(sample = which_sample) %>% 
+    select(feature_id, sample, target, ntc, other) %>% 
+    mutate(total_umi = total_umi,
+           target_cells = length(target_cells),
+           total_cells = total_cells,
+           median_umi = median_umi,
+           mean_umi = mean_umi)
+  
+  bulk_target_cpm
+}
+
+library(parallel)
+tic()
+target_expression <- 
+  mclapply(targets, mc.cores = 20, FUN = function(i) {
+  
+  map(seurats, function(j) {
+    
+    analyze_knockdown(seurat = j,
+                      target = i)
+    
+  }) %>% bind_rows()
+  
+}) %>% bind_rows()
+toc()
+target_expression %>% write_rds(file.path(analysis_dir, 'target_expression.rds'))
+target_expression
+```
+
+### Restart here
+```{r}
+targets <- features %>% 
+  filter(target_gene_id != 'Non-Targeting') %>% 
+  pull(target_gene_id) %>% 
+  unique() 
+
+target_expression <- read_rds(file.path(analysis_dir, 'target_expression.rds')) 
+target_expression
+```
+
+
+```{r}
+target_knockdown <- target_expression %>% 
+  rowwise() %>% 
+  mutate(relative = target/other,
+         log2fc = log2(relative + 0.01),
+         kd = max(1 - relative, 0)) %>% 
+  ungroup()
+
+target_knockdown %>% select(feature_id, sample, kd, target, ntc, other, relative, log2fc) %>% arrange(relative)
+```
+
+### Visualize
+```{r}
+error_bars <-  target_knockdown %>% 
+  group_by(feature_id) %>%
+  summarise(
+    mean = mean(relative, na.rm = TRUE),
+    median = median(relative, na.rm = TRUE),
+    sd = sd(relative, na.rm = TRUE),
+    n = n(),
+    sem = sd/n,
+    error = qt(0.975, df = n-1) * sd/sqrt(n),
+    total_target_cells = sum(target_cells),
+    total_umi = sum(total_umi)) %>% 
+  mutate(library = ifelse(str_detect(feature_id, 'LH'), 'lncRNA', 'Coding'),
+         cv = sd/(mean + 0.01))
+
+error_bars %>% arrange(-mean)
+```
+
+```{r}
+error_bars <- left_join(error_bars, master %>% select(feature_id, primary_pheno))
+```
+
+```{r }
+p_boxplot <- error_bars %>%
+  filter(cv < 2) %>% 
+  ggplot(aes(x = library,
+             y = median,
+             fill = library)) +
+  geom_boxplot(alpha = 0.5) +
+  ylim(c(0, 1))  +
+  geom_point(data = poor_kd %>% filter(primary_pheno == 'None'), color = 'green') +
+  scale_fill_manual(values = c('dodgerblue4', 'orangered'))
+  
+save_figure(plot = p_boxplot, filename = 'knockdown', w = 2, h = 4, directory = 'figures/perturbseq')
+p_boxplot
+```
+
+```{r}
+target_knockdown %>% 
+  pull(relative) %>% 
+  median(na.rm = TRUE)
+  
+```
+
+
+### Focused analysis of SERTAD4-AS1 and SERTAD4
+```{r}
+focused_knockdown <- function(seurat, 
+                              target,
+                              gene_of_interest) {
+  
+  which_sample <- seurat@project.name
+  
+  target_cells <- filtered_sgrnas %>% 
+    filter(sample == which_sample, 
+           guide_target == target) %>% 
+    pull(cell_barcode)
+  
+  ntc_cells <- filtered_sgrnas %>% 
+    filter(sample == which_sample, 
+           guide_target == 'Non-Targeting') %>% 
+    pull(cell_barcode)
+  
+  other_cells <- filtered_sgrnas %>% 
+    filter(sample == which_sample, 
+           guide_target != 'Non-Targeting',
+           guide_target != target) %>% 
+    pull(cell_barcode)
+  
+  # matrices
+  target_matrix <- seurat@assays$RNA@counts[, target_cells]
+  ntc_matrix <- seurat@assays$RNA@counts[, ntc_cells]
+  other_matrix <- seurat@assays$RNA@counts[, other_cells]
+  
+  # merge
+  target_merge <- rowSums(target_matrix)
+  ntc_merge <- rowSums(ntc_matrix)
+  other_merge <- rowSums(other_matrix)
+  
+  bulk_matrix <- data.frame('target' = target_merge, 
+                            'ntc' = ntc_merge,
+                            'other' = other_merge) %>% 
+    as.matrix()
+  
+  bulk_cpm <- t(t(bulk_matrix)/colSums(bulk_matrix)) * 1e6
+  
+  # median UMI detected
+  median_umi <- median(seurat@assays$RNA@counts[target, ])
+  total_umi <- sum(seurat@assays$RNA@counts[target, ])
+  total_cells <- ncol(seurat)
+  mean_umi <- total_umi/total_cells
+  
+  # output
+  
+  bulk_target_cpm <- as.data.frame(bulk_cpm) %>% 
+    rownames_to_column('feature_id') %>% 
+    filter(feature_id %in% gene_of_interest) %>% 
+    mutate(sample = which_sample) %>% 
+    select(feature_id, sample, target, ntc, other) %>% 
+    mutate(total_umi = total_umi,
+           target_cells = length(target_cells),
+           total_cells = total_cells,
+           median_umi = median_umi,
+           mean_umi = mean_umi)
+  
+  bulk_target_cpm
+}
+```
+```{r}
+other_genes <- map(seurats, function(j) {
+  focused_knockdown(seurat = j,
+                     target = 'LH01489',
+                     gene_of_interest = c('LH01489', 'SERTAD4'))
+  }) %>% 
+  bind_rows() 
+
+other_genes
+```
+
+```{r}
+other_genes_stats <- map(other_genes$feature_id %>% unique(), function(i) {
+  target_expression <- other_genes %>% filter(feature_id == i) %>% pull(target)
+  ntc_expression <- other_genes %>% filter(feature_id == i) %>% pull(ntc)
+  other_expression <- other_genes %>% filter(feature_id == i) %>% pull(other)
+  
+  ntc_res <- t.test(target_expression,
+                    ntc_expression, 
+                    paired = TRUE)
+  
+  other_res <- t.test(target_expression,
+                      other_expression,
+                      paired = TRUE)
+
+  tibble(target = i,
+         expression = median(other_expression),
+         ntc_pval = ntc_res$p.value,
+         other_pval = other_res$p.value)
+}) %>% bind_rows() %>% 
+  mutate(across(is.numeric, round, 3))
+
+other_genes_stats 
+```
+
+```{r}
+plot_input <- other_genes %>% 
+  filter(feature_id %in% c('LH01489', 'SERTAD4')) %>% 
+  select(feature_id, sample, target, ntc) %>%
+  pivot_longer(cols = -c(feature_id, sample),
+               names_to = 'condition',
+               values_to = 'expression')
+
+mean_reference_values <- plot_input %>% 
+  filter(condition == 'ntc') %>% 
+  group_by(feature_id) %>% 
+  summarize(expression_mean = mean(expression))
+
+mean_reference_values
+
+plot_input <- plot_input %>% 
+  left_join(mean_reference_values) %>% 
+  mutate(relative = expression / expression_mean)
+plot_input
+```
+```{r}
+t.test(expression ~ condition, data = plot_input %>% filter(feature_id == 'LH01489'))
+```
+```{r}
+t.test(expression ~ condition, data = plot_input %>% filter(feature_id == 'SERTAD4'))
+```
+
+```{r fig.height=4, fig.width = 3}
+error_bars <-  plot_input %>% 
+  mutate(condition = case_when(
+    condition == 'ntc' ~ 'sgControl',
+    condition == 'target' ~ 'sgSERTAD4-AS1'
+  )) %>% 
+  group_by(feature_id, condition) %>%
+  summarise(
+    sd = sd(relative, na.rm = TRUE),
+    mean = mean(relative),
+    n = n(),
+    sem = sd/n,
+    error = qt(0.975, df = n-1) * sd/sqrt(n)
+  )
+
+p <- error_bars %>% 
+  ggplot(aes(x = feature_id, 
+             y = mean,
+             fill = condition)) +
+  geom_bar(stat = 'identity',
+           position = position_dodge(),
+           color = 'black',
+           width = 0.5) +
+  geom_errorbar(aes(y = mean,
+                    ymin = mean - sem,
+                    ymax = mean + sem),
+                width = 0.2,
+                color = 'black',
+                position = position_dodge(width = 0.5)) +
+  scale_y_continuous(breaks = c(0, 0.5, 1.0))+
+  labs(y = 'Relative Expression',
+       x = '') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'top',
+        legend.direction = 'vertical') +
+  scale_fill_manual(values = c('grey80', 'dodgerblue4'))
+
+save_figure(plot = p,
+            filename = 'barplot_LH01489_kd',
+            h = 4,
+            w = 3,
+            directory = 'figures/perturbseq')
+
+p
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,483 @@
+---
+title: 'Filter sgRNAs '
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+## Purpose
+Analyze and filter sgRNA calls from Joseph Replogle
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/perturbseq/output/004_sgrna_filtering' # analysis file output directory
+data_dir <- 'data/perturbseq/derived/seurat' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+```
+
+### Feature reference
+```{r}
+features <- read_csv('data/perturbseq/derived/pipestance/features.csv')
+features
+```
+
+## Results
+Joseph ran his pipeline and generated plots and also the final gRNA calls. 
+Read data in here
+
+```{r}
+sgrna_calls <-
+  read_csv('analysis/perturbseq/input/guide_calls/diff_cell_identities.csv') %>% mutate(condition = 'diff') %>%  # add condition
+  mutate(sample = paste(condition, gemgroup, sep = '_'), # add sample id and fix numbering
+         cell_barcode = str_replace(cell_barcode, '[:digit:]', '1'),
+         unique_cell_id = paste(sample, cell_barcode, sep = '_'),
+         combination = paste(unique_cell_id, guide_identity, sep = ':')) %>% 
+  unique() %>% 
+  add_count(unique_cell_id, name = 'num_features') # tally sgRNAs per cell
+
+sgrna_calls
+```
+
+### Identify multiplets
+
+```{r}
+sgrna_calls %>% 
+  ggplot(aes(x = num_features)) + 
+  geom_histogram(binwidth = 1)
+```
+
+Rank sgRNAs and z-score
+```{r}
+scale_this <- function(x) as.vector(scale(x))
+
+sgrna_augmented <- sgrna_calls %>% 
+  group_by(guide_identity) %>% 
+  mutate(z_score = scale_this(log10(UMI_count))) %>% # add z-scole per guide after log transformation
+  ungroup() %>% 
+  group_by(unique_cell_id) %>% 
+  arrange(-UMI_count) %>% 
+  mutate(rank = paste0('rank', 1:n()),
+         sgrna_count = paste(guide_identity, UMI_count, round(z_score, 3), sep = ':')) %>% 
+  ungroup() %>% 
+  select(cell_barcode, guide_identity, combination, read_count, UMI_count, z_score, coverage, condition, sample, num_features, unique_cell_id, rank, sgrna_count)
+
+sgrna_augmented
+```
+
+
+
+Plot UMI and read count 
+```{r fig.width = 10, fig.height = 6}
+map(conditions, function(i) {
+  sgrna_augmented %>% 
+    filter(condition == i) %>% 
+    scatter_stats(x = 'read_count',
+                  y = 'UMI_count',
+                  log_scale = TRUE,
+                  point_alpha = 0.1,
+                  title = i)
+}) %>% wrap_plots()
+```
+```{r fig.width = 10, fig.height = 8}
+map(conditions, function(i) {
+  sgrna_augmented %>% 
+    filter(condition == i) %>% 
+    scatter_stats(x = 'read_count',
+                  y = 'coverage',
+                  log_scale = TRUE,
+                  point_alpha = 0.1,
+                  title = i,
+                  coord_equal = F) 
+}) %>% wrap_plots()
+```
+Coverage
+```{r}
+sgrna_augmented %>% 
+  ggplot(aes(x = coverage)) +
+  geom_histogram(bins = 100) +
+  facet_wrap(~condition) +
+  scale_x_log10()
+```
+
+Pull singlet unique ids
+```{r}
+singlet_ids <- sgrna_calls %>% filter(num_features == 1) %>% pull(unique_cell_id)
+singlet_ids %>% n_distinct()
+```
+
+Plot nUMI for rank 1 vs other sgRNA
+```{r fig.width = 10, fig.height = 10}
+
+  singlet <- sgrna_augmented %>% 
+    filter(rank == 'rank1') %>% 
+    scatter_stats(x = 'read_count',
+                  y = 'UMI_count',
+                  log_scale = TRUE,
+                  point_alpha = 0.1)
+  
+  multiplet <- sgrna_augmented %>% 
+    filter(rank != 'rank1') %>% 
+    scatter_stats(x = 'read_count',
+                  y = 'UMI_count',
+                  log_scale = TRUE,
+                  point_alpha = 0.1)
+  
+  list(singlet, multiplet) %>% wrap_plots(ncol = 1)
+```
+Coverage
+```{r fig.width = 5, fig.height = 10}
+
+  singlet <- sgrna_augmented %>% 
+    filter(rank == 'rank1') %>% 
+    scatter_stats(x = 'coverage',
+                  y = 'UMI_count',
+                  log_scale = TRUE,
+                  point_alpha = 0.1,
+                  coord_equal = FALSE)
+  
+  multiplet <- sgrna_augmented %>% 
+    filter(rank != 'rank1') %>% 
+    scatter_stats(x = 'coverage',
+                  y = 'UMI_count',
+                  log_scale = TRUE,
+                  point_alpha = 0.1,
+                  coord_equal = FALSE)
+  
+  list(singlet, multiplet) %>% wrap_plots(ncol = 1)
+```
+
+
+Mixture model 
+```{r}
+umi_mixture <- mixture_model(sgrna_augmented %>% pull(UMI_count) %>% log10(),
+                             bins = 100)
+
+umi_mixture$plot
+
+```
+Cells with less than 10 UMIs may be noisy
+Median UMI per sgRNA
+```{r}
+median_umi <- sgrna_augmented %>% 
+  group_by(guide_identity, condition) %>% 
+  summarize(median_umi = median(UMI_count)) %>% arrange(median_umi)
+
+median_umi
+```
+
+```{r}
+median_umi %>% 
+  ggplot(aes(x = median_umi)) +
+  geom_histogram(bins = 100) +
+  facet_wrap(~condition) +
+  scale_x_log10()
+```
+For sgRNAs <10 median UMI, what is the distribution?
+
+```{r}
+low_umi_sgrna <- median_umi %>% filter(median_umi < 10) %>% pull(guide_identity) %>% unique()
+
+sgrna_augmented %>% 
+  filter(guide_identity %in% low_umi_sgrna) %>% 
+  ggplot(aes(x = UMI_count)) + 
+  geom_histogram(bins = 100) +
+  facet_wrap(~condition) +
+  scale_x_log10()
+```
+These may have been selectively lethal in iPSC, but distributed widely in the differentiation condition
+```{r}
+low_umi_plots <- map(low_umi_sgrna %>% set_names(.), function(i) {
+  sgrna_augmented %>% 
+  filter(guide_identity == i) %>% 
+  ggplot(aes(x = UMI_count)) + 
+  geom_histogram(bins = 30) +
+  facet_wrap(~condition) +
+  scale_x_log10() +
+    ggtitle(i)
+})
+
+low_umi_plots 
+```
+
+Filter out UMI < 10 downstream after correcting for doublets
+
+### Doublet analysis
+Pull doublet unique ids and check if some doublets are likely singlets
+```{r}
+doublet_ids <- sgrna_augmented %>% 
+  filter(num_features == 2) %>% 
+  pull(unique_cell_id)
+
+doublets <- sgrna_augmented %>% 
+  filter(unique_cell_id %in% doublet_ids) %>% 
+  select(unique_cell_id, sgrna_count, rank) %>% 
+  pivot_wider(names_from = rank,
+              values_from = sgrna_count) %>% 
+  separate(rank1, into = c('rank1_sgrna', 'rank1_umi', 'rank1_z'), sep = ':') %>% 
+  separate(rank2, into = c('rank2_sgrna', 'rank2_umi', 'rank2_z'), sep = ':') %>% 
+  mutate(rank1_target = str_sub(rank1_sgrna, end = -3),
+         rank2_target = str_sub(rank2_sgrna, end = -3)) %>% 
+  mutate(rank1_umi = as.integer(rank1_umi),
+         rank2_umi = as.integer(rank2_umi),
+         rank1_z = as.numeric(rank1_z),
+         rank2_z = as.numeric(rank2_z),
+         umi_difference = rank1_umi - rank2_umi,
+         umi_ratio = rank1_umi/rank2_umi,
+         umi_log10ratio = log10(umi_ratio),
+         z_difference = rank1_z - rank2_z,
+         z_ratio = rank1_z/rank2_z,
+         sample = str_sub(unique_cell_id, end = 6),
+         condition = str_sub(sample, end = 4))
+
+doublets 
+```
+
+Identify doublets where the rank2 sgRNA is likely to be noise and cell is actually a singlet
+```{r, fig.height=5, fig.width=5}
+doublets %>% 
+  scatter_stats(x = 'rank1_umi',
+                y = 'rank2_umi',
+                log_scale = TRUE, 
+                pseudocount = 0,
+                point_size = 0.5,
+                point_alpha = 0.1)
+```
+
+Without controls, splitting by condition
+```{r, fig.height=5, fig.width=10}
+  doublets %>% 
+    filter(rank1_target != 'sgNTC',
+           rank2_target != 'sgNTC') %>% # filter out controls 
+    scatter_stats(x = 'rank1_umi',
+                  y = 'rank2_umi',
+                  log_scale = TRUE, 
+                  pseudocount = 0,
+                  point_size = 0.5,
+                  point_alpha = 0.1)
+```
+Plot z-scores
+```{r, fig.height=5, fig.width=10}
+
+  doublets %>% 
+    filter(rank1_target != 'sgNTC',
+           rank2_target != 'sgNTC') %>% # filter out controls 
+    scatter_stats(x = 'rank1_z',
+                  y = 'rank2_z',
+                  log_scale = FALSE, 
+                  pseudocount = 0,
+                  point_size = 0.5,
+                  point_alpha = 0.1)
+```
+
+
+Plot z-score differences between rank 1 and 2 
+Appears to be Gaussian mixture
+```{r}
+doublets %>% 
+  ggplot(aes(x = z_difference)) +
+  geom_histogram(bins = 5000,
+                 alpha = 0.8) +
+  facet_wrap(~condition)
+```
+Mixture model on z-scores
+```{r}
+doublets_mixture <- mixture_model(doublets %>% pull(z_difference), xlab = 'Z-score Difference')
+doublets_mixture$plot
+```
+```{r}
+doublets_mixture$cutoff
+```
+
+```{r}
+doublets_mixture$model$mu
+```
+Mixture on rank2 z-score
+```{r}
+rank2_mixture <- mixture_model(doublets %>% pull(rank2_z), xlab = 'Z-score Difference')
+rank2_mixture$plot
+```
+
+```{r}
+rank2_mixture$cutoff
+```
+
+```{r}
+rank2_mixture$model$mu
+```
+
+Use a cutoff of a z-score difference and rank2 for potential singlets
+```{r}
+potential_singlets <- doublets %>% 
+  filter(z_difference > max(doublets_mixture$model$mu),
+         rank2_z < min(rank2_mixture$model$mu)) %>% 
+  select(unique_cell_id, guide_identity = rank1_sgrna) %>% 
+  mutate(combination = paste(unique_cell_id, guide_identity, sep = ':'))
+
+potential_singlets
+```
+
+Filtered sgRNA table
+```{r}
+filtered_sgrnas <- sgrna_augmented %>% 
+  filter(unique_cell_id %in% c(singlet_ids, doublet_ids)) %>% 
+  select(unique_cell_id, condition, sample, cell_barcode, UMI_count, z_score, rank, guide_identity) %>% 
+  left_join(potential_singlets %>% select(unique_cell_id, sgrna_call = guide_identity)) %>% 
+  mutate(sgrna_call = ifelse(is.na(sgrna_call), guide_identity, sgrna_call),
+         status = case_when(
+           unique_cell_id %in% singlet_ids ~ 'Singlet',
+           unique_cell_id %in% potential_singlets$unique_cell_id ~ 'Undetermined',
+           unique_cell_id %in% doublet_ids ~ 'Doublet')) %>% 
+  left_join(features %>% select(guide_identity = id,
+                                guide_target = target_gene_id)) %>% 
+  arrange(desc(status), unique_cell_id)
+
+filtered_sgrnas 
+```
+
+```{r}
+filtered_sgrnas %>% 
+  select(unique_cell_id,
+         status) %>% 
+  unique() %>% 
+  group_by(status) %>% 
+  tally()
+``` 
+
+### Cells per sgRNA
+```{r}
+cells_per_sgrna <- filtered_sgrnas %>% 
+  group_by(condition, sgrna_call) %>% 
+  tally() %>% 
+  arrange(n)
+
+cells_per_sgrna
+```
+```{r}
+cells_per_sgrna %>% 
+  filter(str_detect(sgrna_call, 'NTC', negate = TRUE)) %>% 
+  ggplot(aes(x = n)) +
+  geom_histogram() + 
+  facet_wrap(~condition) +
+  scale_x_log10()
+```
+
+## Plot
+### sgRNA UMIs per cell
+```{r}
+filtered_sgrnas %>% 
+  ggplot(aes(x = sample, 
+             y = UMI_count,
+             color = sample)) + 
+  geom_sina(method = 'density', alpha = 0.2, size = 0.1) + 
+  scale_y_log10() + 
+  ylab('sgRNA UMIs per cell') +
+  annotation_logticks()
+```
+#### All counts
+```{r}
+filtered_sgrnas %>% 
+  group_by(sample) %>% 
+  summarize(mean = mean(UMI_count),
+            sd = sd(UMI_count),
+            median = median(UMI_count),
+            iqr = IQR(UMI_count)
+            ) %>% 
+  mutate_if(is.numeric, round)
+```
+
+#### Singlets
+```{r}
+filtered_sgrnas %>% 
+  filter(status == 'Singlet') %>% 
+  group_by(sample) %>% 
+  summarize(mean = mean(UMI_count),
+            sd = sd(UMI_count),
+            median = median(UMI_count),
+            iqr = IQR(UMI_count)
+            ) %>% 
+  mutate_if(is.numeric, round)
+```
+
+### Cells per sgRNA
+```{r}
+cells_per_sgrna %>% 
+  ungroup() %>% 
+  filter(str_detect(sgrna_call, 'NTC', negate = TRUE)) %>% 
+  ggplot(aes(x = condition,
+             y = n,
+             color = condition)) +
+  geom_sina(method = 'density', alpha = 0.5, size = 1) +
+  scale_color_few() +
+  scale_y_log10()
+```
+```{r}
+cells_per_sgrna %>% 
+  group_by(condition) %>% 
+  summarize(mean = mean(n),
+            sd = sd(n),
+            median = median(n),
+            iqr = IQR(n)) %>% 
+  mutate_if(is.numeric, round)
+```
+
+### Cells per guide target
+```{r}
+cells_per_target <- filtered_sgrnas %>% 
+  filter(status == 'Singlet') %>% 
+  group_by(condition, guide_target) %>% 
+  tally() %>% 
+  arrange(n)
+
+cells_per_target %>% 
+  filter(str_detect(guide_target, 'NTC', negate = TRUE)) %>% 
+  ggplot(aes(x = condition,
+             y = n,
+             color = condition)) +
+  geom_sina(method = 'density', alpha = 0.5, size = 1) +
+  scale_color_few() +
+  scale_y_log10()
+```
+```{r}
+cells_per_target %>% 
+  group_by(condition) %>% 
+  summarize(mean = mean(n),
+            sd = sd(n),
+            median = median(n),
+            iqr = IQR(n)) %>% 
+  mutate_if(is.numeric, round)
+```
+
+
+## Export
+```{r}
+filtered_sgrnas %>% write_tsv(file.path(analysis_dir, 'filtered_sgrnas_replogle.tsv.gz'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```

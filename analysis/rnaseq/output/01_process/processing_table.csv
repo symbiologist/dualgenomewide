@@ -1,0 +1,18 @@
+D0_polyA_Rep1,data/rnaseq/raw/bbduk/D0_polyA_Rep1_Run1.fq.gz data/rnaseq/raw/bbduk/D0_polyA_Rep1_Run2.fq.gz,data/rnaseq/derived/kallisto/D0_Rep1_polyA
+D0_polyA_Rep2,data/rnaseq/raw/bbduk/D0_polyA_Rep2_Run1.fq.gz data/rnaseq/raw/bbduk/D0_polyA_Rep2_Run2.fq.gz,data/rnaseq/derived/kallisto/D0_Rep2_polyA
+D10_polyA_Rep1,data/rnaseq/raw/bbduk/D10_polyA_Rep1_Run1.fq.gz data/rnaseq/raw/bbduk/D10_polyA_Rep1_Run2.fq.gz,data/rnaseq/derived/kallisto/D10_Rep1_polyA
+D10_polyA_Rep2,data/rnaseq/raw/bbduk/D10_polyA_Rep2_Run1.fq.gz data/rnaseq/raw/bbduk/D10_polyA_Rep2_Run2.fq.gz,data/rnaseq/derived/kallisto/D10_Rep2_polyA
+D11_polyA_Rep1,data/rnaseq/raw/bbduk/D11_polyA_Rep1_Run1.fq.gz data/rnaseq/raw/bbduk/D11_polyA_Rep1_Run2.fq.gz,data/rnaseq/derived/kallisto/D11_Rep1_polyA
+D11_polyA_Rep2,data/rnaseq/raw/bbduk/D11_polyA_Rep2_Run1.fq.gz data/rnaseq/raw/bbduk/D11_polyA_Rep2_Run2.fq.gz,data/rnaseq/derived/kallisto/D11_Rep2_polyA
+D4_polyA_Rep1,data/rnaseq/raw/bbduk/D4_polyA_Rep1_Run1.fq.gz data/rnaseq/raw/bbduk/D4_polyA_Rep1_Run2.fq.gz,data/rnaseq/derived/kallisto/D4_Rep1_polyA
+D4_polyA_Rep2,data/rnaseq/raw/bbduk/D4_polyA_Rep2_Run1.fq.gz data/rnaseq/raw/bbduk/D4_polyA_Rep2_Run2.fq.gz,data/rnaseq/derived/kallisto/D4_Rep2_polyA
+D6_polyA_Rep1,data/rnaseq/raw/bbduk/D6_polyA_Rep1_Run1.fq.gz data/rnaseq/raw/bbduk/D6_polyA_Rep1_Run2.fq.gz,data/rnaseq/derived/kallisto/D6_Rep1_polyA
+D6_polyA_Rep2,data/rnaseq/raw/bbduk/D6_polyA_Rep2_Run1.fq.gz data/rnaseq/raw/bbduk/D6_polyA_Rep2_Run2.fq.gz,data/rnaseq/derived/kallisto/D6_Rep2_polyA
+D8_polyA_Rep1,data/rnaseq/raw/bbduk/D8_polyA_Rep1_Run1.fq.gz data/rnaseq/raw/bbduk/D8_polyA_Rep1_Run2.fq.gz,data/rnaseq/derived/kallisto/D8_Rep1_polyA
+D8_polyA_Rep2,data/rnaseq/raw/bbduk/D8_polyA_Rep2_Run1.fq.gz data/rnaseq/raw/bbduk/D8_polyA_Rep2_Run2.fq.gz,data/rnaseq/derived/kallisto/D8_Rep2_polyA
+D0_Total_Rep1,data/rnaseq/raw/bbduk/D0_Total_Rep1_Run1.fq.gz,data/rnaseq/derived/kallisto/D0_Rep1_Total
+D0_Total_Rep2,data/rnaseq/raw/bbduk/D0_Total_Rep2_Run1.fq.gz,data/rnaseq/derived/kallisto/D0_Rep2_Total
+D10_Total_Rep1,data/rnaseq/raw/bbduk/D10_Total_Rep1_Run1.fq.gz,data/rnaseq/derived/kallisto/D10_Rep1_Total
+D10_Total_Rep2,data/rnaseq/raw/bbduk/D10_Total_Rep2_Run1.fq.gz,data/rnaseq/derived/kallisto/D10_Rep2_Total
+D8_Total_Rep1,data/rnaseq/raw/bbduk/D8_Total_Rep1_Run1.fq.gz,data/rnaseq/derived/kallisto/D8_Rep1_Total
+D8_Total_Rep2,data/rnaseq/raw/bbduk/D8_Total_Rep2_Run1.fq.gz,data/rnaseq/derived/kallisto/D8_Rep2_Total

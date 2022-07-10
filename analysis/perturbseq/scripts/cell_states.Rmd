@@ -1,0 +1,301 @@
+---
+title: "Cell state analysis"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Analysis of cell states from sgRNA density maps
+
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/perturbseq/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Output directory
+```{r}
+analysis_dir <- 'analysis/perturbseq/output/cell_states'
+figures_dir <- 'figures/perturbseq'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(figures_dir, showWarnings = FALSE)
+```
+
+
+### Load files
+```{r}
+## -------------------------------------------------------------------------------------------------------
+DIR <- 'analysis/perturbseq/output/data_export/'
+pca_file <- 'pca_coordinates.tsv.gz'
+umap_file <- 'umap_coordinates.tsv.gz'
+meta_file <- 'coordinate_metadata.tsv.gz'
+
+dr <- list('pca' = read_tsv(file.path(DIR, pca_file)),
+           'umap' = read_tsv(file.path(DIR, umap_file)))
+           
+meta <- read_tsv(file.path(DIR, meta_file))
+
+```
+
+
+### Import density tables
+```{r}
+target_density_tables <- read_rds('analysis/perturbseq/output/density/target_density_tables.rds')
+density_tables_merged <- target_density_tables %>% bind_rows() 
+```
+
+### Additional libraries
+```{r}
+library(dbscan)
+```
+
+```{r}
+quantify_densities <- function(density_table,
+                               point_data,
+                               which_z = 'z_diff',
+                               zero_threshold = 0.05,
+                               filter_type = c('quantile', 'absolute', 'max_ratio'),
+                               noise_threshold = 0.5,
+                               eps = 1,
+                               minPts = 10,
+                               print_plot = FALSE,
+                               point_size = 1,
+                               point_alpha = 0.8,
+                               plot_background = TRUE,
+                               downsample_points = 0.2, # if plotting points, downsample to this fraction for computational efficiency
+                               background_point_alpha = 0.1, 
+                               background_point_size = 0.1,
+                               background_point_color = 'grey90',
+                               plot_labels = TRUE,
+                               label_size = 5
+                               ) {
+  
+  # subset table
+  target <- density_table$target %>% unique()
+  density_table <- density_table %>% select(x, y, z = one_of(which_z))
+  
+  # determine plotting range
+  x_range <- range(density_table$x)
+  y_range <- range(density_table$y)
+  
+  # filter out zero values (and those close to zero)
+  max_z <- max(density_table$z)
+  nonzero <- density_table %>% filter(z > max_z * zero_threshold) %>% pull(z)
+  
+  # filter noise 
+  if(filter_type == 'quantile') {
+    filtered_table <- density_table %>% filter(z > quantile(nonzero, probs = noise_threshold))
+  } else if (filter_type == 'absolute') {
+    filtered_table <- density_table %>% filter(z > noise_threshold)
+  } else if (filter_type == 'max_ratio') {
+    filtered_table <- density_table %>% filter(z > max_z * noise_threshold)
+  }
+  
+  if (nrow(filtered_table) == 0) {
+    dbscan_clusters <- 0
+    num_clusters <- 0
+    
+  } else {
+    
+    # use DBSCAN to identify clusters
+    dbscan_clusters <- dbscan(filtered_table %>% select(x, y), eps = eps, minPts = minPts)$cluster
+    
+    num_clusters <- dbscan_clusters %>% setdiff(0) %>% n_distinct()
+    dbscan_clusters[dbscan_clusters == 0] <- NA
+    
+  }
+  
+  
+  # plot
+  cluster_table <-  filtered_table %>% 
+    mutate(cluster = dbscan_clusters)
+  
+  
+  p <- cluster_table %>% 
+    ggplot(aes(x = x,
+               y = y,
+               color = factor(cluster))) 
+  
+  if(plot_background) {
+    p <- p +
+      geom_point(data = point_data %>% sample_frac(downsample_points),
+                 inherit.aes = FALSE,
+                 aes(x = UMAP_1,
+                     y = UMAP_2),
+                 color = background_point_color,
+                 size = background_point_size,
+                 alpha = background_point_alpha)
+  }
+  
+  p <- p +
+    geom_point(size = point_size,
+               alpha = point_alpha) +
+    xlim(x_range) +
+    ylim(y_range) +
+    scale_color_carto_d() +
+    theme(legend.position = 'none',
+          axis.line = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          plot.title = element_text(face = 'plain', family = 'Arial', size = 10, hjust = 0.5)) +
+    ggtitle(paste0('sg', target, ': ', num_clusters, ' states'))
+  
+  if(plot_labels) {
+    centers <- cluster_table %>% dplyr::group_by(cluster) %>% dplyr::summarize(x = median(x), y = median(y))
+    p <- p + shadowtext::geom_shadowtext(data = centers, aes(x = x, y = y, label = cluster), color = 'white', size = label_size, bg.color = 'black')
+  }
+  
+  if(print_plot) {
+    print(p)
+  }
+  
+  list('n_clusters' = num_clusters,
+       'cluster_table' = cluster_table,
+       'plot' = p)
+}
+```
+
+
+```{r}
+density_hit_groups <- density_tables_merged %>% 
+  filter(z_diff > 0.01 * max(density_tables_merged$z_diff, na.rm = T)) %>% 
+  left_join(meta %>% dplyr::select(target = guide_target, primary_pheno, diff_hit_direction, diff_full_status, library, locus_ambiguity) %>% unique())
+```
+
+
+```{r}
+density_hit_groups %>% 
+  filter(library == 'Coding' | locus_ambiguity == 'Non-ambiguous') %>% 
+  ggplot(aes(x = z_diff)) +
+  geom_histogram() +
+  facet_wrap(~diff_hit_direction) +
+  xlim(c(0, 0.05))
+```
+```{r}
+density_top_quantile <- density_hit_groups %>% 
+  filter(library == 'Coding' | locus_ambiguity == 'Non-ambiguous') %>% 
+  mutate(primary_pheno = ifelse(primary_pheno == 'None', 'None', 'Hit')) %>% 
+  group_by(target, primary_pheno) %>% 
+  summarize(z_top = quantile(z_diff, probs = 0.75)) %>% 
+  ungroup()
+
+
+```
+
+
+
+
+### Loop for plotting and quantification
+```{r}
+filter_type <- 'max_ratio'
+noise_threshold <- 0.25 # use top quartile
+zero_threshold <- 0.01 # zero out below this fraction of max density
+minPts <- 30
+
+## plots
+all_targets <- names(target_density_tables) %>% setdiff('Non-Targeting') %>% set_names(.)
+
+density_quantification <- map(all_targets, function(i) {
+  
+  quant <- quantify_densities(target_density_tables[[i]],
+                              point_data = dr$umap, 
+                              filter_type = filter_type,
+                              zero_threshold = zero_threshold,
+                              noise_threshold = noise_threshold,
+                              downsample_points = 1,
+                              background_point_size = 0.1,
+                              point_alpha = 0.5,
+                              minPts = minPts)
+
+  quant
+  
+}) 
+
+density_quantification_table <- map(all_targets, function(i) {
+  
+  tibble('target' = i,
+         'n_clusters' = density_quantification[[i]]$n_clusters)
+}) %>% bind_rows()
+
+density_cluster_coordinates <- map(all_targets, function(i) {
+  
+  density_quantification[[i]]$cluster_table %>% mutate('target' = i)
+}) %>% bind_rows()
+
+## add metadata
+density_quant <- density_quantification_table %>% 
+  left_join(meta %>% select(target = guide_target, library, primary_pheno, diff_hit_direction, diff_full_status, diff_pheno, locus_ambiguity)) %>% 
+  unique()
+
+density_quant
+```
+
+
+```{r}
+density_quant %>% 
+  filter(str_detect(target, 'SMARC|ARID'))
+```
+
+
+
+
+```{r}
+quantify_densities(target_density_tables[['SMARCE1']],
+                   point_data = dr$umap, 
+                   filter_type = filter_type, 
+                   zero_threshold = zero_threshold,
+                   noise_threshold = noise_threshold,
+                   minPts = minPts) 
+```
+```{r}
+quantify_densities(target_density_tables[['SMARCE1']],
+                   point_data = dr$umap, 
+                   filter_type = filter_type, 
+                   zero_threshold = 0.01,
+                   noise_threshold = 0.25,
+                   minPts = 30) 
+```
+
+
+### Test plots
+```{r}
+sos1 <- quantify_densities(target_density_tables[['SOS1']],
+                   point_data = dr$umap, 
+                   filter_type = filter_type, 
+                   zero_threshold = zero_threshold,
+                   noise_threshold = noise_threshold,
+                   minPts = minPts) 
+
+sos1$plot
+  
+```
+
+## Export
+```{r}
+density_cluster_coordinates %>% write_tsv(file.path(analysis_dir, 'density_cluster_coordinates.tsv.gz'))
+density_quant %>% write_tsv(file.path(analysis_dir, 'density_quant.tsv.gz'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```

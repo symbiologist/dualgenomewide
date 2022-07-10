@@ -1,4 +1,6 @@
 # Dual genome-wide screens
+[![DOI](https://zenodo.org/badge/512511123.svg)](https://zenodo.org/badge/latestdoi/512511123)
+
 All original code pertaining to the manuscript "Dual genome-wide coding and lncRNA screens in neural induction of induced pluripotent stem cells."  
 <br>
 A processed Seurat object for analysis in R can be downloaded from [here](https://ucsf.box.com/s/sumo8o3d3h171u72pr5eogqy5s1h8v2q) (warning: 23 GB file!)

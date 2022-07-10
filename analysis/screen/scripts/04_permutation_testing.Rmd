@@ -1,0 +1,352 @@
+---
+title: "Permutation testing of phenotypes"
+author: "David Wu"
+output: html_notebook
+---
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(patchwork)
+library(extrafont)
+library(ggrepel)
+library(ggforce)
+library(eulerr)
+library(parallel)
+loadfonts()
+```
+
+### Load themes and functions
+```{r}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+
+source('analysis/screen/scripts/functions.R') # functions for this subcomponent
+
+theme_set(theme_publication())
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/screen/output/04_permutation_testing'
+data_dir <- ''
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+
+
+### Import screen data
+```{r}
+screen_results <- read_tsv('analysis/screen/output/02_fdr/screen_results.tsv')
+neighbor_integration <- read_tsv('analysis/screen/output/03_neighbors/neighbor_hits.tsv.gz')
+```
+
+
+### Permutation for negative vs positive skew
+## Permute
+```{r}
+hits_table <- neighbor_integration %>% 
+  filter(assay == 'Differentiation',
+         full_status != 'Neighbor hit',
+         (library == 'Coding' | locus_ambiguity != 'Ambiguous')) %>% 
+  mutate(direction = ifelse(pheno > 0, 'Positive', 'Negative')) %>% 
+  select(feature_id,
+         library,
+         assay,
+         status,
+         direction) 
+
+hits_table
+```
+
+### Overall ratio
+
+```{r}
+hits_table %>% 
+  filter(status == 'Hit') %>% 
+  group_by(library, direction) %>% tally() %>% 
+  pivot_wider(names_from = direction, values_from = n) %>% 
+  mutate(ratio = round(Positive/Negative, 2),
+         log2ratio = round(log2(ratio),2))
+```
+
+```{r}
+
+permutations <- function(hits_table,
+                         group1 = status,
+                         group2 = direction) {
+  
+  
+  permute_table <- hits_table %>% 
+    dplyr::select(feature_id,
+           library,
+           {{group1}}, 
+           {{group2}})
+  
+  colnames(permute_table) <- c('feature_id', 
+                               'library',
+                               'group1',
+                               'group2')
+  
+  permute_table <- permute_table %>% 
+    mutate(group1 = sample(group1),
+           group2 = sample(group2))
+  
+  
+  # tally
+  permutation_summary <- permute_table %>% 
+    select(-feature_id) %>% 
+    group_by_all() %>% 
+    tally() %>% 
+    ungroup() %>% 
+    mutate(description = paste(library, group1, group2, sep = '_')) %>% 
+    select(description, n) %>% 
+    pivot_wider(names_from = description, 
+                values_from = n)
+  
+
+permutation_summary
+}
+
+permutations(hits_table)
+
+```
+
+### Trials for positive to negative ratio
+#### All 
+```{r eval=FALSE}
+n_permutations <- 1e6
+n_cores <- 70
+
+tic()
+permutations_direction <- mclapply(1:n_permutations, function(i) {
+  
+  permutation <- permutations(hits_table)
+}, 
+mc.cores = n_cores) %>% 
+  bind_rows() %>% 
+  mutate(Coding_Hit_ratio = Coding_Hit_Positive/Coding_Hit_Negative,
+         lncRNA_Hit_ratio = lncRNA_Hit_Positive/lncRNA_Hit_Negative,
+         `Coding_Non-hit_ratio` = `Coding_Non-hit_Positive`/`Coding_Non-hit_Negative`,
+         `lncRNA_Non-hit_ratio` = `lncRNA_Non-hit_Positive`/`lncRNA_Non-hit_Negative`)
+toc()
+
+permutations_direction %>% write_tsv(file.path(analysis_dir, 'permutations_direction.tsv.gz'))
+
+permutations_direction
+```
+
+#### Observed vs expected ratio
+```{r}
+observed_ratios <- hits_table %>% 
+  filter(status == 'Hit') %>% 
+  group_by(library, direction) %>% tally() %>% 
+  pivot_wider(names_from = direction, values_from = n) %>% 
+  mutate(ratio = round(Positive/Negative, 2),
+         log2ratio = round(log2(ratio),2))
+
+observed_coding_ratio <- observed_ratios %>% filter(library == 'Coding') %>% pull(ratio)
+observed_lncrna_ratio <- observed_ratios %>% filter(library == 'lncRNA') %>% pull(ratio)
+
+observed_coding_ratio
+
+observed_lncrna_ratio
+```
+
+```{r}
+coding_null_n <- permutations_direction %>% filter(log2(Coding_Hit_ratio) >= abs(log2(observed_coding_ratio)))
+
+coding_p <- nrow(coding_null_n)/n_permutations
+
+coding_p
+```
+```{r}
+lncrna_null_n <- permutations_direction %>% filter(log2(lncRNA_Hit_ratio) >= abs(log2(observed_lncrna_ratio)))
+
+lncrna_p <- nrow(lncrna_null_n)/n_permutations
+
+lncrna_p
+```
+
+
+
+## Permutation for differentiation vs proliferation phenotype
+### Permute
+```{r}
+hits_table <- neighbor_integration %>% 
+  filter((library == 'Coding' | locus_ambiguity != 'Ambiguous')) %>% 
+  mutate(status = ifelse(full_status == 'Neighbor hit', 'Non-hit', full_status),) %>% 
+  select(feature_id,
+         library,
+         assay,
+         status) %>% 
+  pivot_wider(names_from = assay, values_from = status)
+
+hits_table
+```
+
+```{r}
+permute_table <- hits_table %>% 
+  mutate(Differentiation = sample(Differentiation),
+         Proliferation = sample(Proliferation))
+
+permute_table
+
+# tally
+permutation_summary <- permute_table %>% 
+  select(library, Differentiation, Proliferation) %>% 
+  group_by(library, Differentiation, Proliferation) %>% 
+  tally() %>% 
+  mutate(primary_pheno = case_when(
+    Differentiation == 'Hit' & Proliferation == 'Hit' ~ 'Dual',
+    Differentiation == 'Hit' ~ 'Differentiation',
+    Proliferation == 'Hit' ~ 'Proliferation',
+    TRUE ~ 'Non-hit'),
+    description = paste0(library, '_', primary_pheno)) %>% 
+  ungroup() %>% 
+  select(description, n) %>% 
+  pivot_wider(names_from =  description,
+              values_from = n) %>% 
+  mutate(Coding_Hits = Coding_Differentiation + Coding_Proliferation,
+         Coding_DP_Ratio = Coding_Differentiation/Coding_Proliferation,
+         Coding_Dual_Ratio = Coding_Dual/Coding_Hits,
+         lncRNA_Hits = lncRNA_Differentiation + lncRNA_Proliferation,
+         lncRNA_DP_Ratio = lncRNA_Differentiation/lncRNA_Proliferation,
+         lncRNA_Dual_Ratio = lncRNA_Dual/lncRNA_Hits,
+         Coding_lncRNA_Ratio = Coding_DP_Ratio/lncRNA_DP_Ratio)
+
+permutation_summary
+```
+
+### Trials for diff and prolif ratio
+```{r}
+tic()
+permutations_phenotype <- mclapply(1:n_permutations, 
+                                   mc.cores = n_cores,
+                                   mc.preschedule = TRUE,
+                                   function(i) {
+                                     permute_table <- hits_table %>% 
+                                       mutate(Differentiation = sample(Differentiation),
+                                              Proliferation = sample(Proliferation))
+                                     
+                                     # tally
+                                     permutation_summary <- permute_table %>% 
+                                       select(library, Differentiation, Proliferation) %>% 
+                                       group_by(library, Differentiation, Proliferation) %>% 
+                                       tally() %>% 
+                                       mutate(primary_pheno = case_when(
+                                         Differentiation == 'Hit' & Proliferation == 'Hit' ~ 'Dual',
+                                         Differentiation == 'Hit' ~ 'Differentiation',
+                                         Proliferation == 'Hit' ~ 'Proliferation',
+                                         TRUE ~ 'Non-hit'),
+                                         description = paste0(library, '_', primary_pheno)) %>% 
+                                       ungroup() %>% 
+                                       select(description, n) %>% 
+                                       pivot_wider(names_from =  description,
+                                                   values_from = n)
+                                     
+                                     permutation_summary %>% 
+                                       mutate('Trial' = i) %>% 
+                                       select(Trial, everything())
+                                   }) %>% 
+  bind_rows() %>% 
+  mutate(Coding_Hits = Coding_Differentiation + Coding_Proliferation,
+         Coding_DP_Ratio = Coding_Differentiation/Coding_Proliferation,
+         Coding_Dual_Ratio = Coding_Dual/Coding_Hits,
+         lncRNA_Hits = lncRNA_Differentiation + lncRNA_Proliferation,
+         lncRNA_DP_Ratio = lncRNA_Differentiation/lncRNA_Proliferation,
+         lncRNA_Dual_Ratio = lncRNA_Dual/lncRNA_Hits,
+         lncRNA_Coding_Ratio = lncRNA_DP_Ratio/Coding_DP_Ratio) %>% 
+  mutate_if(is.double, round, 3)
+
+permutations_phenotype %>% write_tsv(file.path(analysis_dir, 'permutations_phenotype.tsv.gz'))
+toc()
+
+permutations_phenotype
+```
+
+
+### Observed ratios
+
+```{r}
+observed_ratios <- hits_table %>% 
+  filter(!(Differentiation == 'Hit' & Proliferation == 'Hit')) %>% 
+  select(-feature_id) %>% 
+  pivot_longer(cols = -library,
+               names_to = 'assay',
+               values_to = 'status') %>% 
+  group_by_all() %>% 
+  tally() %>% 
+  filter(status == 'Hit') %>% 
+  pivot_wider(names_from = assay,
+              values_from = n) %>% 
+  mutate(ratio = Differentiation/Proliferation)
+
+observed_ratios
+  
+```
+```{r}
+observed_coding_ratio <- observed_ratios %>% filter(library == 'Coding') %>% pull(ratio)
+observed_lncrna_ratio <- observed_ratios %>% filter(library == 'lncRNA') %>% pull(ratio)
+
+observed_coding_ratio
+
+observed_lncrna_ratio
+```
+
+```{r}
+coding_null_n <- permutations_phenotype %>% filter(log2(Coding_DP_Ratio) >= abs(log2(observed_coding_ratio)))
+
+coding_p <- nrow(coding_null_n)/n_permutations
+
+coding_p
+```
+```{r}
+lncrna_null_n <- permutations_phenotype %>% filter(log2(lncRNA_DP_Ratio) >= abs(log2(observed_lncrna_ratio)))
+
+lncrna_p <- nrow(lncrna_null_n)/n_permutations
+
+lncrna_p
+```
+
+
+### Plot
+```{r}
+permutations %>% 
+  ggplot(aes(x = Coding_Dual_Ratio)) +
+  geom_histogram(bins = bins, alpha = alpha) +
+  labs(subtitle = 'Coding Hit Permutations',
+       x = 'Differentiation:Proliferation Hit Ratio',
+       y = 'Frequency')
+
+lncrna <- permutations %>% 
+  ggplot(aes(x = lncRNA_DP_Ratio)) +
+  geom_histogram(bins = bins, alpha = alpha) +
+  xlim(xlim) + 
+  labs(subtitle = 'lncRNA Hit Permutations',
+       x = 'Differentiation:Proliferation Hit Ratio',
+       y = 'Frequency')
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,499 @@
+---
+title: "Ontology analysis"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Ontology analysis
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/screen/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/screen/output/05_ontology' # analysis file output directory
+data_dir <- '' # data file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+#dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(plotly)
+library(pheatmap)
+library(eulerr)
+library(ggcorrplot)
+library(clusterProfiler)
+library(DOSE)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(extrafont)
+loadfonts()
+```
+
+#### Reference annotation
+```{r}
+unified_t2g <- read_tsv('analysis/reference/output/02_unified_reference/unified_t2g.tsv.gz') # minimal metadata for display purposes
+unified_t2g
+```
+
+
+### Import screen data
+```{r}
+master <- read_tsv('analysis/integration/output/00_integrate/master_minimal.tsv.gz')
+master
+```
+
+```{r}
+coding_subset <- master %>% 
+  filter(library == 'Coding')
+```
+
+
+```{r}
+universe <- coding_subset %>% 
+  pull(feature_id) %>% 
+  unique()
+```
+
+```{r}
+lookup <- bitr(universe, 
+               fromType = 'SYMBOL',
+               OrgDb = org.Hs.eg.db,
+               toType = c('ENTREZID', 'ENSEMBL'))
+
+lookup
+```
+
+
+```{r}
+gene_table <- lookup %>% 
+  inner_join(coding_subset %>% 
+               dplyr::rename(SYMBOL = gene_name))
+
+gene_table
+```
+### Function
+```{r}
+
+run_go <- function(gene_subset,
+                   gene_table,
+                   key = 'ENTREZID') {
+  tic()
+  
+  bp <- enrichGO(gene_subset[[key]],
+                 universe = gene_table[[key]],
+                 keyType = key,
+                 OrgDb = org.Hs.eg.db,
+                 readable = TRUE,
+                 ont = 'BP')
+  
+  mf <- enrichGO(gene_subset[[key]],
+                 universe = gene_table[[key]],
+                 keyType = key,
+                 OrgDb = org.Hs.eg.db,
+                 readable = TRUE,
+                 ont = 'MF')
+  
+  cc <- enrichGO(gene_subset[[key]],
+                 universe = gene_table[[key]],
+                 keyType = key,
+                 OrgDb = org.Hs.eg.db,
+                 readable = TRUE,
+                 ont = 'CC')
+  toc()
+  
+  results <- bind_rows(list(bp@result %>% mutate(ontology = 'BP'),
+                            mf@result %>% mutate(ontology = 'MF'),
+                            cc@result %>% mutate(ontology = 'CC'))) %>% 
+    as_tibble() %>% 
+    mutate(log10q = -log10(qvalue)) %>% 
+    dplyr::select(ontology, ID, Description, Count, GeneRatio, BgRatio, pvalue, p.adjust, qvalue, log10q, everything())
+  
+  list('results' = results,
+       'bp' = bp,
+       'mf' = mf,
+       'cc' = cc)
+  
+}
+
+```
+## Subsets
+```{r}
+diff_all_pure <- gene_table %>% filter(primary_pheno %in% c('Differentiation'))
+diff_all_dual <- gene_table %>% filter(primary_pheno %in% c('Differentiation', 'Dual'))
+
+diff_neg_pure <- gene_table %>% filter(primary_pheno %in% c('Differentiation'), diff_direction == 'Negative')
+diff_neg_dual <- gene_table %>% filter(primary_pheno %in% c('Differentiation', 'Dual'), diff_direction == 'Negative')
+
+diff_pos_pure <- gene_table %>% filter(primary_pheno %in% c('Differentiation'), diff_direction == 'Positive')
+diff_pos_dual <- gene_table %>% filter(primary_pheno %in% c('Differentiation', 'Dual'), diff_direction == 'Positive')
+
+prol_all_pure <- gene_table %>% filter(primary_pheno %in% c('Proliferation'))
+prol_all_dual <- gene_table %>% filter(primary_pheno %in% c('Proliferation', 'Dual'))
+
+prol_neg_pure <- gene_table %>% filter(primary_pheno %in% c('Proliferation'), prol_direction == 'Negative')
+prol_neg_dual <- gene_table %>% filter(primary_pheno %in% c('Proliferation', 'Dual'), prol_direction == 'Negative')
+
+prol_pos_pure <- gene_table %>% filter(primary_pheno %in% c('Proliferation'), prol_direction == 'Positive')
+prol_pos_dual <- gene_table %>% filter(primary_pheno %in% c('Proliferation', 'Dual'), prol_direction == 'Positive')
+
+dual <- gene_table %>% filter(primary_pheno %in% c('Dual'))
+nondual <- gene_table %>% filter(primary_pheno != 'None', primary_pheno != 'Dual')
+
+```
+
+
+```{r eval=FALSE}
+go_diff_all_pure <- run_go(diff_all_pure, gene_table)
+go_diff_all_dual <- run_go(diff_all_dual, gene_table)
+
+go_diff_neg_pure <- run_go(diff_neg_pure, gene_table)
+go_diff_neg_dual <- run_go(diff_neg_dual, gene_table)
+
+go_diff_pos_pure <- run_go(diff_pos_pure, gene_table)
+go_diff_pos_dual <- run_go(diff_pos_dual, gene_table)
+
+## Proliferation
+
+go_prol_all_pure <- run_go(prol_all_pure, gene_table)
+go_prol_all_dual <- run_go(prol_all_dual, gene_table)
+
+go_prol_neg_pure <- run_go(prol_neg_pure, gene_table)
+go_prol_neg_dual <- run_go(prol_neg_dual, gene_table)
+
+go_prol_pos_pure <- run_go(prol_pos_pure, gene_table)
+go_prol_pos_dual <- run_go(prol_pos_dual, gene_table)
+
+# dual
+
+go_dual <- run_go(dual, gene_table)
+go_nondual <- run_go(nondual, gene_table)
+
+
+go_output <- list('diff_all_pure' = go_diff_all_pure,
+                  'diff_all_dual' = go_diff_all_dual,
+                  'diff_neg_pure' = go_diff_neg_pure,
+                  'diff_neg_dual' = go_diff_neg_dual,
+                  'diff_pos_pure' = go_diff_pos_pure,
+                  'diff_pos_dual' = go_diff_pos_dual,
+                  'prol_all_pure' = go_prol_all_pure,
+                  'prol_all_dual' = go_prol_all_dual,
+                  'prol_neg_pure' = go_prol_neg_pure,
+                  'prol_neg_dual' = go_prol_neg_dual,
+                  'prol_pos_pure' = go_prol_pos_pure,
+                  'prol_pos_dual' = go_prol_pos_dual,
+                  'dual' = go_dual,
+                  'nondual' = go_nondual)
+
+go_output %>% write_rds(file.path(analysis_dir, 'go.rds'))
+                  
+```
+
+### Resume analysis
+```{r}
+go_output <- read_rds(file.path(analysis_dir, 'go.rds'))
+```
+
+```{r}
+go_output$diff_all_dual$results %>% 
+  filter(qvalue < 0.05) %>% 
+  group_by(ontology) %>% 
+  tally()
+```
+
+```{r}
+kegg <- enrichKEGG(diff_all_dual$ENTREZID)
+kegg@result %>% filter(qvalue < 0.05)
+```
+
+```{r}
+kegg@result %>%
+  filter(ID %in% c('hsa04330',
+                   'hsa04550',
+                   'hsa04150')) %>% 
+  mutate(ID = toupper(ID)) %>% 
+  ggplot(aes(y = -log10(qvalue),
+             x = reorder(ID, -qvalue),
+             label = Description)) +
+  geom_bar(stat = 'identity',
+           fill = 'grey80') + 
+  geom_text(y = 0, hjust = 0) +
+  geom_hline(yintercept = -log10(0.05), linetype = 'dashed', color = 'red') + 
+  coord_flip()
+
+
+```
+
+
+```{r}
+go_output$diff_all_dual$results %>% filter(ontology == 'MF')
+```
+```{r}
+go_output$diff_all_dual$results %>% filter(ontology == 'CC') %>% arrange(-Count)
+```
+```{r}
+
+enrich_plot <- function(filtered_result) {
+  filtered_result %>% 
+    mutate(ID = toupper(ID)) %>% 
+    ggplot(aes(y = -log10(qvalue),
+               x = reorder(ID, -qvalue),
+               label = Description)) +
+    geom_bar(stat = 'identity',
+             fill = 'grey80') + 
+    geom_text(y = 0, hjust = 0, size = 3) +
+    xlab('') + 
+    ylab('-log10 FDR') +
+    theme_publication(base_size = 10) +
+    theme(plot.title = element_text(face = 'plain', size = 10)) +
+    coord_flip() 
+  
+}
+
+bp <- go_output$diff_all_dual$result %>%
+  filter(ID %in% c('GO:0045165', # cell fate commitment
+                   'GO:0048562', # embryonic
+                   'GO:0048863' # stem cell diff 
+                   #'GO:0048568',
+                   #'GO:0001824'
+                   )) %>% 
+  enrich_plot() + 
+  ylim(c(0,6.5)) +
+  ggtitle('Biological process')
+
+
+bp
+
+mf <- go_output$diff_all_dual$result %>%
+  filter(ID %in% c('GO:0003682', # chromatin binding
+                   'GO:0042393', # histone binding
+                   'GO:0003713')) %>%  # transcription coactivator activity)) 
+  enrich_plot() +
+  ylim(c(0,26)) +
+  ggtitle('Molecular function')
+
+mf
+
+cc <- go_output$diff_all_dual$result %>%
+  filter(ID %in% c('GO:0000785', # chromatin binding
+                   'GO:0005667', # histone binding
+                   'GO:0016607')) %>%  # transcription coactivator activity)) 
+  enrich_plot() +
+  ylim(c(0,26)) +
+  ggtitle('Cellular component')
+
+cc 
+
+k <- kegg@result %>%
+  filter(ID %in% c('hsa04330',
+                   'hsa04550',
+                   'hsa04150')) %>% 
+  enrich_plot() +
+  ylim(c(0,6.5)) +
+  ggtitle('KEGG pathway')
+
+k
+
+combined_plot <- mf + cc  + bp + k + plot_layout(nrow = 2, byrow = F)
+
+save_figure(plot = combined_plot, 
+            filename = 'go', 
+            directory = 'figures/screen',
+            w = 6,
+            h = 4)
+
+combined_plot
+```
+
+
+
+## Proliferation
+```{r}
+kegg <- enrichKEGG(prol_all_dual$ENTREZID)
+kegg@result %>% arrange(qvalue)
+```
+
+
+```{r}
+kegg@result %>%
+  filter(ID %in% c('hsa03010',
+                   'hsa03030',
+                   'hsa04110')) %>% 
+  mutate(ID = toupper(ID)) %>% 
+  ggplot(aes(y = -log10(qvalue),
+             x = reorder(ID, -qvalue),
+             label = Description)) +
+  geom_bar(stat = 'identity',
+           fill = 'grey80') + 
+  geom_text(y = 0, hjust = 0) +
+  geom_hline(yintercept = -log10(0.05), linetype = 'dashed', color = 'red') + 
+  coord_flip()
+
+kegg
+```
+
+
+```{r}
+enrich_plot <- function(filtered_result) {
+  filtered_result %>% 
+    mutate(ID = toupper(ID)) %>% 
+    ggplot(aes(y = -log10(qvalue),
+               x = reorder(ID, -qvalue),
+               label = Description)) +
+    geom_bar(stat = 'identity',
+             fill = 'grey80') + 
+    geom_text(y = 0, hjust = 0, size = 3) +
+    xlab('') + 
+    ylab('-log10 FDR') +
+    theme_publication(base_size = 10) +
+    theme(plot.title = element_text(face = 'plain', size = 10)) +
+    coord_flip() 
+  
+}
+
+bp <- go_output$prol_all_dual$result %>%
+  filter(ID %in% c('GO:0006281',
+                   'GO:0022613',
+                   'GO:0000280'
+                   )) %>% 
+  enrich_plot() + 
+  #ylim(c(0,6.5)) +
+  ggtitle('Biological process')
+
+bp
+
+mf <- go_output$prol_all_dual$result %>%
+  filter(ID %in% c('GO:0003735',
+                   'GO:0016779',
+                   'GO:0004386')) %>% 
+  enrich_plot() +
+  #ylim(c(0,26)) +
+  ggtitle('Molecular function')
+
+mf
+
+cc <- go_output$prol_all_dual$result %>%
+  filter(ID %in% c('GO:0005840',
+                   'GO:0005819',
+                   'GO:0000793')) %>%  # transcription coactivator activity)) 
+  enrich_plot() +
+  #ylim(c(0,26)) +
+  ggtitle('Cellular component')
+
+cc 
+
+k <- kegg@result %>%
+  filter(ID %in% c('hsa03010',
+                   'hsa03030',
+                   'hsa04110')) %>% 
+  enrich_plot() +
+  #ylim(c(0,6.5)) +
+  ggtitle('KEGG pathway')
+
+k
+
+combined_plot <- mf + cc  + bp + k + plot_layout(nrow = 2, byrow = F)
+
+save_figure(plot = combined_plot, 
+            filename = 'go_proliferation', 
+            directory = 'figures/screen',
+            w = 6,
+            h = 4)
+
+combined_plot
+```
+
+
+
+```{r}
+enrich_plot <- function(filtered_result) {
+  filtered_result %>% 
+    mutate(ID = toupper(ID)) %>% 
+    ggplot(aes(y = -log10(qvalue),
+               x = reorder(ID, -qvalue),
+               label = Description)) +
+    geom_bar(stat = 'identity',
+             fill = 'grey80') + 
+    geom_text(y = 0, hjust = 0, size = 3) +
+    xlab('') + 
+    ylab('-log10 FDR') +
+    theme_publication(base_size = 10) +
+    theme(plot.title = element_text(face = 'plain', size = 10)) +
+    coord_flip() 
+  
+}
+
+bp <- go_dual$result %>%
+  filter(ID %in% c('GO:0006281',
+                   'GO:0022613',
+                   'GO:0000280'
+                   )) %>% 
+  enrich_plot() + 
+  #ylim(c(0,6.5)) +
+  ggtitle('Biological process')
+
+bp
+
+mf <- go_dual$result %>%
+  filter(ID %in% c('GO:0003735',
+                   'GO:0016779',
+                   'GO:0004386')) %>% 
+  enrich_plot() +
+  #ylim(c(0,26)) +
+  ggtitle('Molecular function')
+
+mf
+
+cc <- go_dual$result %>%
+  filter(ID %in% c('GO:0005840',
+                   'GO:0005819',
+                   'GO:0000793')) %>%  # transcription coactivator activity)) 
+  enrich_plot() +
+  #ylim(c(0,26)) +
+  ggtitle('Cellular component')
+
+cc 
+
+k <- kegg@result %>%
+  filter(ID %in% c('hsa03010',
+                   'hsa03030',
+                   'hsa04110')) %>% 
+  enrich_plot() +
+  #ylim(c(0,6.5)) +
+  ggtitle('KEGG pathway')
+
+k
+
+combined_plot <- mf + cc  + bp + k + plot_layout(nrow = 2, byrow = F)
+
+save_figure(plot = combined_plot, 
+            filename = 'go_dual', 
+            directory = 'figures/screen',
+            w = 6,
+            h = 4)
+
+combined_plot
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```

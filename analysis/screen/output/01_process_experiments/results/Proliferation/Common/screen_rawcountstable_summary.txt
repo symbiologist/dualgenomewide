@@ -1,0 +1,4 @@
+final	Rep1	analysis/screen/output/003_merge_counts/to_process/Common_Total_R1.counts	186215865
+final	Rep2	analysis/screen/output/003_merge_counts/to_process/Common_Total_R2.counts	186825576
+initial	Rep1	analysis/screen/output/003_merge_counts/to_process/Common_Initial_R1.counts	21925812
+initial	Rep2	analysis/screen/output/003_merge_counts/to_process/Common_Initial_R2.counts	252607857

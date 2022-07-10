@@ -1,0 +1,4 @@
+neg	Rep1	analysis/screen/output/003_merge_counts/to_process/CRiNCL_Negative_R1.counts	117569439
+neg	Rep2	analysis/screen/output/003_merge_counts/to_process/CRiNCL_Negative_R2.counts	207372139
+pos	Rep1	analysis/screen/output/003_merge_counts/to_process/CRiNCL_Positive_R1.counts	208167879
+pos	Rep2	analysis/screen/output/003_merge_counts/to_process/CRiNCL_Positive_R2.counts	190356684

@@ -1,0 +1,4 @@
+final	Rep1	analysis/screen/output/003_merge_counts/to_process/Coding_Total_R1.counts	512157462
+final	Rep2	analysis/screen/output/003_merge_counts/to_process/Coding_Total_R2.counts	445094410
+initial	Rep1	analysis/screen/output/003_merge_counts/to_process/Coding_Initial_R1.counts	161336846
+initial	Rep2	analysis/screen/output/003_merge_counts/to_process/Coding_Initial_R2.counts	177395404

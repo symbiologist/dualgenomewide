@@ -1,0 +1,794 @@
+---
+title: "Transcriptomic analysis of hits"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Analyze transcriptomic features of hits
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/screen/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/screen/output/07_transcriptomics' # analysis file output directory
+data_dir <- '' # data file output directory
+figures_dir <- 'figures/screen'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(figures_dir, showWarnings = FALSE)
+#dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(plyranges)
+library(patchwork)
+library(ggcorrplot)
+library(pheatmap)
+library(extrafont)
+```
+
+
+
+### Annotation
+```{r}
+unified_reference <- import('analysis/reference/output/02_unified_reference/unified.gtf.gz')
+```
+
+### Expression data
+```{r}
+expression_clusters <- read_tsv('analysis/rnaseq/output/04_expression_clusters/expression_clusters.tsv.gz')
+foldchanges_long <- read_tsv('analysis/rnaseq/output/07_dynamic_expression/foldchanges_long.tsv.gz')
+foldchanges_wide <- read_tsv('analysis/rnaseq/output/07_dynamic_expression/foldchanges_wide.tsv.gz')
+```
+
+### Load screen data
+```{r}
+neighbor_wide <- read_tsv('analysis/screen/output/03_neighbors/neighbor_wide.tsv.gz') %>% 
+  mutate(primary_pheno = factor(primary_pheno, levels = c('Differentiation', 'Dual', 'Proliferation', 'None')),
+         status = ifelse(primary_pheno == 'None', 'Non-hit', 'Hit')) %>% 
+  left_join(expression_clusters %>% select(feature_id, expression_cluster = cluster) %>% unique()) 
+
+neighbor_wide
+```
+
+### Additional genomic information
+Exon count and total length
+```{r}
+gene_length <- unified_reference %>% 
+  filter(type == 'gene') %>% 
+  mutate(length = width) %>% 
+  as_tibble() %>% 
+  select(feature_id, length) %>% 
+  group_by(feature_id) %>% 
+  top_n(n = 1, length) %>% 
+  unique() %>% 
+  ungroup()
+
+gene_length
+```
+
+
+### Exon count (longest transcript) and number of isoforms
+```{r}
+exons <- unified_reference %>% 
+  filter(type == 'exon') 
+
+exon_counts <- exons@elementMetadata %>% 
+  as_tibble() %>% 
+  add_count(transcript_id, name = 'exon_count') %>% 
+  select(-type) %>% 
+  unique() %>% 
+  add_count(feature_id, name = 'isoform_count') %>% 
+  group_by(feature_id) %>% 
+  top_n(n = 1, exon_count) %>% 
+  ungroup() %>% 
+  select(feature_id, exon_count, isoform_count) %>% 
+  unique() 
+ 
+
+exon_counts
+```
+### Expression levels
+### Calculate max expression level and dynamic range (max)
+
+```{r}
+ max_tpm <- expression_clusters %>% 
+  select(feature_id, tpm, expression_fraction) %>% 
+  group_by(feature_id, expression_fraction) %>% 
+  top_n(1, tpm) %>% 
+  ungroup() %>% 
+  unique() %>% 
+  pivot_wider(names_from = expression_fraction,
+              values_from = tpm) %>% 
+  mutate(max_tpm = ifelse(polyA > Total, polyA, Total))
+
+colnames(max_tpm) <- c('feature_id', 'polyA_max_tpm', 'Total_max_tpm', 'max_tpm')
+
+max_tpm
+```
+```{r}
+ med_tpm <- expression_clusters %>% 
+  select(feature_id, tpm, expression_fraction) %>% 
+  group_by(feature_id, expression_fraction) %>% 
+  summarize(tpm = median(tpm, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  unique() %>% 
+  pivot_wider(names_from = expression_fraction,
+              values_from = tpm) %>% 
+  mutate(med_tpm = ifelse(polyA > Total, polyA, Total))
+
+colnames(med_tpm) <- c('feature_id', 'polyA_med_tpm', 'Total_med_tpm', 'med_tpm')
+
+med_tpm
+```
+```{r}
+ max_log2fc <- foldchanges_long %>% 
+  mutate(log2fc = ifelse(is.na(log2fc), 0, log2fc)) %>% 
+  select(feature_id, condition, log2fc) %>% 
+  group_by(feature_id, condition) %>% 
+  top_n(1, abs(log2fc)) %>% 
+  ungroup() %>% 
+  unique() %>% 
+  pivot_wider(names_from = condition,
+              values_from = log2fc) %>% 
+  mutate(max_log2fc = ifelse(abs(polyA) > abs(Total), polyA, Total),
+         max_log2fc_abs = abs(max_log2fc))
+
+colnames(max_log2fc) <- c('feature_id', 'polyA_max_log2fc', 'Total_max_log2fc', 'max_log2fc', 'max_log2fc_abs')
+
+max_log2fc
+```
+
+```{r}
+scaled_expression <- expression_clusters %>% 
+  mutate(scaled_expression = ifelse(is.nan(scaled_expression), 0, scaled_expression),
+         sample = paste(expression_fraction, paste0('D', time), 'scaled', sep = '_')) %>% 
+  select(feature_id, sample, scaled_expression) %>% 
+  unique() %>% 
+  pivot_wider(names_from = sample,
+              values_from = scaled_expression)
+
+scaled_expression
+```
+
+
+```{r}
+tpm_expression <- expression_clusters %>% 
+  mutate(sample = paste(expression_fraction, paste0('D', time), 'tpm', sep = '_')) %>% 
+  select(feature_id, sample, tpm) %>% 
+  unique() %>% 
+  pivot_wider(names_from = sample,
+              values_from = tpm)
+
+tpm_expression
+```
+
+```{r}
+transcriptomics <- gene_length %>% 
+  left_join(exon_counts) %>% 
+  left_join(max_tpm) %>% 
+  left_join(med_tpm) %>% 
+  left_join(max_log2fc) %>% 
+  left_join(tpm_expression) %>% 
+  left_join(scaled_expression) %>% 
+  left_join(foldchanges_wide) %>% 
+  mutate_if(is.double, round, 3)
+
+colnames(transcriptomics)[-1] <- paste0('txn_', colnames(transcriptomics)[-1])
+transcriptomics
+```
+
+```{r}
+# Detected in at least 2 samples
+polya_detected <- expression_clusters %>% filter(expression_fraction == 'polyA') %>% filter(tpm > 0) %>% add_count(feature_id) %>% filter(n > 1) %>% pull(feature_id)
+total_detected <- expression_clusters %>% filter(expression_fraction == 'Total') %>% filter(tpm > 0) %>% add_count(feature_id) %>% filter(n > 1) %>% pull(feature_id)
+```
+
+```{r}
+screen_merge <- neighbor_wide %>% left_join(transcriptomics)
+screen_merge
+```
+
+```{r}
+transcriptomics %>% select(feature_id, contains('max'))
+```
+
+
+### Expression level and hits
+```{r fig.height=4, fig.width=4}
+hit_colors <- c('dodgerblue4',
+                'darkorchid4')
+
+plot_subset <- screen_merge %>% 
+  filter(library == 'Coding' | locus_ambiguity == 'Non-ambiguous',
+         diff_full_status != 'Neighbor hit') 
+```
+
+
+```{r}
+p_expression <- plot_subset %>% 
+  ggplot(aes(x = fct_rev(diff_full_status),
+             y = txn_max_tpm,
+             fill = diff_full_status)) + 
+  geom_boxplot(alpha = 0.5, outlier.alpha = 0) + 
+  #geom_violin(alpha = 0.5, draw_quantiles = c(0.5)) +
+  scale_y_log10(breaks = c(0.01, 1, 100, 10000),
+                labels = c(0.01, 1, 100, 10000),
+                limits = c(0.01, 1e4)) +
+  facet_wrap(~library, nrow = 2) +
+  scale_fill_manual(values = hit_colors) +
+  coord_flip() +
+  labs(y = 'Max expression (TPM)',
+       x = '')
+
+p_expression
+```
+
+```{r}
+p_dynamics <- plot_subset %>% 
+  filter(txn_max_log2fc_abs != 0) %>% 
+  ggplot(aes(x = fct_rev(diff_full_status),
+             y = abs(txn_polyA_max_log2fc),
+             fill = diff_full_status)) + 
+  geom_boxplot(alpha = 0.5, outlier.alpha = 0) + 
+  #geom_violin(alpha = 0.5, draw_quantiles = c(0.5)) +
+  scale_y_log10(breaks = c(0.1, 1, 10),
+                labels = c(0.1, 1, 10)) +
+  facet_wrap(~library, nrow = 2) +
+  scale_fill_manual(values = hit_colors) +
+  coord_flip() +
+  labs(y = 'Max log2 fold-change',
+       x = '')
+
+p_dynamics
+```
+```{r}
+p_final <- p_expression + p_dynamics
+p_final
+```
+
+
+```{r}
+save_figure(plot = p_final,
+            filename = 'expression_level_dynamics',
+            directory = figures_dir,
+            h = 3,
+            w = 7)
+```
+
+
+## Library level comparisons
+### Expression level and hits
+```{r fig.height=4, fig.width=4}
+hit_colors <- c('darkred',
+                'grey80')
+
+p_expression <- screen_merge %>% 
+  ggplot(aes(x = fct_rev(status),
+             y = txn_polyA_max_tpm,
+             fill = status)) + 
+  geom_boxplot(alpha = 0.5, outlier.alpha = 0) + 
+  scale_y_log10(breaks = c(0.01, 1, 100, 10000),
+                labels = c(0.01, 1, 100, 10000)) +
+  facet_wrap(~library, nrow = 2) +
+  scale_fill_manual(values = hit_colors) +
+  coord_flip() +
+  labs(y = 'Max expression (TPM)',
+       x = '')
+
+p_expression
+```
+
+```{r fig.height=4, fig.width=4}
+p_expression_all <- screen_merge %>% 
+  ggplot(aes(x = fct_rev(library),
+             y = txn_polyA_max_tpm,
+             fill = library)) + 
+  geom_boxplot(alpha = 0.5, outlier.alpha = 0) + 
+  scale_y_log10(breaks = c(0.01, 1, 100, 10000),
+                labels = c(0.01, 1, 100, 10000)) +
+  scale_fill_manual(values = c('darkgreen', 'magenta')) +
+  coord_flip() +
+  labs(y = 'Max expression (TPM)',
+       x = '')
+
+p_expression_all
+```
+
+
+```{r fig.height=4, fig.width=4}
+p_screen_merge <- screen_merge %>% 
+  ggplot(aes(x = fct_rev(status),
+             y = abs(max_log2fc),
+             fill = status)) + 
+  geom_boxplot(alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~library, nrow = 2) +
+  scale_fill_manual(values = hit_colors) +
+  coord_flip() +
+  scale_y_log10(breaks = c(0.1, 1,  10),
+                limits = c(0.05, 20)) +
+  #ylim(c(0, 10)) + 
+  labs(y = 'Max log2 fold-change',
+       x = '')
+
+p_screen_merge
+```
+
+
+```{r fig.height=4, fig.width=4}
+p_screen_merge_all <- screen_merge %>% 
+  ggplot(aes(x = fct_rev(library),
+             y = abs(max_log2fc),
+             fill = library)) + 
+  geom_boxplot(alpha = 0.5, outlier.alpha = 0) +
+  scale_fill_manual(values = c('darkgreen', 'magenta')) +
+  coord_flip() +
+  scale_y_log10(breaks = c(0.1, 1,  10),
+                limits = c(0.05, 20)) +
+  labs(y = 'Max log2 fold-change',
+       x = '')
+
+p_screen_merge_all
+```
+
+```{r fig.height = 4, fig.width = 7}
+p_final <- (p_expression_all + p_screen_merge_all) / (p_expression + p_screen_merge) + plot_layout(heights = c(1.1, 3))
+
+save_figure(plot = p_final,
+            filename = 'expression_level_screen_merge_simplified',
+            directory = figures_dir,
+            h = 4,
+            w = 7)
+
+p_final
+```
+
+### How many hits in top quantile?
+```{r}
+top_quantile <- 0.75
+quantiles <- screen_merge %>% 
+  group_by(library) %>% 
+  summarize(expression_quantile = quantile(txn_polyA_max_tpm, probs = top_quantile),
+            median_quantile = quantile(med_expression, probs = top_quantile),
+            screen_merge_quantile = quantile(max_log2fc, probs = top_quantile))
+
+quantiles
+```
+
+### Expression quantile
+```{r}
+screen_merge %>% 
+  left_join(quantiles) %>% 
+  filter(txn_polyA_max_tpm > expression_quantile,
+         status == 'Hit') %>% 
+  group_by(library) %>% 
+  tally()
+```
+
+### screen_merge quantile
+```{r}
+screen_merge %>% 
+  left_join(quantiles) %>% 
+  filter(max_log2fc > screen_merge_quantile,
+         status == 'Hit') %>% 
+  group_by(library, primary_pheno) %>% 
+  tally()
+```
+
+### Calculate all statistics together and perform FDR adjustment 
+```{r}
+comparison_table <- crossing(library = c('lncRNA', 'Coding', 'Both'),
+                             which_variable = c('txn_max_tpm', 'txn_max_log2fc_abs')) %>% 
+  mutate(row = row_number())
+
+comparison_table
+```
+
+
+```{r}
+map(comparison_table$row, function(i) {
+  
+  params <- comparison_table[i, ]
+  
+  data_subset <- plot_subset %>% 
+     select(status,
+            library,
+            status,
+            variable = one_of(params$which_variable))
+  
+  if(params$library == 'Both') { # perform between comparison
+    
+    group1 <- data_subset %>% filter(library == 'Coding') %>% pull(variable) %>% abs()
+    group2 <- data_subset %>% filter(library == 'lncRNA') %>% pull(variable) %>% abs()
+    
+  } else { # perform within comparison
+    
+    group1 <- data_subset %>% filter(library == params$library, status == 'Hit') %>% pull(variable) %>% abs()
+    group2 <- data_subset %>% filter(library == params$library, status == 'Non-hit') %>% pull(variable) %>% abs()
+  }
+  
+  test_res <- wilcox.test(group1, group2)
+  test_res
+  
+  tibble(params,
+         'median1' = median(group1),
+         'median2' = median(group2),
+         '25quartile1' = quantile(group1, probs = 0.25),
+         '25quartile2' = quantile(group2, probs = 0.25),
+         '75quartile1' = quantile(group1, probs = 0.75),
+         '75quartile2' = quantile(group2, probs = 0.75),
+         'ratio' = median1/median2,
+         'pval' = test_res$p.value)
+  
+}) %>% 
+  bind_rows() %>% 
+  mutate(padj = p.adjust(pval, method = 'BH')) %>% 
+  select(-row)
+  
+```
+
+
+## Txn cluster
+```{r}
+neighbor_wide %>% 
+  select(feature_id, library, status, primary_pheno, expression_cluster) %>% 
+  group_by(library, status, expression_cluster) %>% 
+  tally()
+```
+```{r}
+neighbor_wide %>% 
+  select(feature_id, library, status, primary_pheno, expression_cluster) %>% 
+  group_by(library, expression_cluster) %>% 
+  tally()
+```
+## cluster enrichment 
+### All 
+```{r}
+libraries <- c('Coding', 'lncRNA')
+assays <- c('Differentiation', 'Proliferation', 'Dual', 'All')
+clusters <- neighbor_wide$expression_cluster %>% unique() %>% setdiff('Undetected')
+
+enrich <- map(libraries, function(i) {
+  map(assays, function(j) {
+    map(clusters, function(k) {
+      
+      if(j == 'All') {
+        hit_subset <- neighbor_wide %>% filter(library == i, primary_pheno != 'None') %>% pull(feature_id)
+      } else {
+        hit_subset <- neighbor_wide %>% filter(library == i, primary_pheno == j) %>% pull(feature_id)
+      }
+      
+      cluster_subset <- neighbor_wide %>% filter(library == i, expression_cluster == k) %>% pull(feature_id)
+      background <- neighbor_wide %>% filter(library == i) %>% pull(feature_id)
+      
+      test <- enrichment_test(list1 = hit_subset,
+                              list2 = cluster_subset,
+                              cat1 = c('Hit', 'Non-hit'),
+                              cat2 = c('In cluster', 'Out cluster'),
+                              background = background,
+                              print = FALSE)
+      
+      tibble(library = i,
+             primary_pheno = j,
+             expression_cluster = k,
+             pval = test$fisher$p.value,
+             odds = test$fisher$estimate,
+             log2odds = log2(odds),
+             hits_in = sum(hit_subset %in% cluster_subset),
+             hits_out = length(hit_subset) - hits_in,
+             n_cluster = length(cluster_subset),
+             f_hits_in = round(hits_in/length(hit_subset), 4),
+             f_hits_out = round(hits_out/length(hit_subset), 4),
+             f_cluster_in = round(hits_in/n_cluster, 4))
+      
+      
+    }) %>% bind_rows()
+  }) %>% bind_rows()
+}) %>% bind_rows() %>% 
+  mutate(padj = p.adjust(pval) %>% round(4)) %>% 
+  arrange(padj) %>% 
+  select(library, primary_pheno, expression_cluster, pval, padj, everything())
+```
+
+
+```{r}
+enrich %>% 
+  filter(library == 'lncRNA') %>% 
+  arrange(padj) %>% 
+  filter(log2odds > 0,
+         padj < 0.05)
+  
+  
+```
+```{r}
+enrich %>% 
+  filter(library == 'lncRNA') %>% 
+  arrange(padj) %>% 
+  filter(log2odds > 0,
+         padj < 0.05)
+```
+
+```{r}
+enrich %>% 
+  filter(library == 'Coding') %>% 
+  arrange(-abs(log2odds)) %>% 
+  filter(log2odds > 0, padj < 0.05)
+```
+```{r}
+
+expression_cluster_df <- enrich %>% 
+  mutate(group = paste(library, primary_pheno),
+         expression_cluster = ifelse(expression_cluster == 0, 'Unassigned', expression_cluster),
+         log2odds = ifelse(padj < 0.05, log2odds, NA)) %>% 
+  arrange(expression_cluster, group) %>% 
+  select(group, expression_cluster, log2odds) %>% 
+  pivot_wider(names_from = expression_cluster, values_from = log2odds) %>% 
+  column_to_rownames('group')
+
+expression_cluster_df[expression_cluster_df == -Inf] <- 0
+
+expression_cluster_df
+```
+
+
+
+
+```{r}
+pheatmap(expression_cluster_df,
+         breaks = seq(-3, 3, length.out = 101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         angle_col = 45,
+         na_col = 'white',
+         scale = 'none',
+         #filename = file.path(figures_dir, 'expression_cluster_heatmap.pdf'),
+         width = 5,
+         height = 3,
+         silent = FALSE)
+```
+
+Show n in each cluster
+```{r}
+expression_cluster_df <- enrich %>% 
+  mutate(group = paste(library, primary_pheno),
+         expression_cluster = ifelse(expression_cluster == 0, 'Unassigned', expression_cluster)) %>% 
+  arrange(expression_cluster, group) %>% 
+  select(group, expression_cluster, hits_in) %>% 
+  pivot_wider(names_from = expression_cluster, values_from = hits_in) %>% 
+  column_to_rownames('group')
+
+expression_cluster_df[expression_cluster_df == -Inf] <- 0
+
+expression_cluster_df
+
+pheatmap(expression_cluster_df,
+         breaks = seq(-3, 3, length.out = 101),
+         color = 'white',
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         angle_col = 45,
+         number_format = '%i',
+         display_numbers = TRUE,
+         na_col = 'white',
+         scale = 'none',
+         filename = file.path(figures_dir, 'expression_cluster_heatmap_n.pdf'),
+         width = 5,
+         height = 3,
+         silent = FALSE)
+```
+Fraction in each cluster
+```{r}
+expression_cluster_df <- enrich %>% 
+  mutate(group = paste(library, primary_pheno),
+         expression_cluster = ifelse(expression_cluster == 0, 'Unassigned', expression_cluster)) %>% 
+  arrange(expression_cluster, group) %>% 
+  select(group, expression_cluster, f_cluster_in) %>% 
+  mutate(f_cluster_in = round(100* f_cluster_in, 1)) %>% 
+  pivot_wider(names_from = expression_cluster, values_from = f_cluster_in) %>% 
+  column_to_rownames('group')
+
+expression_cluster_df[expression_cluster_df == -Inf] <- 0
+
+expression_cluster_df
+
+pheatmap(expression_cluster_df,
+         breaks = seq(-3, 3, length.out = 101),
+         color = 'white',
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         angle_col = 45,
+         display_numbers = TRUE, 
+         number_format = "%.1f",
+         na_col = 'white',
+         scale = 'none',
+         filename = file.path(figures_dir, 'expression_cluster_heatmap_frac.pdf'),
+         width = 5,
+         height = 3,
+         silent = FALSE)
+```
+
+## cluster enrichment 
+### Diff
+```{r}
+libraries <- c('Coding', 'lncRNA')
+clusters <- neighbor_wide$expression_cluster %>% unique() %>% setdiff('Undetected')
+
+enrich_subset <- neighbor_wide %>% filter(library == 'Coding' | locus_ambiguity == 'Non-ambiguous', diff_full_status != 'Neighbor hit')
+
+enrich <- map(libraries, function(i) {
+    map(clusters, function(k) {
+      
+      hit_subset <- enrich_subset %>% filter(library == i, diff_full_status == 'Hit') %>% pull(feature_id)
+      cluster_subset <- enrich_subset %>% filter(library == i, expression_cluster == k) %>% pull(feature_id)
+      background <- enrich_subset %>% filter(library == i) %>% pull(feature_id)
+      
+      test <- enrichment_test(list1 = hit_subset,
+                              list2 = cluster_subset,
+                              cat1 = c('Hit', 'Non-hit'),
+                              cat2 = c('In cluster', 'Out cluster'),
+                              background = background,
+                              print = FALSE)
+      
+      tibble(library = i,
+             expression_cluster = k,
+             pval = test$fisher$p.value,
+             odds = test$fisher$estimate,
+             log2odds = log2(odds),
+             hits_in = sum(hit_subset %in% cluster_subset),
+             hits_out = length(hit_subset) - hits_in,
+             n_cluster = length(cluster_subset),
+             f_hits_in = round(hits_in/length(hit_subset), 4),
+             f_hits_out = round(hits_out/length(hit_subset), 4),
+             f_cluster_in = round(hits_in/n_cluster, 4))
+      
+      
+    }) %>% bind_rows()
+}) %>% bind_rows() %>% 
+  mutate(padj = p.adjust(pval) %>% round(4)) %>% 
+  arrange(padj) %>% 
+  select(library, expression_cluster, pval, padj, everything())
+```
+
+
+```{r}
+enrich %>% 
+  filter(library == 'lncRNA') %>% 
+  arrange(padj) %>% 
+  filter(log2odds > 0,
+         padj < 0.05)
+  
+  
+```
+```{r}
+enrich %>% 
+  filter(library == 'lncRNA') %>% 
+  arrange(padj) %>% 
+  filter(log2odds > 0,
+         padj < 0.05)
+```
+
+```{r}
+enrich %>% 
+  filter(library == 'Coding') %>% 
+  arrange(-abs(log2odds)) %>% 
+  filter(log2odds > 0, padj < 0.05)
+```
+```{r}
+
+expression_cluster_df <- enrich %>% 
+  mutate(group = library,
+         expression_cluster = ifelse(expression_cluster == 0, 'Unassigned', expression_cluster),
+         log2odds = ifelse(pval < .05, log2odds, NA)) %>% 
+  arrange(expression_cluster, group) %>% 
+  select(group, expression_cluster, log2odds) %>% 
+  pivot_wider(names_from = expression_cluster, values_from = log2odds) %>% 
+  column_to_rownames('group')
+
+expression_cluster_df[expression_cluster_df == -Inf] <- 0
+
+expression_cluster_df
+```
+
+
+
+
+
+```{r}
+pheatmap(expression_cluster_df,
+         breaks = seq(-2, 2, length.out = 101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         angle_col = 45,
+         na_col = 'white',
+         scale = 'none',
+         filename = file.path(figures_dir, 'expression_cluster_heatmap.pdf'),
+         width = 5,
+         height = 2,
+         silent = FALSE)
+```
+
+Show n in each cluster
+```{r}
+expression_cluster_df <- enrich %>% 
+  mutate(group = library,
+         expression_cluster = ifelse(expression_cluster == 0, 'Unassigned', expression_cluster)) %>% 
+  arrange(expression_cluster, group) %>% 
+  select(group, expression_cluster, hits_in) %>% 
+  pivot_wider(names_from = expression_cluster, values_from = hits_in) %>% 
+  column_to_rownames('group')
+
+expression_cluster_df[expression_cluster_df == -Inf] <- 0
+
+expression_cluster_df
+
+pheatmap(expression_cluster_df,
+         breaks = seq(-3, 3, length.out = 101),
+         color = 'white',
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         angle_col = 45,
+         number_format = '%i',
+         display_numbers = TRUE,
+         na_col = 'white',
+         scale = 'none',
+         filename = file.path(figures_dir, 'expression_cluster_heatmap_n.pdf'),
+         width = 5,
+         height = 2,
+         silent = FALSE)
+```
+Fraction in each cluster
+```{r}
+expression_cluster_df <- enrich %>% 
+  mutate(group = library,
+         expression_cluster = ifelse(expression_cluster == 0, 'Unassigned', expression_cluster)) %>% 
+  arrange(expression_cluster, group) %>% 
+  select(group, expression_cluster, f_cluster_in) %>% 
+  mutate(f_cluster_in = round(100* f_cluster_in, 1)) %>% 
+  pivot_wider(names_from = expression_cluster, values_from = f_cluster_in) %>% 
+  column_to_rownames('group')
+
+expression_cluster_df[expression_cluster_df == -Inf] <- 0
+
+expression_cluster_df
+
+pheatmap(expression_cluster_df,
+         breaks = seq(-3, 3, length.out = 101),
+         color = 'white',
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         angle_col = 45,
+         display_numbers = TRUE, 
+         number_format = "%.1f",
+         na_col = 'white',
+         scale = 'none',
+         filename = file.path(figures_dir, 'expression_cluster_heatmap_frac.pdf'),
+         width = 5,
+         height = 2,
+         silent = FALSE)
+```
+
+
+## Export
+```{r}
+transcriptomics %>% write_tsv(file.path(analysis_dir, 'trascriptomics.tsv.gz'))
+```

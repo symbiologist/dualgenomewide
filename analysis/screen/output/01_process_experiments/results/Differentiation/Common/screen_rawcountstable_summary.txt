@@ -1,0 +1,4 @@
+neg	Rep1	analysis/screen/output/003_merge_counts/to_process/Common_Negative_R1.counts	87381784
+neg	Rep2	analysis/screen/output/003_merge_counts/to_process/Common_Negative_R2.counts	86854020
+pos	Rep1	analysis/screen/output/003_merge_counts/to_process/Common_Positive_R1.counts	64606642
+pos	Rep2	analysis/screen/output/003_merge_counts/to_process/Common_Positive_R2.counts	65801483

@@ -1,0 +1,4 @@
+final	Rep1	45282876
+final	Rep2	54261637
+initial	Rep1	21925812
+initial	Rep2	252607857

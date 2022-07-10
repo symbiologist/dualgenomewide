@@ -1,0 +1,1803 @@
+---
+title: "Figures from Screen Analysis"
+author: "David Wu"
+output: html_notebook
+---
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(patchwork)
+library(extrafont)
+library(ggrepel)
+library(ggforce)
+library(eulerr)
+loadfonts()
+```
+
+### Load themes and functions
+```{r}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+
+source('analysis/screen/scripts/functions.R') # functions for this subcomponent
+
+theme_set(theme_publication())
+```
+
+### Output directory
+```{r}
+output_dir <- 'figures/screen'
+dir.create(output_dir, showWarnings = FALSE)
+```
+
+### Functions
+```{r}
+figure_volcano <- function(screen_table, 
+                           top_genes = 25, 
+                           extra_genes = NULL, 
+                           size = 1, 
+                           alpha = 0.5, 
+                           xlab = 'log2 enrichment', 
+                           ylab = '-log10 p-value', 
+                           ylim = 'auto',
+                           title = '', 
+                           color_by = 'legend', 
+                           colors = c('dodgerblue4', 'lightblue', 'grey75', 'grey75'), 
+                           label_size = 4, 
+                           min_segment_length = 1,
+                           box_padding = 0.3,
+                           fontface = 'plain',
+                           legend = TRUE,
+                           drop_points = FALSE,
+                           plot_cutoff = TRUE,
+                           cutoff_color = 'grey50') {
+  
+  # Get experiment info
+  library <- screen_table %>% pull(library) %>% unique()
+  assay <- screen_table %>% pull(assay) %>% unique()
+  experiment <- screen_table %>% pull(experiment) %>% unique()
+  threshold <- screen_table %>% pull(threshold) %>% unique()
+  #
+  if(title == 'auto') {
+    title <- paste(assay, experiment) 
+  }
+  
+  
+  if(ylim == 'auto') {
+    ylim <- c(0, ceiling(max(-log10(screen_table$avg_mw))))
+  }
+  
+  color_vector <- unlist(screen_table[,color_by])
+  
+  if(drop_points) {
+    plot <- screen_table %>% 
+      ggplot(aes(x = avg_pheno, y = -log10(avg_mw)))
+  } else {
+    plot <- screen_table %>% 
+      ggplot(aes(x = avg_pheno, y = -log10(avg_mw))) + 
+      geom_point(aes(color = color_vector), size = size, alpha = alpha)
+  }
+  plot <- plot + 
+    xlab(xlab) + 
+    ylab(ylab) +
+    ylim(ylim) + 
+    ggtitle(title) + 
+    theme_publication(legend = legend) + 
+    scale_color_manual(values = colors) + 
+    theme(plot.title = element_text(hjust = 0.5, face = 'plain'), 
+          axis.title = element_text(hjust = 0.5), legend.title = element_blank(),
+          text = element_text(size = 14)) +
+    ggtitle(title)
+  
+  if(top_genes > 0 | !is.null(extra_genes)) {
+    
+    interesting_genes <- c(unique(c(screen_table %>% group_by(direction) %>% top_n(top_genes, score) %>% pull(feature_id), extra_genes)))
+    plot <- plot + 
+      geom_text_repel(data = screen_table %>% 
+                        filter(feature_id %in% interesting_genes), 
+                      aes(x = avg_pheno, y = -log10(avg_mw), 
+                          label = gene_name), 
+                      size = label_size,
+                      min.segment.length = min_segment_length,
+                      box.padding = box_padding,
+                      segment.color = 'grey70',
+                      max.overlaps = 20)
+    
+  }  
+  
+  #calculate distribution from pseudo genes
+  control_sd <- screen_table %>% pull(control_sd) %>% unique()
+  
+  # mark hits
+  if(plot_cutoff) {
+    score_threshold <- control_sd * threshold
+    plot <- plot +  stat_function(fun = function(x) {abs(score_threshold/x)}, geom = 'line', linetype = 'dashed', color = cutoff_color)  
+  } 
+    plot
+  
+}
+
+```
+
+
+### Import screen data
+```{r}
+screen_results <- read_tsv('analysis/screen/output/04_fdr/screen_results.tsv')
+neighbor_integration <- read_tsv('analysis/screen/output/05_neighbors/neighbor_hits.tsv.gz')
+tss_gtf <- import('analysis/screen/output/05_neighbors/screen_tss.gtf')
+interaction_master <- read_tsv('analysis/architecture/output/000_interaction/interaction_master.tsv.gz')
+```
+
+
+## Volcano plots
+```{r}
+volcano_table <- screen_results %>% 
+  mutate(avg_mw = pval,
+         avg_pheno = pheno,
+         experiment = library,
+         legend = ifelse(group == 'Control', 'Control', status),
+         legend = factor(legend, levels = c('Hit', 'Non-hit', 'Control'))) %>% 
+  arrange(legend) 
+
+volcano_table %>% head()
+  
+```
+
+```{r}
+volcano_table %>% filter(group == 'Gene') %>% 
+  group_by(library, assay, direction, status) %>% tally()
+```
+
+
+Parameters
+```{r fig.width=6, fig.height=5}
+
+diff_colors <- c('dodgerblue4', 'grey70', 'grey90')
+prolif_colors <- c('orangered', 'grey70', 'grey90')
+
+width <- 7
+height <- 6
+dpi <- 300
+point_size <- 1
+point_alpha <- 0.4
+ymax <- 7.35
+xlims <- c(-3.3, 3.3)
+```
+
+Coding diff
+```{r fig.width=7, fig.height=6}
+features_to_highlight <- c('PAX6', # control
+                           
+                           # neural
+                           'OTX2', 
+                           'HES1',
+                           'SOX2',
+                           'SOX4',
+                           'SOX11',
+                           
+                           # pluripotency
+                           'POU5F1',
+                           'GBX2', 
+                           'PRDM14', 
+                           'SALL4',
+                           
+                           #'SIX3', 
+                           
+                           # pathways
+                           'NOTCH1',
+                           'JAG1',
+                           'FGFR3',
+                           'SPRY2',
+                           
+                           # BAF complex
+                           'SMARCA4',
+                           'SMARCC1',
+                           'SMARCE1',
+                           'ARID1A',
+                           
+                           # paf complex
+                           'PAF1',
+                           'CTR9',
+                           'RTF1',
+                           'CDC73')
+
+volcano_table %>% 
+  filter(library == 'Coding',
+         assay == 'Differentiation') %>% 
+  figure_volcano(colors = diff_colors, 
+                 top_genes = 0, 
+                 extra_genes = features_to_highlight,
+                 min_segment_length = 0,
+                 box_padding = 0.4,
+                 size = point_size,
+                 legend = FALSE,
+                 alpha = point_alpha) + 
+  ylim(c(0, ymax)) +
+  xlim(xlims)
+
+save_figure(filename = 'Volcano_CD', w = width, h = height, dpi = dpi, directory = 'figures/screen')
+
+
+```
+
+No points + no text
+```{r}
+volcano_table %>% 
+  filter(library == 'Coding',
+         assay == 'Differentiation') %>% 
+  figure_volcano(colors = diff_colors, 
+                 top_genes = 0, 
+                 extra_genes = features_to_highlight,
+                 min_segment_length = 0,
+                 box_padding = 0.4,
+                 size = point_size,
+                 alpha = point_alpha,
+                 legend = FALSE,
+                 drop_points = TRUE) + 
+  ylim(c(0, ymax)) +
+  xlim(xlims)
+
+save_figure(filename = 'Volcano_CD_pointless', w = width, h = height, dpi = dpi, directory = 'figures/screen')
+
+volcano_table %>% 
+  filter(library == 'Coding',
+         assay == 'Differentiation') %>% 
+  figure_volcano(colors = diff_colors, 
+                 top_genes = 0, 
+                 extra_genes = NULL,
+                 min_segment_length = 0,
+                 box_padding = 0.4,
+                 size = point_size,
+                 alpha = point_alpha,
+                 legend = FALSE,
+                 drop_points = FALSE,
+                 cutoff_color = 'transparent') + 
+  ylim(c(0, ymax)) +
+  xlim(xlims)
+
+save_figure(filename = 'Volcano_CD_textless', w = width, h = height, dpi = dpi, directory = 'figures/screen')
+```
+
+
+lncRNA diff
+```{r fig.width=7, fig.height=6}
+features_to_highlight <- c( # pos
+  'LH02475',
+  'LH13351',
+  'LH06946',
+  'LH13381',
+  'LH15346',
+  'LH13771',
+  'LH09605',
+  'LH11936',
+  
+  
+  # neg
+  'LH03270',
+  'LH00068',
+  'LH08375',
+  'LH14510',
+  'LH15678',
+  'LH15024',
+  
+  # fig 2
+  'LH13552')
+
+lncrna_neighbor_hits_diff <- neighbor_integration %>% filter(full_status == 'Neighbor hit' | locus_ambiguity == 'Ambiguous', assay == 'Differentiation') %>% pull(feature_id)
+
+volcano_table %>% 
+  filter(library == 'lncRNA',
+         assay == 'Differentiation',
+         !(feature_id %in% lncrna_neighbor_hits_diff)) %>% 
+    figure_volcano(colors = diff_colors, 
+                 top_genes = 0, 
+                 extra_genes = features_to_highlight,
+                 min_segment_length = 0,
+                 box_padding = 0.4,
+                 size = point_size,
+                 alpha = point_alpha,
+                 legend = FALSE) + 
+  ylim(c(0, ymax)) +
+  xlim(xlims)
+  
+
+save_figure(filename = 'Volcano_LD', w = width, h = height, dpi = dpi, directory = 'figures/screen')
+```
+
+```{r}
+volcano_table %>% 
+  filter(library == 'lncRNA',
+         assay == 'Differentiation',
+         !(feature_id %in% lncrna_neighbor_hits_diff)) %>% 
+    figure_volcano(colors = diff_colors, 
+                 top_genes = 0, 
+                 extra_genes = features_to_highlight,
+                 min_segment_length = 0,
+                 box_padding = 0.4,
+                 size = point_size,
+                 alpha = point_alpha,
+                 legend = FALSE,
+                 drop_points = TRUE) + 
+  ylim(c(0, ymax)) +
+  xlim(xlims)
+  
+
+save_figure(filename = 'Volcano_LD_pointless', w = width, h = height, dpi = dpi, directory = 'figures/screen')
+
+volcano_table %>% 
+  filter(library == 'lncRNA',
+         assay == 'Differentiation',
+         !(feature_id %in% lncrna_neighbor_hits_diff)) %>% 
+    figure_volcano(colors = diff_colors, 
+                 top_genes = 0, 
+                 extra_genes = NULL,
+                 min_segment_length = 0,
+                 box_padding = 0.4,
+                 size = point_size,
+                 alpha = point_alpha,
+                 legend = FALSE,
+                 drop_points = FALSE,
+                 cutoff_color = 'transparent') + 
+  ylim(c(0, ymax)) +
+  xlim(xlims)
+  
+
+save_figure(filename = 'Volcano_LD_textless', w = width, h = height, dpi = dpi, directory = 'figures/screen')
+```
+
+Coding prolif
+```{r fig.width=7, fig.height=6}
+features_to_highlight <- c('RAD51',
+                           'CENPE',
+                           'BCL2L1',
+                           'TP53',
+                           'MCM10',
+                           'CDC20',
+                           'POLD3',
+                           'CDC27',
+                           'CDT1',
+                           'WEE1',
+                           'MDM2',
+                           'TOP2A',
+                           'AURKA',
+                           'BRCA2',
+                           'POU5F1',
+                           'DDIT4',
+                           'CDKN1C',
+                           'APC',
+                           'CHEK2',
+                           'BMF',
+                           'BAX')
+
+volcano_table %>% 
+  filter(library == 'Coding',
+         assay == 'Proliferation') %>% 
+  figure_volcano(colors = prolif_colors, 
+                 top_genes = 0, 
+                 extra_genes = features_to_highlight,
+                 min_segment_length = 0,
+                 box_padding = 0.4,
+                 size = point_size,
+                 alpha = point_alpha,
+                 legend = FALSE) + 
+  ylim(c(0, ymax)) +
+  xlim(-3.3, 1.5)
+save_figure(filename = 'Volcano_CP', w = width, h = height, dpi = dpi, directory = 'figures/screen')
+
+```
+
+```{r}
+
+volcano_table %>% 
+  filter(library == 'Coding',
+         assay == 'Proliferation') %>% 
+    figure_volcano(colors = prolif_colors, 
+                 top_genes = 0, 
+                 extra_genes = features_to_highlight,
+                 min_segment_length = 0,
+                 box_padding = 0.4,
+                 size = point_size,
+                 alpha = point_alpha,
+                 drop_points = TRUE,
+                 legend = FALSE) + 
+  ylim(c(0, ymax)) +
+  xlim(-3.3, 1.5)
+save_figure(filename = 'Volcano_CP_pointless', w = width, h = height, dpi = dpi, directory = 'figures/screen')
+
+volcano_table %>% 
+  filter(library == 'Coding',
+         assay == 'Proliferation') %>% 
+    figure_volcano(colors = prolif_colors, 
+                 top_genes = 0, 
+                 extra_genes = NULL,
+                 min_segment_length = 0,
+                 box_padding = 0.4,
+                 size = point_size,
+                 alpha = point_alpha,
+                 drop_points = FALSE,
+                 legend = FALSE,
+                 cutoff_color = 'transparent') + 
+  ylim(c(0, ymax)) +
+  xlim(-3.3, 1.5)
+save_figure(filename = 'Volcano_CP_textless', w = width, h = height, dpi = dpi, directory = 'figures/screen')
+```
+
+
+```{r}
+neighbor_integration %>% arrange(-score) %>% filter(assay == 'Proliferation', library == 'lncRNA', locus_ambiguity == 'Non-ambiguous')
+```
+lncRNA prolif
+```{r fig.width=7, fig.height=6}
+features_to_highlight <- c('LH09133',
+                           'LH10879',
+                           'LH04790',
+                           'LH07886',
+                           'LH10547',
+                           'LH00799',
+                           'LH04267',
+                           'LH15312')
+
+lncrna_neighbor_hits_prol <- neighbor_integration %>% filter(full_status == 'Neighbor hit' | locus_ambiguity == 'Ambiguous', assay == 'Proliferation') %>% pull(feature_id)
+
+volcano_table %>% 
+  filter(library == 'lncRNA',
+         assay == 'Proliferation',
+         !(feature_id %in% lncrna_neighbor_hits_prol)) %>% 
+    figure_volcano(colors = prolif_colors, 
+                 top_genes = 0, 
+                 extra_genes = features_to_highlight,
+                 min_segment_length = 0,
+                 box_padding = 0.4,
+                 size = point_size,
+                 alpha = point_alpha,
+                 legend = FALSE) + 
+  ylim(c(0, ymax)) +
+  xlim(-3.3, 1.5)
+save_figure(filename = 'Volcano_LP', w = width, h = height, dpi = dpi, directory = 'figures/screen')
+
+```
+```{r}
+volcano_table %>% 
+  filter(library == 'lncRNA',
+         assay == 'Proliferation',
+         !(feature_id %in% lncrna_neighbor_hits_prol)) %>% 
+    figure_volcano(colors = prolif_colors, 
+                 top_genes = 0, 
+                 extra_genes = features_to_highlight,
+                 min_segment_length = 0,
+                 box_padding = 0.4,
+                 size = point_size,
+                 alpha = point_alpha,
+                 drop_points = TRUE,
+                 legend = FALSE) + 
+  ylim(c(0, ymax)) +
+  xlim(-3.3, 1.5)
+save_figure(filename = 'Volcano_LP_pointless', w = width, h = height, dpi = dpi, directory = 'figures/screen')
+
+volcano_table %>% 
+  filter(library == 'lncRNA',
+         assay == 'Proliferation',
+         !(feature_id %in% lncrna_neighbor_hits_prol)) %>% 
+    figure_volcano(colors = prolif_colors, 
+                 top_genes = 0, 
+                 extra_genes = NULL,
+                 min_segment_length = 0,
+                 box_padding = 0.4,
+                 size = point_size,
+                 alpha = point_alpha,
+                 drop_points = FALSE,
+                 legend = FALSE,
+                 cutoff_color = 'transparent') + 
+  ylim(c(0, ymax)) +
+  xlim(-3.3, 1.5)
+save_figure(filename = 'Volcano_LP_textless', w = width, h = height, dpi = dpi, directory = 'figures/screen')
+```
+
+
+```{r}
+color_scheme <- c(few_pal()(2), 'grey80')
+```
+
+```{r fig.width=7}
+neighbor_integration %>% 
+  filter(assay == 'Differentiation',
+         library == 'Coding') %>% 
+  mutate(colors = ifelse(status == 'Non-hit', 'Non-hit', library),
+         facets = ifelse(status == 'Non-hit', 'Non-hit', direction)) %>% 
+  select(library, pheno, colors, facets, status) %>% unique() %>% 
+  ggplot(aes(x = pheno, fill = status)) + 
+  geom_density(alpha = 0.6, position = 'identity') +
+  scale_fill_manual(values = color_scheme[c(1,3)]) +
+  theme_publication(grid = F, legend = FALSE) + 
+  theme(axis.ticks = element_line()) +
+  labs(x = '', y = '', title = 'Differentiation') +
+  facet_wrap(~colors, ncol = 1, scales = 'free_y') +
+  xlim(xlims)
+
+save_figure(filename = 'effectsize_hist_diff_coding', directory = 'figures/screen', dpi = dpi, w = width, )
+```
+
+```{r fig.width=7}
+neighbor_integration %>% 
+  filter(assay == 'Differentiation',
+         library == 'lncRNA',
+         locus_ambiguity == 'Non-ambiguous',
+         full_status != 'Neighbor hit') %>% 
+  mutate(colors = ifelse(status == 'Non-hit', 'Non-hit', library),
+         facets = ifelse(status == 'Non-hit', 'Non-hit', direction)) %>% 
+  select(library, pheno, colors, facets, status) %>% unique() %>% 
+  ggplot(aes(x = pheno, fill = status)) + 
+  geom_density(bins = 100, alpha = 0.6, position = 'identity') +
+  scale_fill_manual(values = color_scheme[c(1,3)]) +
+  theme_publication(grid = F, legend = FALSE) + 
+  theme(axis.ticks = element_line()) +
+  labs(x = '', y = '', title = 'Differentiation') +
+  facet_wrap(~colors, ncol = 1, scales = 'free_y') +
+  xlim(xlims)
+
+save_figure(filename = 'effectsize_hist_diff_lncRNA', directory = 'figures/screen', dpi = dpi, w = width)
+```
+
+```{r fig.width=7}
+neighbor_integration %>% 
+  filter(assay == 'Proliferation',
+         library == 'Coding',
+         full_status == 'Hit') %>% 
+  mutate(colors = ifelse(status == 'Non-hit', 'Non-hit', library),
+         facets = ifelse(status == 'Non-hit', 'Non-hit', direction)) %>% 
+  select(library, pheno, colors, facets, status) %>% unique() %>% 
+  ggplot(aes(x = pheno, fill = status)) + 
+  geom_density(bins = 100, alpha = 0.6, position = 'identity') +
+  scale_fill_manual(values = color_scheme[c(2,3)]) +
+  theme_publication(grid = F, legend = FALSE) + 
+  theme(axis.ticks = element_line()) +
+  xlim(-3.3, 1.5) +
+  labs(x = '', y = '', title = 'Proliferation') +
+  facet_wrap(~colors, ncol = 1, scales = 'free_y')
+
+save_figure(filename = 'effectsize_hist_prolif_coding', directory = 'figures/screen', w = width)
+```
+
+
+```{r fig.height=8, fig.width=10}
+neighbor_integration %>% 
+  filter(full_status != 'Neighbor hit') %>% 
+  select(feature_id, assay, library, pheno, primary_pheno) %>% 
+  pivot_wider(names_from = assay, values_from = pheno) %>% 
+  mutate(status = ifelse(primary_pheno == 'None', 'Non-hit', 'Hit'),
+         primary_pheno = case_when(
+           primary_pheno == 'Differentiation' ~ 'Differentiation hit',
+           primary_pheno == 'Proliferation' ~ 'Proliferation hit',
+           primary_pheno == 'Dual' ~ 'Dual hit',
+           primary_pheno == 'None' ~ 'Non-hit'),
+         primary_pheno = factor(primary_pheno, levels = c('Differentiation hit', 
+                                                          'Proliferation hit',
+                                                          'Dual hit',
+                                                          'Non-hit'))) %>% 
+  ggplot(aes(x = Differentiation, y = Proliferation, color = primary_pheno)) + 
+  geom_point(alpha = 0.25) +
+  scale_color_manual(values = c( 'dodgerblue4', 'orangered','darkorchid4', 'grey80')) +
+  xlim(c(-3, 3)) +
+  ylim(c(-3, 1)) + 
+  scale_x_continuous(breaks = seq(-3, 3, by = 1)) + 
+  theme_publication(legend = TRUE) +
+  facet_wrap(~status + library)
+
+save_figure(filename = 'pheno_scatter', directory = 'figures/screen', w = 10, h = 8)
+```
+
+```{r, fig.height=5, fig.width=10}
+df_input <- neighbor_integration %>% 
+  filter(group == 'Gene') %>% 
+  select(feature_id, assay, library, pheno, primary_pheno) %>% 
+  pivot_wider(names_from = assay, values_from = pheno) %>% 
+  mutate(status = ifelse(primary_pheno == 'None', 'Non-hit', 'Hit'),
+         primary_pheno = case_when(
+           primary_pheno == 'Differentiation' ~ 'Differentiation hit',
+           primary_pheno == 'Proliferation' ~ 'Proliferation hit',
+           primary_pheno == 'Dual' ~ 'Dual hit',
+           primary_pheno == 'None' ~ 'Non-hit'),
+         primary_pheno = ordered(primary_pheno, levels = c('Differentiation hit', 
+                                                           'Proliferation hit',
+                                                           'Dual hit',
+                                                           'Non-hit'))) %>% 
+  arrange(primary_pheno)
+
+neighbor_hits <- neighbor_integration %>% filter(full_status == 'Neighbor hit') %>% pull(feature_id)
+
+df_input %>% filter(primary_pheno == 'Non-hit') %>% 
+  ggplot(aes(x = Differentiation, y = Proliferation, color = primary_pheno)) + 
+  geom_point(alpha = 0.25, color = 'grey90', size = 1) +
+  geom_point(data = df_input %>% filter(primary_pheno != 'Non-hit', !(feature_id %in% neighbor_hits)),
+             alpha = 0.25) + 
+  scale_color_manual(values = c('dodgerblue4', 'orangered','darkorchid4', 'grey90')) +
+  ylim(c(-3.3, 1.5)) +
+  scale_x_continuous(breaks = seq(-3, 3, by = 1), limits = c(-3, 3)) + 
+  theme_publication(legend = FALSE) +
+  # geom_hline(yintercept = 0, linetype = 'dashed', color = 'grey50') +
+  # geom_vline(xintercept = 0, linetype = 'dashed', color = 'grey50') +
+  coord_equal() +
+  coord_flip() +
+  facet_wrap(~library)
+
+save_figure(filename = 'pheno_scatter', directory = 'figures/screen', w = width*2, h = 5)
+
+
+df_input %>% filter(primary_pheno == 'Non-hit') %>% 
+  ggplot(aes(x = Differentiation, y = Proliferation, color = primary_pheno)) + 
+  ylim(c(-3.3, 1.5)) +
+  scale_x_continuous(breaks = seq(-3, 3, by = 1), limits = c(-3, 3)) + 
+  theme_publication(legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = 'dashed', color = 'grey50') +
+  geom_vline(xintercept = 0, linetype = 'dashed', color = 'grey50') +
+  coord_equal() +
+  coord_flip() +
+  facet_wrap(~library)
+
+
+save_figure(filename = 'pheno_scatter_pointless', directory = 'figures/screen', w = width*2, h = 5)
+
+```
+
+## Symmetric coordinates
+### Density
+```{r fig.width=3, fig.height = 1}
+all_lims <- c(-3.3, 3.3)
+width <- 5
+height <- 1.5
+
+neighbor_integration %>% 
+  filter(assay == 'Proliferation',
+         library == 'Coding',
+         full_status == 'Hit') %>% 
+  mutate(colors = ifelse(status == 'Non-hit', 'Non-hit', library),
+         facets = ifelse(status == 'Non-hit', 'Non-hit', direction)) %>% 
+  select(library, pheno, colors, facets, status) %>% unique() %>% 
+  ggplot(aes(x = pheno, fill = status)) + 
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = color_scheme[c(2,3)]) +
+  theme_publication(grid = F, legend = FALSE) + 
+  theme(axis.ticks = element_line()) +
+  xlim(all_lims) +
+  scale_y_continuous(breaks = c(0, 0.5, 1), limits = c(0, 1)) +
+  labs(x = '', y = '')
+
+save_figure(filename = 'effectsize_hist_prolif_coding_balanced', directory = 'figures/screen', w = width, h = height)
+```
+```{r fig.width=7, fig.height = 2}
+neighbor_integration %>% 
+  filter(assay == 'Proliferation',
+         library == 'lncRNA',
+         locus_ambiguity == 'Non-ambiguous',
+         full_status == 'Hit') %>% 
+  mutate(colors = ifelse(status == 'Non-hit', 'Non-hit', library),
+         facets = ifelse(status == 'Non-hit', 'Non-hit', direction)) %>% 
+  select(library, pheno, colors, facets, status) %>% unique() %>% 
+  ggplot(aes(x = pheno, fill = status)) + 
+  geom_density(adjust = 0.5, alpha = 0.6) +
+  scale_fill_manual(values = color_scheme[c(2,3)]) +
+  theme_publication(grid = F, legend = FALSE) + 
+  theme(axis.ticks = element_line()) +
+  labs(x = '', y = '') +
+  xlim(all_lims) +
+  scale_y_continuous(breaks = c(0, 0.5, 1), limits = c(0, 1.2))
+
+save_figure(filename = 'effectsize_hist_prolif_lncrna_balanced', directory = 'figures/screen', w = width, h = height)
+```
+```{r fig.width=7, fig.height = 1.75}
+neighbor_integration %>% 
+  filter(assay == 'Differentiation',
+         library == 'Coding',
+         full_status == 'Hit') %>% 
+  mutate(colors = ifelse(status == 'Non-hit', 'Non-hit', library),
+         facets = ifelse(status == 'Non-hit', 'Non-hit', direction)) %>% 
+  select(library, pheno, colors, facets, status) %>% unique() %>% 
+  ggplot(aes(x = pheno, fill = status)) + 
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = color_scheme[c(1,3)]) +
+  theme_publication(grid = F, legend = FALSE) + 
+  theme(axis.ticks = element_line()) +
+  xlim(all_lims) +
+  scale_y_continuous(breaks = c(0, 0.5), limits = c(0, 0.6)) +
+  labs(x = '', y = '')
+
+save_figure(filename = 'effectsize_hist_diff_coding_balanced', directory = 'figures/screen', w = width, h = height)
+```
+```{r fig.width=7, fig.height = 2}
+neighbor_integration %>% 
+  filter(assay == 'Differentiation',
+         library == 'lncRNA',
+         full_status == 'Hit',
+         locus_ambiguity == 'Non-ambiguous') %>% 
+  mutate(colors = ifelse(status == 'Non-hit', 'Non-hit', library),
+         facets = ifelse(status == 'Non-hit', 'Non-hit', direction)) %>% 
+  select(library, pheno, colors, facets, status) %>% unique() %>% 
+  ggplot(aes(x = pheno, fill = status)) + 
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = color_scheme[c(1,3)]) +
+  theme_publication(grid = F, legend = FALSE) + 
+  theme(axis.ticks = element_line()) +
+  labs(x = '', y = '') +
+  scale_y_continuous(breaks = c(0, 0.5, 1, 1.5, 2), limits = c(0, 2.2)) +
+  xlim(all_lims)
+
+save_figure(filename = 'effectsize_hist_diff_lncrna_balanced', directory = 'figures/screen', w = width, h = height)
+```
+### Scatter
+```{r, fig.height=4, fig.width=10}
+
+df_input <- neighbor_integration %>% 
+  filter(library == 'Coding' | locus_ambiguity == 'Non-ambiguous') %>% 
+  select(feature_id, assay, library, pheno, primary_pheno) %>% 
+  pivot_wider(names_from = assay, values_from = pheno) %>% 
+  mutate(status = ifelse(primary_pheno == 'None', 'Non-hit', 'Hit'),
+         primary_pheno = case_when(
+           primary_pheno == 'Differentiation' ~ 'Differentiation hit',
+           primary_pheno == 'Proliferation' ~ 'Proliferation hit',
+           primary_pheno == 'Dual' ~ 'Dual hit',
+           primary_pheno == 'None' ~ 'Non-hit'),
+         primary_pheno = ordered(primary_pheno, levels = c('Differentiation hit', 
+                                                           'Proliferation hit',
+                                                           'Dual hit',
+                                                           'Non-hit'))) %>% 
+  arrange(primary_pheno)
+
+neighbor_hits <- neighbor_integration %>% filter(full_status == 'Neighbor hit') %>% pull(feature_id)
+
+df_input %>% filter(primary_pheno == 'Non-hit') %>% 
+  ggplot(aes(x = Differentiation, y = Proliferation, color = primary_pheno)) + 
+  geom_point(alpha = 0.25, color = 'grey90', size = 1) +
+  geom_point(data = df_input %>% filter(primary_pheno != 'Non-hit', !(feature_id %in% neighbor_hits)),
+             alpha = 0.25) + 
+  scale_color_manual(values = c('dodgerblue4', 'orangered','darkorchid4', 'grey90')) +
+  scale_x_continuous(breaks = seq(-3, 3, by = 1), limits = c(-3.1, 3.1)) + 
+  scale_y_continuous(breaks = seq(-3, 3, by = 1), limits = c(-3.1, 3.1)) + 
+  theme_publication(legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~library)
+
+save_figure(filename = 'pheno_scatter_balanced', device = 'png', directory = 'figures/screen', w = width*2, h = width * 0.8)
+
+df_input %>% filter(primary_pheno == 'Non-hit') %>% 
+  ggplot(aes(x = Differentiation, y = Proliferation, color = primary_pheno)) + 
+  scale_x_continuous(breaks = seq(-3, 3, by = 1), limits = c(-3.1, 3.1)) + 
+  scale_y_continuous(breaks = seq(-3, 3, by = 1), limits = c(-3.1, 3.1)) + 
+  theme_publication(legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = 'dashed', color = 'grey50') +
+  geom_vline(xintercept = 0, linetype = 'dashed', color = 'grey50') +
+  coord_flip() +
+  facet_wrap(~library)
+
+
+save_figure(filename = 'pheno_scatter_balanced_pointless', device = 'pdf', directory = 'figures/screen', w = width*2, h = width * 0.8)
+
+```
+
+
+## Select dual hits
+```{r}
+df_input %>% 
+  filter(primary_pheno == 'Dual hit', !(feature_id %in% neighbor_hits)) %>% 
+  ggplot(aes(x = Proliferation, y = Differentiation)) +
+  geom_point(alpha = 0.25,
+             color = 'darkorchid4') + 
+  geom_text_repel(data = df_input %>% filter(feature_id %in% c('POU5F1')),
+                  aes(label = feature_id),
+                  nudge_x = -1,
+                  nudge_y = 1) +
+  geom_text_repel(data = df_input %>% filter(feature_id %in% c('APC')),
+                  aes(label = feature_id),
+                  nudge_x = 1,
+                  nudge_y = -0.25) +
+    geom_text_repel(data = df_input %>% filter(feature_id %in% c('CHEK1')),
+                  aes(label = feature_id),
+                  nudge_x = -1,
+                  nudge_y = -1) +
+  ylim(c(-3.3, 3.3)) +
+  scale_x_continuous(breaks = seq(-3, 3, by = 1), limits = c(-3, 3)) + 
+  geom_hline(yintercept = 0, linetype = 'dashed', color = 'grey50') +
+  geom_vline(xintercept = 0, linetype = 'dashed', color = 'grey50') +
+  theme_publication(legend = FALSE) +
+  coord_equal()
+
+save_figure(filename = 'pheno_scatter_dual', directory = 'figures/screen', w = width/2, h = width/2)
+```
+
+## Venn diagram
+
+```{r}
+cd <- neighbor_integration %>% filter(full_status == 'Hit', library == 'Coding', assay == 'Differentiation') %>% pull(feature_id)
+cp <- neighbor_integration %>% filter(full_status == 'Hit', library == 'Coding', assay == 'Proliferation') %>% pull(feature_id)
+ld <- neighbor_integration %>% filter(full_status == 'Hit', library == 'lncRNA', locus_ambiguity == 'Non-ambiguous', assay == 'Differentiation') %>% pull(feature_id)
+lp <- neighbor_integration %>% filter(full_status == 'Hit', library == 'lncRNA', locus_ambiguity == 'Non-ambiguous', assay == 'Proliferation') %>% pull(feature_id)
+```
+
+Save manually
+```{r}
+p <- plot(euler(list(
+                'CD' = cd,
+                'CP' = cp,
+                'LD' = ld,
+                'LP' = lp)),
+          quantities = TRUE,
+          fill = c('dodgerblue4', 'orangered', 'dodgerblue4', 'orangered'), alpha = 0.8)
+
+
+pdf(file = 'figures/screen/hits_venn.pdf')
+p
+dev.off()
+p
+```
+
+### Permutations
+```{r}
+permutations_phenotype <- read_tsv('analysis/screen/output/007_permutation_testing/permutations_phenotype.tsv.gz')
+permutations_direction <- read_tsv('analysis/screen/output/007_permutation_testing/permutations_direction.tsv.gz')
+```
+
+Plot distributions
+```{r}
+bins <- 1000
+alpha <- 0.5
+
+coding <- permutations_phenotype %>% 
+  ggplot(aes(x = Coding_DP_Ratio)) +
+  geom_histogram(bins = bins, alpha = alpha) +
+  xlim(c(0, 10)) + 
+  labs(subtitle = 'Coding Hit Permutations',
+       x = 'Differentiation:Proliferation Hit Ratio',
+       y = 'Frequency')
+
+lncrna <- permutations_phenotype %>% 
+  ggplot(aes(x = lncRNA_DP_Ratio)) +
+  geom_histogram(bins = bins, alpha = alpha) +
+  xlim(c(0, 10)) + 
+  labs(subtitle = 'lncRNA Hit Permutations',
+       x = 'Differentiation:Proliferation Hit Ratio',
+       y = 'Frequency')
+
+coding_lncrna <- permutations_phenotype %>% 
+  ggplot(aes(x = lncRNA_Coding_Ratio)) +
+  geom_histogram(bins = bins, alpha = alpha) +
+  xlim(c(0, 10)) + 
+  labs(subtitle = '',
+       x = 'lncRNA:Coding Combined Ratio',
+       y = 'Frequency')
+
+combined <- coding / lncrna / coding_lncrna
+
+combined
+
+save_figure(filename = 'Permutation', w = 6, h = 8, dpi = 300, directory = 'figures/screen')
+```
+
+
+
+#### Log
+```{r}
+bins <- 50
+alpha <- 0.5
+
+coding <- permutations_phenotype %>% 
+  ggplot(aes(x = log2(Coding_DP_Ratio))) +
+  geom_histogram(bins = bins, alpha = alpha) +
+  labs(subtitle = 'Coding Hit Permutations',
+       x = 'log2 Differentiation:Proliferation Hit Ratio',
+       y = 'Frequency')
+
+lncrna <- permutations_phenotype %>% 
+  ggplot(aes(x = log2(lncRNA_DP_Ratio))) +
+  geom_histogram(bins = bins, alpha = alpha) +
+  labs(subtitle = 'lncRNA Hit Permutations',
+       x = 'log2 Differentiation:Proliferation Hit Ratio',
+       y = 'Frequency')
+
+coding_lncrna <- permutations_phenotype %>% 
+  ggplot(aes(x = log2(lncRNA_Coding_Ratio))) +
+  geom_histogram(bins = bins, alpha = alpha) +
+  labs(subtitle = '',
+       x = 'log2 lncRNA:Coding Combined Ratio',
+       y = 'Frequency')
+
+combined <- coding / lncrna / coding_lncrna
+
+combined
+
+save_figure(filename = 'Permutation_log2', w = 8, h = 8, dpi = 300, directory = 'figures/screen')
+```
+```{r}
+permutations_direction %>% filter(abs(Coding_Hit_ratio) > (218/(201))) %>% nrow()
+```
+
+## KS test for difference in phenotype distributions
+Differentiation distributions are significantly different (p < 2.2 x 10%-16)
+```{r}
+coding_differentiation_phenos <- neighbor_integration %>% filter(library == 'Coding', full_status == 'Hit', assay == 'Differentiation') %>% pull(pheno) 
+lncrna_differentiation_phenos <- neighbor_integration %>% filter(library == 'lncRNA', full_status == 'Hit', assay == 'Differentiation') %>% pull(pheno) 
+
+ks.test(coding_differentiation_phenos,
+        lncrna_differentiation_phenos)
+
+plot(ecdf(coding_differentiation_phenos),  
+     col = "blue") 
+plot(ecdf(lncrna_differentiation_phenos),  
+     add = TRUE,  
+     lty = "dashed", 
+     col = "red") 
+```
+
+Proliferation is not significant p = 0.193
+```{r}
+coding_proliferation_phenos <- neighbor_integration %>% filter(library == 'Coding', full_status == 'Hit', assay == 'Proliferation') %>% pull(pheno)
+lncrna_proliferation_phenos <- neighbor_integration %>% filter(library == 'lncRNA', full_status == 'Hit', assay == 'Proliferation', locus_ambiguity == 'Non-ambiguous') %>% pull(pheno)
+
+ks.test(coding_proliferation_phenos,
+        lncrna_proliferation_phenos)
+
+plot(ecdf(coding_proliferation_phenos),  
+     col = "blue") 
+plot(ecdf(lncrna_proliferation_phenos),  
+     add = TRUE,  
+     lty = "dashed", 
+     col = "red") 
+```
+
+
+
+## Validation plot
+```{r}
+validation <- read_csv('analysis/screen/input/20180928_validation.csv') %>% mutate(library = ifelse(library == 'crincl', 'lncRNA', 'Coding'))
+
+validation <- validation %>% filter(bfp > 10) # only count conditions with at least 10% sgRNA positivity
+
+genes <- validation$gene %>% unique()
+
+res_table <- screen_results %>% 
+  filter(assay == 'Differentiation') %>% 
+  select(gene = feature_id, gene_name, screen_pheno = pheno, score, legend, group, status) %>% 
+  unique() %>% 
+  inner_join(validation) %>% 
+  mutate(rep = ifelse(str_detect(grna, '1F'), 1, 2))
+
+res_merge <- res_table %>% 
+  group_by(gene, gene_name, grna, rep) %>% 
+  summarize(mean_screen_pheno = mean(screen_pheno),
+            mean_log2_pheno = mean(log2_pheno)) %>% 
+  ungroup() 
+  
+
+# Calculate correlation
+cor(res_merge$mean_screen_pheno, res_merge$mean_log2_pheno, method = 'pearson')
+
+# Figure
+
+p_val <- res_table %>% 
+  ggplot(aes(x = screen_pheno, y = log2_pheno, label = gene_name, color = gene_name)) + 
+  geom_smooth(method = 'lm', se = F, color = 'grey50') + 
+  #geom_text_repel() +
+  geom_jitter(
+    size = 2, 
+    alpha = 0.5) + 
+  ggtitle('Individual Validation of 32 sgRNAs') + 
+  #scale_color_manual(values = carto_pal(n = 16, 'Bold')) + 
+  xlab('Screen phenotype') + 
+  ylab('Validation phenotype') + 
+  theme_publication(legend = TRUE, grid = TRUE) + 
+  theme(axis.title = element_text(size = 14), 
+        plot.title = element_text(size = 14, face = 'plain'),
+        axis.text = element_text(size = 12), 
+        panel.grid.major = element_blank()) + 
+  xlim(c(-2,2)) +
+  ylim(c(-2,2)) +
+  coord_equal()
+save_figure(plot = p_val, filename = 'validation_scatter', directory = 'figures/screen', w = 6, h = 5)
+p_val
+```
+```{r}
+p_val <- res_table %>% 
+  ggplot(aes(x = screen_pheno, y = log2_pheno, label = gene_name, color = gene_name)) + 
+  geom_smooth(method = 'lm', se = F, color = 'grey50') + 
+  geom_text_repel(max.overlaps = Inf) +
+  geom_jitter(
+    size = 2, 
+    alpha = 0.5) + 
+  ggtitle('Individual Validation of 32 sgRNAs') + 
+  #scale_color_manual(values = carto_pal(n = 16, 'Bold')) + 
+  xlab('Screen phenotype') + 
+  ylab('Validation phenotype') + 
+  theme_publication(legend = TRUE, grid = TRUE) + 
+  theme(axis.title = element_text(size = 14), 
+        plot.title = element_text(size = 14, face = 'plain'),
+        axis.text = element_text(size = 12), 
+        panel.grid.major = element_blank()) + 
+  xlim(c(-2,2)) +
+  ylim(c(-2,2)) +
+  coord_equal()
+save_figure(plot = p_val, filename = 'validation_scatter_labels', directory = 'figures/screen', w = 6, h = 5)
+p_val
+```
+
+
+
+## Replicate plots
+```{r, fig.height=8, fig.width=8}
+results <- read_rds('analysis/screen/output/005_fdr/results.rds')
+```
+
+
+```{r, fig.height=4, fig.width=4}
+replicate_plot <- function(input_table,
+                          x,
+                          y,
+                          color = NULL,
+                          xlab = x,
+                          ylab = y,
+                          log_transform = F,
+                          pseudocount = 1,
+                          log_scale = F,
+                          title = '',
+                          point_size = 1,
+                          point_alpha = 'auto',
+                          point_color = 'steelblue',
+                          identity_line = TRUE,
+                          line_size = 1,
+                          line_type = 'dashed',
+                          line_color = 'grey50',
+                          line_alpha = 1,
+                          xlims = NULL,
+                          ylims = NULL,
+                          xbreaks = NULL,
+                          ybreaks = NULL,
+                          correlation = TRUE,
+                          coord_equal = TRUE,
+                          drop_points = FALSE) {
+  
+  table_subset <- input_table %>% select(one_of(x, y, color))
+  
+  if(is.null(color)) {
+    colnames(table_subset) <- c('X', 'Y')
+  } else {
+    colnames(table_subset) <- c('X', 'Y', 'Color')
+  }
+  
+  
+  if(log_transform) {
+    table_subset <- table_subset %>% mutate_all(function(i) {log10(i + pseudocount)}) %>% filter(is.finite(X), is.finite((Y)))
+  }
+  
+  if (point_alpha == 'auto') {
+    point_alpha <- 100*sqrt(point_size)/sqrt(nrow(table_subset)) 
+  }
+  
+  if(correlation) {
+    if(log_scale) {
+      correlation_subset <- table_subset %>% mutate_all(function(i) {log10(i + pseudocount)}) %>% filter(is.finite(X), is.finite((Y)))
+    } else {
+      correlation_subset <- table_subset %>% drop_na()
+    }
+    r <- round(cor(correlation_subset$X, correlation_subset$Y, use = 'complete.obs'), 3)
+    
+  }
+  
+  if(drop_points) {
+    p <- table_subset %>% 
+      ggplot(aes(x = X,
+                 y = Y))
+    
+  } else {
+    if(is.null(color)) {
+    p <- table_subset %>% 
+      ggplot(aes(x = X,
+                 y = Y)) + 
+      geom_point(size = point_size,
+                 alpha = point_alpha,
+                 color = point_color) 
+    
+  } else {
+    p <- table_subset %>% 
+      ggplot(aes(x = X,
+                 y = Y,
+                 color = Color)) +
+      geom_point(size = point_size,
+                 alpha = point_alpha) 
+  }
+  }
+  
+  
+  
+  if(coord_equal) {
+    p <- p + coord_equal()  
+  }
+  
+  if(log_scale) {
+    if(is.null(xbreaks)) {
+      p <- p + 
+        scale_x_log10(limits = xlims) 
+    } else {
+      p <- p + 
+        scale_x_log10(limits = xlims, breaks = xbreaks) 
+    }
+    if(is.null(ybreaks)) {
+      p <- p + 
+        scale_y_log10(limits = ylims) 
+    } else {
+      p <- p + 
+        scale_y_log10(limits = ylims, breaks = ybreaks) 
+    }
+  } else {
+    if(is.null(xbreaks)) {
+      p <- p + 
+        scale_x_continuous(limits = xlims) 
+    } else {
+      p <- p + 
+        scale_x_continuous(limits = xlims, breaks = xbreaks) 
+    }
+    if(is.null(ybreaks)) {
+      p <- p + 
+        scale_y_continuous(limits = ylims) 
+    } else {
+      p <- p + 
+        scale_y_continuous(limits = ylims, breaks = ybreaks) 
+    }
+  }
+  if(identity_line) {
+    p <- p + geom_abline(slope = 1, linetype = line_type, color = line_color, alpha = line_alpha, size = line_size)
+  }
+  
+  p <- p + theme_publication(grid = F) +
+    labs(title = title,
+         subtitle = paste('Pearson r =', r),
+         x = xlab,
+         y = ylab) +
+    theme(plot.title = element_text(face = 'plain', size = rel(1)),
+          axis.title = element_text(size = rel(0.8)),
+          plot.subtitle = element_text(hjust = 0.5, size = rel(0.8)))
+  
+    p
+}
+```
+
+
+```{r, fig.height=6, fig.width=6}
+counts_point_color <- 'steelblue'
+counts_point_alpha <- 0.5
+counts_line_alpha <- 1
+counts_line_size <- 1
+counts_line_color <- 'grey50'
+counts_xlims <- c(0, 2.6)
+counts_ylims <- counts_xlims
+
+pheno_point_alpha <- counts_point_alpha
+pheno_line_alpha <- counts_line_alpha
+pheno_line_size <- counts_line_size
+pheno_line_color <- counts_line_color
+pheno_xlims <- c(-3, 3)
+pheno_ylims <- pheno_xlims
+
+dpi <- 600
+figure_width <- 6
+figure_height <- 6
+
+# save with and without points for vector plots
+map(c(TRUE, FALSE), function(points) {
+  
+  if(points) {
+    device <- 'pdf'
+  } else {
+    device <- 'png'
+    counts_line_color <- 'transparent'
+    counts_line_alpha <- 0
+    pheno_line_color <- 'transparent'
+    pheno_line_alpha <- 0
+  }
+  
+  coding_1 <- results$Differentiation$replicates$Coding$counts %>% 
+    replicate_plot(x = 'Sample1_Rep1',
+                   y = 'Sample1_Rep2',
+                   xlab = expression(atop('log10 CPM + 1', 'Replicate 1')),
+                   ylab = expression(atop('Replicate 2', 'log10 CPM + 1')),
+                   title = 'Positive fraction',
+                   correlation = TRUE,
+                   identity_line = TRUE, 
+                   log_transform = TRUE,
+                   point_color = counts_point_color,
+                   point_alpha = counts_point_alpha,
+                   line_alpha = counts_line_alpha,
+                   line_size = counts_line_size,
+                   line_color = counts_line_color,
+                   xlims = counts_xlims,
+                   ylims = counts_ylims,
+                   drop_points = points)
+  
+  coding_2 <- results$Differentiation$replicates$Coding$counts %>% 
+    replicate_plot(x = 'Sample2_Rep1',
+                   y = 'Sample2_Rep2',
+                   xlab = expression(atop('log10 CPM + 1', 'Replicate 1')),
+                   ylab = expression(atop('Replicate 2', 'log10 CPM + 1')),
+                   title = 'Negative fraction',
+                   correlation = TRUE,
+                   identity_line = TRUE, 
+                   log_transform = TRUE,
+                   point_color = counts_point_color,
+                   point_alpha = counts_point_alpha,
+                   line_alpha = counts_line_alpha,
+                   line_size = counts_line_size,
+                   line_color = counts_line_color,
+                   xlims = counts_xlims,
+                   ylims = counts_ylims,
+                   drop_points = points)
+  
+  coding_pheno <- results$Differentiation$replicates$Coding$screen_table %>% 
+    replicate_plot(x = 'rep1_pheno',
+                   y = 'rep2_pheno',
+                   xlab = expression(atop('Phenotype', 'Replicate 1')),
+                   ylab = expression(atop('Replicate 2', 'Phenotype')),
+                   title = 'Phenotype',
+                   correlation = TRUE, 
+                   log_transform = FALSE,
+                   point_color = counts_point_color,
+                   point_alpha = pheno_point_alpha,
+                   line_alpha = pheno_line_alpha,
+                   line_size = pheno_line_size,
+                   line_color = pheno_line_color,
+                   xlims = pheno_xlims,
+                   ylims = pheno_ylims,
+                   drop_points = points)
+  
+  
+  coding_score <- results$Differentiation$replicates$Coding$screen_table %>% 
+    replicate_plot(x = 'rep1_score',
+                   y = 'rep2_score',
+                   xlab = expression(atop('Screen score', 'Replicate 1')),
+                   ylab = expression(atop('Replicate 2', 'Screen score')),
+                   title = 'Score',
+                   correlation = TRUE, 
+                   log_transform = FALSE,
+                   point_color = counts_point_color,
+                   point_alpha = pheno_point_alpha,
+                   line_alpha = pheno_line_alpha,
+                   line_size = pheno_line_size,
+                   line_color = pheno_line_color,
+                   xlims = c(0, 55),
+                   ylims = c(0, 55),
+                   drop_points = points)
+  
+  combined <- coding_1 + coding_2 + coding_pheno + coding_score + plot_layout(nrow = 2)
+  
+  
+  save_figure(plot = combined,
+              filename = 'Replicate_Coding_Differentiation',
+              directory = 'figures/screen',
+              device = device,
+              dpi = 600,
+              h = figure_height,
+              w = figure_width)
+  
+  combined
+})
+
+
+```
+
+
+```{r, fig.height=6, fig.width=6}
+map(c(TRUE, FALSE), function(points) {
+  
+  if(points) {
+    device <- 'pdf'
+  } else {
+    device <- 'png'
+    counts_line_color <- 'transparent'
+    counts_line_alpha <- 0
+    pheno_line_color <- 'transparent'
+    pheno_line_alpha <- 0
+  }
+  
+  
+  
+  
+lncrna_1 <- bind_rows(results$Differentiation$replicates$CRiNCL$counts,
+                      results$Differentiation$replicates$Common$counts) %>% 
+  replicate_plot(x = 'Sample1_Rep1',
+                 y = 'Sample1_Rep2',
+                 xlab = expression(atop('log10 CPM + 1', 'Replicate 1')),
+                 ylab = expression(atop('Replicate 2', 'log10 CPM + 1')),
+                 title = 'Positive fraction',
+                 correlation = TRUE,
+                 identity_line = TRUE, 
+                 log_transform = TRUE,
+                 point_color = counts_point_color,
+                 point_alpha = counts_point_alpha,
+                 line_alpha = counts_line_alpha,
+                 line_size = counts_line_size,
+                 line_color = counts_line_color,
+                 xlims = counts_xlims,
+                 ylims = counts_ylims,
+                 drop_points = points)
+
+lncrna_2 <- bind_rows(results$Differentiation$replicates$CRiNCL$counts,
+                      results$Differentiation$replicates$Common$counts) %>% 
+  replicate_plot(x = 'Sample2_Rep1',
+                 y = 'Sample2_Rep2',
+                 xlab = expression(atop('log10 CPM + 1', 'Replicate 1')),
+                 ylab = expression(atop('Replicate 2', 'log10 CPM + 1')),
+                 title = 'Negative fraction',
+                 correlation = TRUE,
+                 identity_line = TRUE, 
+                 log_transform = TRUE,
+                 point_color = counts_point_color,
+                 point_alpha = counts_point_alpha,
+                 line_alpha = counts_line_alpha,
+                 line_size = counts_line_size,
+                 line_color = counts_line_color,
+                 xlims = counts_xlims,
+                 ylims = counts_ylims,
+                 drop_points = points)
+
+lncrna_pheno <- bind_rows(results$Differentiation$replicates$CRiNCL$screen_table,
+                          results$Differentiation$replicates$Common$screen_table) %>% 
+  replicate_plot(x = 'rep1_pheno',
+                 y = 'rep2_pheno',
+                 xlab = expression(atop('Phenotype', 'Replicate 1')),
+                 ylab = expression(atop('Replicate 2', 'Phenotype')),
+                 title = 'Phenotype',
+                 correlation = TRUE, 
+                 log_transform = FALSE,
+                 point_color = counts_point_color,
+                 point_alpha = pheno_point_alpha,
+                 line_alpha = pheno_line_alpha,
+                 line_size = pheno_line_size,
+                 line_color = pheno_line_color,
+                 xlims = pheno_xlims,
+                 ylims = pheno_ylims,
+                 drop_points = points)
+  
+lncrna_score <- bind_rows(results$Differentiation$replicates$CRiNCL$screen_table,
+                          results$Differentiation$replicates$Common$screen_table) %>% 
+  replicate_plot(x = 'rep1_score',
+                 y = 'rep2_score',
+                 xlab = expression(atop('Screen score', 'Replicate 1')),
+                 ylab = expression(atop('Replicate 2', 'Screen score')),
+                 title = 'Score',
+                 correlation = TRUE, 
+                 log_transform = FALSE,
+                 point_color = counts_point_color,
+                 point_alpha = pheno_point_alpha,
+                 line_alpha = pheno_line_alpha,
+                 line_size = pheno_line_size,
+                 line_color = pheno_line_color,
+                 xlims = c(0, 125),
+                 ylims = c(0, 125),
+                 drop_points = points)
+
+combined <- lncrna_1 + lncrna_2 + lncrna_pheno + lncrna_score + plot_layout(nrow = 2)
+
+  
+  
+  save_figure(plot = combined,
+              filename = 'Replicate_lncRNA_Differentiation',
+              directory = 'figures/screen',
+              device = device,
+              dpi = 600,
+              h = figure_height,
+              w = figure_width)
+
+  
+  combined
+})
+```
+## Prolif
+```{r, fig.height=6, fig.width=6}
+counts_point_color <- 'orangered'
+counts_point_alpha <- 0.5
+counts_line_alpha <- 1
+counts_line_size <- 1
+counts_line_color <- 'grey50'
+counts_xlims <- c(0, 2.6)
+counts_ylims <- counts_xlims
+
+pheno_point_alpha <- counts_point_alpha
+pheno_line_alpha <- counts_line_alpha
+pheno_line_size <- counts_line_size
+pheno_line_color <- counts_line_color
+pheno_xlims <- c(-3.5, 1)
+pheno_ylims <- pheno_xlims
+
+map(c(TRUE, FALSE), function(points) {
+  
+    if(points) {
+    device <- 'pdf'
+  } else {
+    device <- 'png'
+    counts_line_color <- 'transparent'
+    counts_line_alpha <- 0
+    pheno_line_color <- 'transparent'
+    pheno_line_alpha <- 0
+  }
+  
+  
+  
+coding_1 <- results$Proliferation$replicates$Coding$counts %>% 
+  replicate_plot(x = 'Sample1_Rep1',
+                 y = 'Sample1_Rep2',
+                 xlab = expression(atop('log10 CPM + 1', 'Replicate 1')),
+                 ylab = expression(atop('Replicate 2', 'log10 CPM + 1')),
+                 title = 'Initial',
+                 correlation = TRUE,
+                 identity_line = TRUE, 
+                 log_transform = TRUE,
+                 point_color = counts_point_color,
+                 point_alpha = counts_point_alpha,
+                 line_alpha = counts_line_alpha,
+                 line_size = counts_line_size,
+                 line_color = counts_line_color,
+                 xlims = counts_xlims,
+                 ylims = counts_ylims,
+                 drop_points = points)
+
+coding_2 <- results$Proliferation$replicates$Coding$counts %>% 
+  replicate_plot(x = 'Sample2_Rep1',
+                 y = 'Sample2_Rep2',
+                 xlab = expression(atop('log10 CPM + 1', 'Replicate 1')),
+                 ylab = expression(atop('Replicate 2', 'log10 CPM + 1')),
+                 title = 'Final',
+                 correlation = TRUE,
+                 identity_line = TRUE, 
+                 log_transform = TRUE,
+                 point_color = counts_point_color,
+                 point_alpha = counts_point_alpha,
+                 line_alpha = counts_line_alpha,
+                 line_size = counts_line_size,
+                 line_color = counts_line_color,
+                 xlims = counts_xlims,
+                 ylims = counts_ylims,
+                 drop_points = points)
+
+coding_pheno <- results$Proliferation$replicates$Coding$screen_table %>% 
+  replicate_plot(x = 'rep1_pheno',
+                 y = 'rep2_pheno',
+                 xlab = expression(atop('Phenotype', 'Replicate 1')),
+                 ylab = expression(atop('Replicate 2', 'Phenotype')),
+                 title = 'Phenotype',
+                 correlation = TRUE, 
+                 log_transform = FALSE,
+                 point_color = counts_point_color,
+                 point_alpha = pheno_point_alpha,
+                 line_alpha = pheno_line_alpha,
+                 line_size = pheno_line_size,
+                 line_color = pheno_line_color,
+                 xlims = pheno_xlims,
+                 ylims = pheno_ylims,
+                 drop_points = points)
+  
+coding_score <- results$Proliferation$replicates$Coding$screen_table %>% 
+  replicate_plot(x = 'rep1_score',
+                 y = 'rep2_score',
+                 xlab = expression(atop('Screen score', 'Replicate 1')),
+                 ylab = expression(atop('Replicate 2', 'Screen score')),
+                 title = 'Score',
+                 correlation = TRUE, 
+                 log_transform = FALSE,
+                 point_color = counts_point_color,
+                 point_alpha = pheno_point_alpha,
+                 line_alpha = pheno_line_alpha,
+                 line_size = pheno_line_size,
+                 line_color = pheno_line_color,
+                 xlims = c(0, 85),
+                 ylims = c(0, 85),
+                 drop_points = points)
+
+  combined <- coding_1 + coding_2 + coding_pheno + coding_score + plot_layout(nrow = 2)
+  
+  device <- ifelse(points, 'pdf', 'png')
+  
+  save_figure(plot = combined,
+              filename = 'Replicate_Coding_Proliferation',
+              directory = 'figures/screen',
+              device = device,
+              dpi = 600,
+              h = figure_height,
+              w = figure_width)
+  
+  combined
+})
+```
+
+
+```{r, fig.height=6, fig.width=6}
+map(c(TRUE, FALSE), function(points) {
+  
+if(points) {
+    device <- 'pdf'
+  } else {
+    device <- 'png'
+    counts_line_color <- 'transparent'
+    counts_line_alpha <- 0
+    pheno_line_color <- 'transparent'
+    pheno_line_alpha <- 0
+  }
+  
+  
+lncrna_1 <- bind_rows(results$Proliferation$replicates$CRiNCL$counts,
+                      results$Proliferation$replicates$Common$counts) %>% 
+  replicate_plot(x = 'Sample1_Rep1',
+                 y = 'Sample1_Rep2',
+                 xlab = expression(atop('log10 CPM + 1', 'Replicate 1')),
+                 ylab = expression(atop('Replicate 2', 'log10 CPM + 1')),
+                 title = 'Initial',
+                 correlation = TRUE,
+                 identity_line = TRUE, 
+                 log_transform = TRUE,
+                 point_color = counts_point_color,
+                 point_alpha = counts_point_alpha,
+                 line_alpha = counts_line_alpha,
+                 line_size = counts_line_size,
+                 line_color = counts_line_color,
+                 xlims = counts_xlims,
+                 ylims = counts_ylims,
+                 drop_points = points)
+
+
+lncrna_2 <- bind_rows(results$Proliferation$replicates$CRiNCL$counts,
+                      results$Proliferation$replicates$Common$counts) %>% 
+  replicate_plot(x = 'Sample2_Rep1',
+                 y = 'Sample2_Rep2',
+                 xlab = expression(atop('log10 CPM + 1', 'Replicate 1')),
+                 ylab = expression(atop('Replicate 2', 'log10 CPM + 1')),
+                 title = 'Final',
+                 correlation = TRUE,
+                 identity_line = TRUE, 
+                 log_transform = TRUE,
+                 point_color = counts_point_color,
+                 point_alpha = counts_point_alpha,
+                 line_alpha = counts_line_alpha,
+                 line_size = counts_line_size,
+                 line_color = counts_line_color,
+                 xlims = counts_xlims,
+                 ylims = counts_ylims,
+                 drop_points = points)
+
+lncrna_pheno <- bind_rows(results$Proliferation$replicates$CRiNCL$screen_table,
+                          results$Proliferation$replicates$Common$screen_table) %>% 
+  replicate_plot(x = 'rep1_pheno',
+                 y = 'rep2_pheno',
+                 xlab = expression(atop('Phenotype', 'Replicate 1')),
+                 ylab = expression(atop('Replicate 2', 'Phenotype')),
+                 title = 'Phenotype',
+                 correlation = TRUE, 
+                 log_transform = FALSE,
+                 point_color = counts_point_color,
+                 point_alpha = pheno_point_alpha,
+                 line_alpha = pheno_line_alpha,
+                 line_size = pheno_line_size,
+                 line_color = pheno_line_color,
+                 xlims = pheno_xlims,
+                 ylims = pheno_ylims,
+                 drop_points = points)
+  
+lncrna_score <- bind_rows(results$Proliferation$replicates$CRiNCL$screen_table,
+                          results$Proliferation$replicates$Common$screen_table) %>% 
+  replicate_plot(x = 'rep1_score',
+                 y = 'rep2_score',
+                 xlab = expression(atop('Screen score', 'Replicate 1')),
+                 ylab = expression(atop('Replicate 2', 'Screen score')),
+                 title = 'Score',
+                 correlation = TRUE, 
+                 log_transform = FALSE,
+                 point_color = counts_point_color,
+                 point_alpha = pheno_point_alpha,
+                 line_alpha = pheno_line_alpha,
+                 line_size = pheno_line_size,
+                 line_color = pheno_line_color,
+                 xlims = c(0, 110),
+                 ylims = c(0, 110),
+                 drop_points = points)
+
+combined <- lncrna_1 + lncrna_2 + lncrna_pheno + lncrna_score + plot_layout(nrow = 2)
+
+  device <- ifelse(points, 'pdf', 'png')
+  
+  save_figure(plot = combined,
+              filename = 'Replicate_lncRNA_Proliferation',
+              directory = 'figures/screen',
+              device = device,
+              dpi = 600,
+              h = figure_height,
+              w = figure_width)
+
+  
+  combined
+})
+```
+## Proliferation validation
+```{r}
+pheno_xlims <- c(-2.5, 1)
+pheno_ylims <- pheno_xlims
+
+validation_subset <- inner_join(results$Proliferation$replicates$Validation$screen_table %>% 
+                                  select(feature_id, 
+                                         validation_pheno = avg_pheno,
+                                         validation_score = score),
+                                results$Proliferation$replicates$Common$screen_table %>% 
+                                  select(feature_id,
+                                         pheno = avg_pheno,
+                                         score)) %>% 
+  mutate(status = ifelse((score > 5.5) | (validation_score > 5.5), 'Hit', 'Non-hit'))
+                                
+map(c(TRUE, FALSE), function(points) {
+  
+if(points) {
+    device <- 'pdf'
+  } else {
+    device <- 'png'
+    counts_line_color <- 'transparent'
+    counts_line_alpha <- 0
+    pheno_line_color <- 'transparent'
+    pheno_line_alpha <- 0
+  }
+  
+  
+  validation_pheno_hit <- validation_subset %>% 
+    filter(status == 'Hit') %>% 
+    replicate_plot(x = 'pheno',
+                   y = 'validation_pheno',
+                   xlab = expression(atop('Phenotype', 'Validation')),
+                   ylab = expression(atop('Combined', 'Phenotype')),
+                   title = 'Hits only',
+                   correlation = TRUE, 
+                   log_transform = FALSE,
+                   point_size = 6,
+                   point_color = counts_point_color,
+                   point_alpha = pheno_point_alpha,
+                   line_alpha = pheno_line_alpha,
+                   line_size = pheno_line_size,
+                   line_color = pheno_line_color,
+                   xlims = pheno_xlims,
+                   ylims = pheno_ylims,
+                   drop_points = points)
+  
+  validation_pheno_all <- validation_subset %>% 
+    replicate_plot(x = 'pheno',
+                   y = 'validation_pheno',
+                   xlab = expression(atop('Phenotype', 'Validation')),
+                   ylab = expression(atop('Combined', 'Phenotype')),
+                   title = 'All targets',
+                   correlation = TRUE, 
+                   log_transform = FALSE,
+                   point_size = 6,
+                   point_color = counts_point_color,
+                   point_alpha = pheno_point_alpha,
+                   line_alpha = pheno_line_alpha,
+                   line_size = pheno_line_size,
+                   line_color = pheno_line_color,
+                   xlims = pheno_xlims,
+                   ylims = pheno_ylims,
+                   drop_points = points)
+  
+  device <- ifelse(points, 'pdf', 'png')
+  
+  save_figure(plot = validation_pheno_hit,
+              filename = 'Validation_lncRNA_Proliferation_Hit',
+              directory = 'figures/screen',
+              device = device,
+              dpi = 600,
+              h = figure_height,
+              w = figure_width)
+  
+  save_figure(plot = validation_pheno_all,
+              filename = 'Validation_lncRNA_Proliferation_All',
+              directory = 'figures/screen',
+              device = device,
+              dpi = 600,
+              h = figure_height,
+              w = figure_width)
+  
+  validation_pheno_all + validation_pheno_hit
+})
+```
+Statistics
+```{r}
+# Validation correlation across all genes
+cor.test(validation_subset$validation_pheno,
+         validation_subset$pheno)
+
+# Validation correlation for hits
+validation_hit_subset <- validation_subset %>% 
+  filter(status == 'Hit') #%>% 
+cor.test(validation_hit_subset$validation_pheno,
+         validation_hit_subset$pheno)
+```
+
+### Number of targets in proliferation validation
+```{r}
+sgrna_table %>% 
+  filter(sublibrary %in% c('common', 'hek_unique')) %>% 
+  select(X1, gene) %>% 
+  summarize_all(n_distinct)
+  
+```
+
+## Dual hit primary and secondary phenotypes
+```{r}
+master <- read_tsv('analysis/integration/output/000_integrate/master_minimal.tsv.gz')
+dual_table <- master %>% 
+  filter(neighbor_overall_status == 'Non-neighbor') %>% 
+  filter(primary_pheno == 'Dual') %>% select(feature_id, gene_name, library, diff_pheno, prol_pheno) %>% 
+  mutate(diff_z = scale(diff_pheno),
+         prol_z = scale(prol_pheno)) %>% 
+  group_by(feature_id) %>% 
+  mutate(rank1_pheno = max(abs(diff_pheno), abs(prol_pheno)),
+         rank2_pheno = min(abs(diff_pheno), abs(prol_pheno)),
+         pheno_difference = rank1_pheno - rank2_pheno,
+         rank1_z = max(abs(diff_z), abs(prol_z)),
+         rank2_z = min(abs(diff_z), abs(prol_z)),
+         z_difference = rank1_z - rank2_z,
+         strength = case_when(
+           z_difference >= 1.5 ~ 'Weak',
+           z_difference >= 1 ~ 'Moderate',
+           z_difference < 1 ~ 'Similar'
+         ))
+dual_table
+```
+```{r}
+dual_table$pheno_difference %>% median()
+```
+
+```{r}
+p <- dual_table %>% 
+  ggplot(aes(x = rank1_z,
+             y = rank2_z,
+             color = factor(strength, levels = c('Similar', 'Moderate', 'Weak')))) +
+  geom_point(alpha = 0.7) +
+  #geom_smooth(method = 'lm', se = F) +
+  geom_abline(slope = 1, linetype = 'dashed') +
+  coord_equal() +
+  xlim(c(0, 3.5)) +
+  ylim(c(0, 3.5)) +
+  labs(x = 'Primary phenotype Z-score',
+       y = 'Secondary phenotype Z-score') +
+  facet_wrap(~library) +
+  theme(legend.position = 'top') +
+  scale_color_few()
+
+save_figure(plot = p,
+             directory = 'figures/screen',
+             filename = 'dual_phenotypes',
+             w = 6, 
+             h = 3)
+ 
+ p
+
+
+```
+```{r}
+cor.test(dual_table$rank1_z,
+         dual_table$rank2_z)
+```
+
+
+What proportion dual hits?
+```{r}
+master %>% 
+  filter(neighbor_overall_status != 'Neighbor hit',
+         primary_pheno != 'None')
+  
+```
+
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+

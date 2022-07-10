@@ -1,0 +1,317 @@
+---
+title: "sgRNA target scoring"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Assess off-targets of sgRNAs
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+
+source('analysis/screen/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/screen/output/sgrna_targets' # analysis file output directory
+data_dir <- '' # data file output directory
+figures_dir <- 'figures/screen'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(figures_dir, showWarnings = FALSE)
+#dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(plyranges)
+library(patchwork)
+library(extrafont)
+library(Biostrings)
+```
+
+
+### Annotation
+```{r}
+unified_reference <- import('analysis/reference/output/02_unified_reference/unified.gtf.gz')
+tss_gtf <- import('analysis/screen/output/05_neighbors/screen_tss.gtf')
+coding_sgrna <- read_tsv('analysis/screen/input/ScreenProcessing/library_tables/CRISPRi_v2_human_librarytable.txt')
+lncrna_sgrna <- read_tsv('analysis/screen/input/ScreenProcessing/library_tables/CRISPRi_v2_human_lincRNA_unique_merged_librarytable.txt')
+```
+```{r}
+chromosomes <- unified_reference %>% 
+  as_tibble() %>% 
+  select(feature_id, chromosome = seqnames) %>% 
+  unique()
+```
+
+
+
+
+### sgRNA sequences
+```{r}
+sgrna_table <- coding_sgrna %>%
+  filter(str_detect(sublibrary, 'top5')) %>% 
+  separate(sgId, into = c('feature_id', 'sense', 'position'), sep = '_', remove = F) %>% 
+  separate(position, into = c('position', NA, NA)) %>% 
+  bind_rows(
+    lncrna_sgrna %>% 
+  separate(`...1`, into = c(NA, 'sgId'), sep = ':') %>% 
+  separate(sgId, into = c(NA, 'sense', 'position', NA), sep = '_|\\.', remove = F) %>% 
+  select(feature_id = gene, everything())
+  ) %>% 
+  mutate(pam = 'NGG') %>% 
+  select(feature_id, sgId, sequence, pam, position, sense) %>% 
+  mutate(position = as.integer(position)) %>% 
+  filter(!str_detect(sgId, 'non-targeting')) %>% 
+  left_join(chromosomes)
+
+sgrna_table
+```
+
+### Load screen data
+```{r}
+neighbor_wide <- read_tsv('analysis/screen/output/05_neighbors/neighbor_wide.tsv.gz') %>% 
+  mutate(primary_pheno = factor(primary_pheno, levels = c('Differentiation', 'Dual', 'Proliferation', 'None')),
+         status = ifelse(primary_pheno == 'None', 'Non-hit', 'Hit')) 
+
+neighbor_wide
+```
+
+### Extract hit sgRNAs
+```{r}
+hits <- neighbor_wide %>% 
+  filter(diff_full_status == 'Hit' | prol_full_status == 'Hit',
+         locus_ambiguity == 'Non-ambiguous' | library == 'Coding')
+
+hits
+```
+```{r}
+sgrnas <- sgrna_table %>% 
+  filter(feature_id %in% hits$feature_id) %>% 
+  mutate(sgId = str_replace_all(sgId, ',', ';')) %>% 
+  unique()
+
+sgrnas
+```
+
+```{r}
+sgrnas %>% select(sequence) %>% write_tsv(file.path(analysis_dir, 'sequence.tsv'), col_names = F)
+```
+
+
+### Cas-OFFinder
+```{r}
+offinder <- read_tsv(file.path(analysis_dir, 'cas-offinder.txt')) %>% 
+  mutate(sequence = str_remove(crRNA, 'NGG'))
+offinder
+```
+```{r}
+merged <- sgrna_table %>% 
+  left_join(offinder) %>% 
+  select(feature_id, sgId, sequence, position, chromosome, DNA, Chromosome, Position, Mismatches)
+merged
+```
+```{r}
+merged %>% 
+  drop_na() %>% 
+  filter()
+  
+```
+```{r}
+merged %>% 
+  ggplot(aes(x = Mismatches)) +
+  geom_histogram()
+```
+```{r}
+
+```
+
+```{r}
+offtarget_gtf <- merged %>% 
+  drop_na() %>% 
+  select(Chromosome,
+         Position,
+         original_position = position,
+         original_chromosome = chromosome,
+         feature_id,
+         Mismatches,
+         sgId) %>% 
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE, seqnames.field = 'Chromosome', start.field = 'Position', end.field = 'Position')
+
+offtarget_gtf
+```
+```{r}
+overlaps <- join_overlap_intersect(offtarget_gtf %>% promoters(upstream = 500, downstream = 500), 
+                                   tss_gtf) %>% 
+  as_tibble() %>% 
+  filter(feature_id.x != feature_id.y) %>% 
+  dplyr::select(sgId, feature_id.x, feature_id.y, Mismatches, original_position, original_chromosome, chromosome = seqnames, position = start) %>%
+  left_join(hits %>% dplyr::select(feature_id.x = feature_id, library.x = library, primary_pheno.x = primary_pheno)) %>% 
+  left_join(hits %>% dplyr::select(feature_id.y = feature_id, library.y = library, primary_pheno.y = primary_pheno)) %>% 
+  mutate(distance = ifelse(original_chromosome == chromosome, abs(position - original_position), NA)) %>% 
+  mutate(combination = ifelse(feature_id.x < feature_id.y, paste0(feature_id.x, ':', feature_id.y), paste0(feature_id.y, ':', feature_id.x))) %>% 
+  ungroup() %>% 
+  unique() %>% 
+  arrange(combination) 
+  
+
+overlaps %>% 
+  filter(primary_pheno.x == primary_pheno.y)
+```
+```{r}
+intended_matches <- overlaps %>% 
+  filter(Mismatches == 0 | distance < 500) %>% 
+  pull(combination) %>% 
+  unique()
+
+intended_matches %>% n_distinct()
+```
+
+```{r}
+matched_hits <- overlaps %>% 
+  filter(primary_pheno.x == primary_pheno.y,
+         !(combination %in% intended_matches)) %>% 
+  group_by(combination, Mismatches) %>% 
+  add_count() %>% 
+  ungroup() %>% 
+  dplyr::select(combination, Mismatches, n, primary_pheno.x) %>% 
+  unique() %>% 
+  pivot_wider(names_from = Mismatches, names_prefix = 'Mismatch', values_from = n, values_fill = 0)
+
+matched_hits
+```
+```{r}
+matched_hits %>% filter(Mismatch3 > 1 | Mismatch2 > 1)
+```
+### Off-target
+```{r}
+overlaps
+```
+```{r}
+top_off_targets <- overlaps %>% 
+  filter(!(combination %in% intended_matches)) %>% 
+  group_by(feature_id.x, feature_id.y, Mismatches) %>% 
+  add_count() %>% 
+  arrange(feature_id.x, feature_id.y, Mismatches,)
+
+top_off_targets
+```
+```{r}
+
+```
+
+## GO
+```{r}
+library(clusterProfiler)
+library(DOSE)
+library(org.Hs.eg.db)
+library(enrichplot)
+
+```
+
+```{r}
+universe <- tss_gtf$feature_id %>% unique()
+
+lookup <- bitr(universe, 
+               fromType = 'SYMBOL',
+               OrgDb = org.Hs.eg.db,
+               toType = c('ENTREZID', 'ENSEMBL'))
+
+lookup
+```
+
+
+```{r}
+gene_table <- lookup 
+
+gene_table
+```
+
+
+```{r}
+run_go <- function(gene_subset,
+                   gene_table,
+                   key = 'ENTREZID') {
+  tic()
+  
+  bp <- enrichGO(gene_subset[[key]],
+                 universe = gene_table[[key]],
+                 keyType = key,
+                 OrgDb = org.Hs.eg.db,
+                 readable = TRUE,
+                 ont = 'BP')
+  
+  mf <- enrichGO(gene_subset[[key]],
+                 universe = gene_table[[key]],
+                 keyType = key,
+                 OrgDb = org.Hs.eg.db,
+                 readable = TRUE,
+                 ont = 'MF')
+  
+  cc <- enrichGO(gene_subset[[key]],
+                 universe = gene_table[[key]],
+                 keyType = key,
+                 OrgDb = org.Hs.eg.db,
+                 readable = TRUE,
+                 ont = 'CC')
+  toc()
+  
+  results <- bind_rows(list(bp@result %>% mutate(ontology = 'BP'),
+                            mf@result %>% mutate(ontology = 'MF'),
+                            cc@result %>% mutate(ontology = 'CC'))) %>% 
+    as_tibble() %>% 
+    mutate(log10q = -log10(qvalue)) %>% 
+    dplyr::select(ontology, ID, Description, Count, GeneRatio, BgRatio, pvalue, p.adjust, qvalue, log10q, everything())
+  
+  list('results' = results,
+       'bp' = bp,
+       'mf' = mf,
+       'cc' = cc)
+  
+}
+```
+
+```{r}
+top_off_targets <- overlaps %>% 
+  filter(!(combination %in% intended_matches)) %>% 
+  group_by(feature_id.x, feature_id.y, Mismatches) %>% 
+  add_count() %>% 
+  arrange(feature_id.x, feature_id.y, Mismatches,)
+
+top_off_targets
+```
+```{r}
+off_targets <- top_off_targets %>% 
+  filter(Mismatches <= 2) %>% 
+  pull(feature_id.y) %>% 
+  unique()
+
+off_targets
+```
+
+```{r}
+go_res <- run_go(gene_subset = gene_table %>% filter(SYMBOL %in% off_targets),
+                 gene_table = gene_table)
+
+go_res$results %>% filter(p.adjust < 0.05)
+```
+
+## Export
+```{r}
+
+```

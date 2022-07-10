@@ -1,0 +1,263 @@
+---
+title: "Score screen hits using empirical FDR"
+author: "David Wu"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Purpose
+Determine hits based on 0.05 FDR threshold
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load themes and functions
+```{r, message=FALSE}
+source('analysis/universal/functions.R') # functions for all project components
+
+source('analysis/universal/themes.R') # themes for all project components
+
+theme_set(theme_publication())
+
+source('analysis/screen/scripts/functions.R')  # functions for this component; may be empty
+```
+
+### Directories
+```{r}
+analysis_dir <- 'analysis/screen/output/02_fdr'
+dir.create(analysis_dir, showWarnings = FALSE)
+```
+
+### Results directories
+```{r}
+result_dir <- 'analysis/screen/output/01_process_experiments/results'
+result_subdirs <- list.files(result_dir, full.names = TRUE)
+names(result_subdirs) <- basename(result_subdirs)
+result_subdirs
+```
+
+Read in results
+```{r, message = FALSE}
+results <- map(result_subdirs, function(i) {
+  experiment_dirs <- list.files(i, full.names = TRUE)
+  names(experiment_dirs) <- basename(experiment_dirs)
+  
+  analysis <- map(experiment_dirs, function(j) {
+    print(c(basename(i), basename(j)))
+    screen_analysis(j)
+    
+  })
+  
+  replicates <- map(experiment_dirs, function(j) {
+    print(c(basename(i), basename(j)))
+    screen_replicates(j)
+  })
+  
+  list('analysis' = analysis,
+       'replicates' = replicates)
+})
+```
+
+
+```{r}
+results$Differentiation$analysis$Coding$table
+```
+## Analysis
+### Visualization
+```{r}
+volcano <- map(results, function(i) {
+  map(i$analysis, function(j) {
+    j$table %>% screen_volcano()
+  })
+})
+```
+
+```{r, fig.width= 8, fig.height=8}
+volcano$Differentiation %>% wrap_plots(ncol = 2)
+```
+
+```{r, fig.width= 8, fig.height=8}
+volcano$Proliferation %>% wrap_plots(ncol = 2)
+```
+### Summarize results
+```{r}
+result_summary <- map(results, function(i) {
+  map(i$analysis, function(j) {
+    screen_table <- j$table
+    assay <- screen_table %>% pull(assay) %>% unique()
+    library <- screen_table %>% pull(library) %>% unique()
+    experiment <- screen_table %>% pull(experiment) %>% unique()
+    
+    hits <- screen_table %>% filter(legend == 'Hit Gene') %>% pull(feature_id) %>% n_distinct()
+    threshold <- screen_table %>% pull(threshold) %>% unique()
+    
+    list(assay = assay,
+         library = library,
+         experiment = experiment,
+         hits = hits,
+         threshold = threshold)
+  }) %>% bind_rows()
+}) %>% bind_rows()
+
+result_summary %>% filter(assay == 'Differentiation')
+```
+```{r}
+result_summary %>% filter(assay == 'Proliferation')
+```
+
+## Merge
+### Merge output into one table
+```{r}
+differentiaton <- map(results$Differentiation$analysis, function(i) {
+  i$table
+}) %>% bind_rows()
+
+proliferation <- map(results$Proliferation$analysis, function(i) {
+  i$table
+}) %>% bind_rows()
+
+full_results <- bind_rows(differentiaton, proliferation) %>% filter(experiment != 'Validation')
+full_results
+```
+### Merge lncRNA data and recalculate screen scores
+```{r}
+lncrna_results <- full_results %>% filter(library == 'lncRNA')
+
+lncrna_recalculate <- map(c('Differentiation', 'Proliferation'), function(i) {
+  lncrna_results %>% 
+    filter(assay == i) %>% 
+    select(-score, -threshold, -control_sd) %>% 
+  screen_calculate_score() %>% 
+  screen_mark_hits()
+}) %>% bind_rows()
+
+lncrna_recalculate %>% select(assay, threshold) %>% unique()
+```
+
+Tally final total hit count
+```{r}
+lncrna_recalculate %>% group_by(assay, status) %>% tally()
+```
+
+Combined volcano plot 
+```{r}
+map(c('Differentiation', 'Proliferation'), function(i) {
+    lncrna_recalculate %>% 
+    filter(assay == i) %>% 
+    screen_volcano()
+}) %>% wrap_plots()
+  
+```
+
+### Recombine full results
+```{r}
+full_results <- full_results %>% 
+  filter(library == 'Coding') %>% 
+  bind_rows(lncrna_recalculate)
+full_results
+```
+
+
+### Total hits
+```{r}
+full_results %>% filter(group == 'Gene', status == 'Hit') %>% pull(feature_id) %>% n_distinct()
+```
+Coding hits
+```{r}
+full_results %>% filter(group == 'Gene', status == 'Hit', library == 'Coding') %>% pull(feature_id) %>% n_distinct()
+```
+
+lncRNA hits
+```{r}
+full_results %>% filter(group == 'Gene', status == 'Hit', library == 'lncRNA') %>% pull(feature_id) %>% n_distinct()
+```
+### Differentiation hits
+```{r}
+differentiation_hits <- full_results %>% filter(group == 'Gene', status == 'Hit', assay == 'Differentiation') 
+differentiation_hits %>% pull(feature_id) %>% n_distinct()
+```
+Coding differentiation hits
+```{r}
+differentiation_hits %>% filter(library == 'Coding') %>% pull(feature_id) %>% n_distinct()
+```
+lncRNA differentiation hits
+```{r}
+differentiation_hits %>% filter(library == 'lncRNA') %>% pull(feature_id) %>% n_distinct()
+```
+### Proliferation hits
+```{r}
+proliferation_hits <- full_results %>% filter(group == 'Gene', status == 'Hit', assay == 'Proliferation') 
+proliferation_hits %>% pull(feature_id) %>% n_distinct()
+```
+Coding proliferation hits
+```{r}
+proliferation_hits %>% filter(library == 'Coding') %>% pull(feature_id) %>% n_distinct()
+```
+lncRNA proliferation hits
+```{r}
+proliferation_hits %>% filter(library == 'lncRNA') %>% pull(feature_id) %>% n_distinct()
+```
+### Dual hits
+All
+```{r}
+dual_hits <- full_results %>% filter(group == 'Gene', status == 'Hit') %>% add_count(feature_id) %>% filter(n > 1)
+
+dual_hits %>% pull(feature_id) %>%  n_distinct()
+```
+Coding
+```{r}
+dual_hits %>% filter(library == 'Coding') %>% pull(feature_id) %>% n_distinct()
+```
+lncRNA
+```{r}
+dual_hits %>% filter(library == 'lncRNA') %>%  pull(feature_id) %>% n_distinct()
+```
+
+## Mark primary phenotypes
+Primary phenotype for hits is differentiation, proliferation, or dual.
+Non-hits = Non-hit
+```{r}
+full_results_marked <- full_results %>% 
+  mutate(primary_pheno = case_when(
+    feature_id %in% dual_hits$feature_id ~ 'Dual',
+    feature_id %in% differentiation_hits$feature_id ~ 'Differentiation',
+    feature_id %in% proliferation_hits$feature_id ~ 'Proliferation',
+    TRUE ~ 'None'),
+    direction = ifelse(avg_pheno >= 0, 'Positive', 'Negative')) %>% 
+  select(feature_id,
+         gene_name,
+         library,
+         group,
+         assay,
+         pheno = avg_pheno,
+         pval = avg_mw,
+         score,
+         threshold,
+         control_sd,
+         direction,
+         status,
+         hit_direction,
+         primary_pheno,
+         legend,
+         experiment)
+
+full_results_marked
+```
+
+## Export
+```{r}
+full_results_marked %>% write_tsv(file.path(analysis_dir, 'screen_results.tsv'))
+results %>% write_rds(file.path(analysis_dir, 'results.rds'), compress = 'gz')
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+
+

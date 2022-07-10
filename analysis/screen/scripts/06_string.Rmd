@@ -1,0 +1,236 @@
+---
+title: "STRINGdb Protein Interaction Analysis"
+author: "David Wu"
+output: html_notebook
+---
+## Purpose
+Analyze protein-protein interactions of hits and compare to random sets of genes
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Optionally convert this Rmd to R script 
+```{r eval=FALSE}
+current_file <- rstudioapi::getActiveDocumentContext()$path
+output_file <- stringr::str_replace(current_file, '.Rmd', '.R')
+knitr::purl(current_file, output = output_file)
+file.edit(output_file)
+```
+
+### Load custom themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+theme_set(theme_publication())
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/screen/output/06_string' # analysis file output directory
+
+dir.create(analysis_dir, showWarnings = FALSE)
+
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(extrafont)
+loadfonts()
+```
+
+### Import screen data
+```{r}
+master <- read_tsv('analysis/integration/output/00_integrate/master_minimal.tsv.gz')
+master
+```
+
+```{r}
+coding_subset <- master %>% 
+  filter(library == 'Coding')
+```
+
+
+```{r}
+universe <- coding_subset %>% 
+  pull(feature_id) %>% 
+  unique()
+```
+
+## Download and load human STRINGdb network
+Network: https://stringdb-static.org/download/protein.links.v11.0/9606.protein.links.v11.0.txt.gz
+Mapping: https://stringdb-static.org/download/protein.info.v11.0/9606.protein.info.v11.0.txt.gz
+```{r}
+mapping <- read_tsv('analysis/screen/input/9606.protein.info.v11.0.txt.gz')
+string <- read_delim('analysis/screen/input/9606.protein.links.v11.0.txt.gz', delim = ' ')
+```
+
+```{r}
+mapped_universe <- mapping %>% filter(preferred_name %in% universe)
+```
+```{r}
+string %>% head()
+```
+## Threshold interaction analysis
+```{r}
+interaction_network <- function(genes,
+                                string,
+                                mapping,
+                                threshold = 150) {
+  
+  # map to STRINGdb identifiers
+  mapped_ids <- mapping %>% filter(preferred_name %in% genes) %>% pull(protein_external_id)
+  
+  # subset protein network and filter for unique combinations
+  network <- string %>% 
+    filter(combined_score >= threshold,
+      protein1 %in% mapped_ids,
+      protein2 %in% mapped_ids) %>% 
+    mutate(combination = ifelse(protein1 > protein2, paste(protein1, protein2), paste(protein2, protein1))) %>% 
+    dplyr::select(combination, combined_score) %>% 
+    unique()
+  
+  network
+}
+
+```
+
+```{r}
+hits <- coding_subset %>% filter(primary_pheno %in% c('Differentiation', 'Dual')) %>% pull(feature_id)
+
+hits_network <- hits %>% interaction_network(string = string, mapping = mapping)
+
+hits_network
+```
+## Random genes
+```{r}
+sample_size <- length(hits)
+ntrials <- 1e3
+cores <- 30
+thresholds <- c(150,
+                400,
+                700)
+
+tic()
+random_trials <- mclapply(1:ntrials, 
+         mc.cores = cores,
+         FUN = function(i) {
+  random_genes <- coding_subset %>%
+    sample_n(sample_size) %>% 
+    pull(feature_id)
+  random_network <- random_genes %>% interaction_network(string = string, mapping = mapping)
+  
+  threshold_count <- map(thresholds, function(j) {
+    
+    passing_threshold <- random_network %>% 
+      filter(combined_score >= j) %>% 
+      nrow()
+    
+    tibble('threshold' = j,
+           'interactions' = passing_threshold)
+    
+  }) %>% 
+    bind_rows() %>% 
+    mutate(trial = i)
+}) %>% bind_rows() %>% 
+  arrange(threshold, trial)
+
+random_trials %>% head()
+toc()
+```
+
+
+```{r}
+random_summary <- random_trials %>% 
+  group_by(threshold) %>% 
+  summarize(mean = mean(interactions),
+            sd = sd(interactions),
+            conf1 = t.test(interactions, conf.level = 0.95)$conf.int[1],
+            conf2 = t.test(interactions, conf.level = 0.95)$conf.int[2])
+
+random_summary
+
+
+```
+```{r}
+ hits_threshold <- map(thresholds, function(j) {
+    
+    passing_threshold <- hits_network %>% 
+      filter(combined_score >= j) %>% 
+      nrow()
+    
+    tibble('threshold' = j,
+           'interactions' = passing_threshold)
+    
+  }) %>% 
+    bind_rows()
+
+hits_threshold
+```
+```{r}
+combined_counts <- bind_rows(random_summary %>% 
+                               dplyr::select(threshold,
+                                             interactions = mean,
+                                             sd,
+                                             conf1,
+                                             conf2) %>% 
+                               mutate(group = 'Random'),
+                             hits_threshold %>% 
+                               mutate(group = 'Hits',
+                                      sd = 0,
+                                      conf1 = interactions,
+                                      conf2 = interactions)) %>% 
+  mutate(confidence = case_when(
+    threshold == 150 ~ 'Low',
+    threshold == 400 ~ 'Medium',
+    threshold == 700 ~ 'High',
+  ))
+combined_counts
+```
+```{r}
+p <- combined_counts %>% 
+  mutate(confidence = factor(confidence, levels = c('Low', 'Medium', 'High', 'Highest'))) %>% 
+  ggplot(aes(x = interactions,
+             y = confidence,
+             fill = group)) +
+  geom_bar(stat = 'identity',
+           position = 'dodge',
+           #fill = 'darkred',
+           alpha = 0.8) +
+  geom_errorbar(aes(xmin=interactions - sd, xmax=interactions + sd), 
+                width=.2,
+                position=position_dodge(.9)) +
+labs(x = 'Unique protein-protein interactions',
+     y = 'Interaction confidence threshold') +
+  scale_fill_few() +
+  theme(legend.position = 'right')
+
+
+
+save_figure(plot = p, 
+            filename = 'string', 
+            directory = 'figures/screen',
+            w = 5,
+            h = 3)
+
+p 
+  
+```
+
+
+ 
+
+## Export
+```{r}
+random_trials %>% write_tsv(file.path(analysis_dir, 'random_trials.tsv.gz'))
+```
+
+## Session info
+```{r}
+sessionInfo()
+```

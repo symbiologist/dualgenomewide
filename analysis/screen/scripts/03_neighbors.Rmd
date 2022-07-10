@@ -1,0 +1,1227 @@
+---
+title: 'Analysis of neighbor effects'
+author: 'David Wu'
+output: html_notebook
+---
+
+## Purpose
+Determine neighbor effects by comparing coding and lncRNA screen data
+
+## Setup 
+Set working directory to project directory
+```{r setup}
+require(knitr)
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+### Load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(plyranges)
+library(ggExtra)
+```
+
+### Load themes and functions
+```{r, message=FALSE}
+source('analysis/universal/themes.R') # themes for all project components
+
+source('analysis/universal/functions.R') # themes for all project components
+
+source('analysis/screen/scripts/functions.R')  # functions for this component; may be empty
+
+theme_set(theme_publication()) # set ggplot2 theme
+```
+
+### Directories
+```{r, message=FALSE}
+analysis_dir <- 'analysis/screen/output/03_neighbors'
+data_dir <- 'data/screen/derived/neighbor'
+
+dir.create(analysis_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+### Functions
+```{r}
+find_nearest <- function(query, subject = NULL, ignore.strand = TRUE, id = 'feature_id') {
+  
+  if(is.null(subject)) { # compare to self
+    distances <- distanceToNearest(query, ignore.strand = ignore.strand)
+    subject <- query
+  } else {
+    distances <- distanceToNearest(query, subject, ignore.strand = ignore.strand)
+  }
+  
+  query_ids <- query %>% as_tibble() %>% .[[id]]
+  subject_ids <- subject %>% as_tibble() %>% .[[id]]
+  
+  query_table <- tibble(query_id = query_ids, 
+                        queryHits = 1:length(query_id))
+  
+  subject_table <- tibble(subject_id = subject_ids, 
+                        subjectHits = 1:length(subject_id))
+  
+  distance_table <- distances %>% as_tibble() %>% full_join(query_table) %>% left_join(subject_table) %>% select(query_id, subject_id, distance)
+  return(distance_table)
+}
+
+
+
+
+```
+
+## Load data
+### Load screen table
+```{r}
+screen_results <- read_tsv('analysis/screen/output/02_fdr/screen_results.tsv') 
+screen_results
+```
+
+```{r}
+lncrna_hits <- screen_results %>% filter(library == 'lncRNA', group == 'Gene', assay == 'Differentiation', status == 'Hit') %>% pull(feature_id)
+coding_hits <- screen_results %>% filter(library == 'Coding', group == 'Gene', assay == 'Differentiation', status == 'Hit') %>% pull(feature_id)
+```
+
+### Expression correlations
+```{r}
+expression_cor <- read_rds('data/rnaseq/derived/other/expression_cor.rds')
+expression_cor[1:5, 1:5]
+```
+### Load annotation files
+```{r}
+unified_gtf <- import('analysis/reference/output/02_unified_reference/unified.gtf')
+
+coding_gtf <- import('analysis/reference/output/01_coding_reference/coding.gtf') 
+```
+
+### Subset unified to assayed genes
+```{r}
+assayed_targets <- intersect(screen_results$feature_id, unified_gtf$feature_id)
+gtf_subset <- unified_gtf %>% filter(feature_id %in% assayed_targets)
+gtf_subset
+```
+
+### Subset coding reference to Derrien et al criteria (known protein-coding)
+```{r}
+coding_filtered <- coding_gtf %>% filter(transcript_status == 'KNOWN',
+                                         transcript_type == 'protein_coding',
+                                         feature_id %in% assayed_targets)
+
+coding_subset <- gtf_subset %>% filter(ref_id %in% coding_filtered$ref_id, type == 'transcript')
+coding_subset
+```
+### Coding TSS to gtf
+```{r}
+coding_tss <- read_csv('analysis/reference/input/20150611_TSS_table_grouped_extended.csv') # Use Max's TSS table
+coding_tss_gtf <- coding_tss %>% 
+  filter(gene %in% assayed_targets) %>% 
+  mutate(start = position,
+         end = position) %>% 
+  select(chromosome, start, end, strand, feature_id = gene) %>% 
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+
+#coding_tss_gtf <- coding_subset %>% resize(1) 
+coding_tss_gtf 
+```
+
+### lncRNA subset
+```{r}
+lncrna_subset <- gtf_subset %>% filter(library == 'lncRNA', type != 'gene')
+```
+
+### Obtain TSS
+```{r}
+gtf_tss <- gtf_subset %>% filter(type == 'gene') %>% resize(width = 1)
+```
+
+### Calculate all pairwise TSS distances 
+```{r eval=FALSE}
+pairwise <- map(1:length(gtf_tss), function(i) {
+  distances_to_query <- distance(gtf_tss[i], gtf_tss, select = 'all', ignore.strand = TRUE)
+  tibble('feature_id.x' = gtf_tss[i]$feature_id,
+         'feature_id.y' = gtf_tss$feature_id,
+         'tss_distance' = distances_to_query) 
+}) %>% 
+  bind_rows() %>% 
+  drop_na() %>% # remove trans-chromosome distances
+  filter(feature_id.x != feature_id.y) # remove self matches
+
+pairwise %>% write_rds('data/screen/derived/neighbor/pairwise_tss_distances.rds', compress = 'gz')
+
+pairwise %>% head()
+```
+
+```{r}
+pairwise <- read_rds(file.path(data_dir, 'pairwise_tss_distances.rds')) 
+```
+### sgRNA coordinates
+#### lncRNA sgRNA tables
+```{r}
+lncrna_sgrna <- read_tsv('analysis/screen/input/ScreenProcessing/library_tables/CRISPRi_v2_human_lincRNA_unique_merged_librarytable.txt')
+lncrna_sgrna
+
+sgrna_screened <- read_tsv('analysis/screen/input/counts/to_process/Common_Initial_R1.counts', col_names = F) %>% 
+  bind_rows(read_tsv('analysis/screen/input_counts/to_process/CRiNCL_Initial_R1.counts', col_names = F)) %>% 
+  filter(X2 > 0) %>% 
+  pull(X1) %>%
+  unique()
+```
+
+#### Top 3 sgRNAs
+lncRNA differentiation
+```{r}
+crincl_diff <- read_tsv('analysis/screen/output/01_process_experiments/results/Differentiation/CRiNCL/screen_phenotypetable.txt', col_names = c('sgId', 'pheno_1', 'pheno_2', 'pheno_mean'), skip = 2)  
+common_diff <- read_tsv('analysis/screen/output/01_process_experiments/results/Differentiation/Common/screen_phenotypetable.txt', col_names = c('sgId', 'pheno_1', 'pheno_2', 'pheno_mean'), skip = 2)  
+
+lncrna_diff <- bind_rows(crincl_diff, common_diff) %>% 
+  left_join(lncrna_sgrna %>% dplyr::rename(sgId = X1)) %>% 
+  select(feature_id = gene, pheno_mean, pheno_1, pheno_2, sequence) %>% 
+  unique()
+
+lncrna_diff_top3 <- lncrna_diff %>% 
+  group_by(feature_id) %>% 
+  top_n(3, abs(pheno_mean)) %>% 
+  ungroup() %>% 
+  unique() %>% 
+  add_count(feature_id)
+
+lncrna_diff_top3 
+```
+Proliferation
+```{r}
+crincl_prol <- read_tsv('analysis/screen/output/01_process_experiments/results/Proliferation/CRiNCL/screen_phenotypetable.txt', col_names = c('sgId', 'pheno_1', 'pheno_2', 'pheno_mean'), skip = 2)  
+common_prol <- read_tsv('analysis/screen/output/01_process_experiments/results/Proliferation/Common/screen_phenotypetable.txt', col_names = c('sgId', 'pheno_1', 'pheno_2', 'pheno_mean'), skip = 2)  
+
+lncrna_prol <- bind_rows(crincl_prol, common_prol) %>% 
+  left_join(lncrna_sgrna %>% dplyr::rename(sgId = X1)) %>% 
+  select(feature_id = gene, pheno_mean, pheno_1, pheno_2, sequence) %>% 
+  unique()
+
+lncrna_prol_top3 <- lncrna_prol %>% 
+  group_by(feature_id) %>% 
+  top_n(3, abs(pheno_mean)) %>% 
+  ungroup() %>% 
+  unique() %>% 
+  add_count(feature_id)
+
+lncrna_prol_top3
+```
+
+#### Coding sgRNA tables
+```{r}
+coding_sgrna <- read_tsv('analysis/screen/input/ScreenProcessing/library_tables/CRISPRi_v2_human_librarytable.txt') %>% filter(str_detect(sublibrary, 'top5'))
+coding_sgrna
+```
+
+```{r}
+coding_diff <- read_tsv('analysis/screen/output/01_process_experiments/results/Differentiation/Coding/screen_phenotypetable.txt', col_names = c('sgId', 'pheno_1', 'pheno_2', 'pheno_mean'), skip = 3)  
+
+coding_diff_top3 <- coding_diff %>% 
+  left_join(coding_sgrna %>% dplyr::rename(feature_id = gene)) %>% 
+  group_by(feature_id) %>% 
+  top_n(3, abs(pheno_mean)) %>% 
+  ungroup() %>% 
+  unique() %>% 
+  add_count(feature_id)
+
+coding_diff_top3 
+```
+
+```{r}
+coding_prol <- read_tsv('analysis/screen/output/01_process_experiments/results/Proliferation/Coding/screen_phenotypetable.txt', col_names = c('sgId', 'pheno_1', 'pheno_2', 'pheno_mean'), skip = 3)  
+
+coding_prol_top3 <- coding_prol %>% 
+  left_join(coding_sgrna %>% dplyr::rename(feature_id = gene)) %>% 
+  group_by(feature_id) %>% 
+  top_n(3, abs(pheno_mean)) %>% 
+  ungroup() %>% 
+  unique() %>% 
+  add_count(feature_id)
+
+coding_prol_top3 
+```
+
+#### Top 3
+```{r}
+lncrna_top3_sequences <- c(lncrna_diff_top3$sequence, lncrna_prol_top3$sequence) %>% unique()
+coding_top3_sequences <- c(coding_diff_top3$sequence, coding_prol_top3$sequence) %>% unique()
+```
+
+#### Pull sgRNA coordinates
+```{r}
+lncrna_sgrna_gtf <- lncrna_sgrna %>% 
+  filter(gene %in% screen_results$feature_id,
+         X1 %in% sgrna_screened) %>% 
+  separate(X1, into = c(NA, 'temp'), sep = ':') %>% 
+  separate(temp, into = c('tss_id', 'strand', 'start'), sep = '_') %>% 
+  separate(start, into = c('start', NA, NA, NA)) %>% 
+  select(feature_id = gene, start, strand, sequence) %>% 
+  unique() %>% 
+  group_by(feature_id) %>% 
+  mutate(row = row_number(),
+         id = paste(feature_id, row, sep = '_'),
+         end = start,
+         top3 = ifelse(sequence %in% lncrna_top3_sequences, 'Yes', 'No')) %>% 
+  inner_join(unified_metadata %>% select(feature_id, chr = chromosome) %>% unique()) %>% # get chr
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+
+lncrna_sgrna_gtf
+```
+
+```{r} 
+coding_sgrna_gtf <- coding_sgrna %>% 
+  filter(gene %in% screen_results$feature_id) %>% 
+  separate(sgId, into = c(NA, 'strand', 'temp'), sep = '_') %>% 
+  separate(temp, into = c('start', NA), sep = '\\.') %>%
+  select(feature_id = gene, start, strand, sequence) %>% 
+  unique() %>% 
+  group_by(feature_id) %>% 
+  mutate(row = row_number(),
+         id = paste(feature_id, row, sep = '_'),
+         end = start,
+         top3 = ifelse(sequence %in% coding_top3_sequences, 'Yes', 'No')) %>% 
+  inner_join(unified_metadata %>% select(feature_id, chr = chromosome) %>% unique()) %>% # get chr
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) 
+
+coding_sgrna_gtf
+```
+
+
+### Coding sgrna dist
+```{r}
+coding_sgrna_distance <- join_nearest(coding_sgrna_gtf,
+                                      coding_tss_gtf) %>% 
+  add_nearest_distance(coding_tss_gtf) %>% 
+  as_tibble() %>% 
+  select(feature_id.x, sequence, id, feature_id.y, distance)
+
+coding_sgrna_distance 
+```
+```{r}
+coding_sgrna_distance %>% 
+  filter(feature_id.x == feature_id.y) %>% 
+  ggplot(aes(x = distance)) +
+  geom_histogram() +
+  xlim(c(0, 1000))
+```
+
+### Quantiles of distance to coding TSS
+```{r}
+coding_sgrna_distance %>% 
+  filter(feature_id.x == feature_id.y) %>% 
+  pull(distance) %>% 
+  quantile(probs = seq(0,1,by = 0.05))
+```
+
+```{r}
+coding_sgrna_distances_all <- coding_sgrna_distance %>% 
+  filter(feature_id.x == feature_id.y) %>% 
+  pull(distance)
+
+mean(coding_sgrna_distances_all <= 500)
+mean(coding_sgrna_distances_all <= 300)
+```
+
+### lncRNA sgRNAs in CRISPRi active window
+```{r}
+crispri_window_full <- 500
+crispri_window_stringent <- 300
+
+lncrna_sgrna_window_full <- join_overlap_intersect(lncrna_sgrna_gtf,
+                                                   coding_tss_gtf %>% promoters(upstream = crispri_window_full, downstream = crispri_window_full)) %>% 
+  mutate(window = 'full')
+
+lncrna_sgrna_window_stringent <- join_overlap_intersect(lncrna_sgrna_gtf,
+                                                        coding_tss_gtf %>% promoters(upstream = 50, downstream = crispri_window_stringent)) %>% 
+  mutate(window = 'stringent')
+
+lncrna_sgrna_window_full
+```
+```{r}
+lncrna_sgrna_window_stringent
+```
+
+```{r}
+lncrna_sgrna_window_full
+```
+
+```{r}
+sgrna_window_table <- c(lncrna_sgrna_window_full, lncrna_sgrna_window_stringent) %>% 
+  mutate(combination = paste(feature_id.x, feature_id.y, sep = ':')) %>% 
+  as_tibble() %>% 
+  select(feature_id.x, feature_id.y, combination, window, top3) %>% 
+  group_by_all() %>% 
+  add_count() %>% 
+  ungroup() %>% 
+  unique() %>% 
+  mutate(description = paste(window, top3, sep = '_') %>% str_replace('Yes', 'Top3') %>% str_remove('_No')) %>% 
+  select(feature_id.x, feature_id.y, combination, description, n) %>% 
+  pivot_wider(names_from = description,
+              values_from = n,
+              values_fill = 0) 
+
+sgrna_window_table %>% filter(full < full_Top3)
+```
+```{r}
+sgrna_window_table %>% filter(full_Top3 >= 3, stringent_Top3 > 0)
+```
+
+
+```{r}
+sgrna_window_table
+```
+```{r}
+sgrna_window_table %>% filter(feature_id.x %in% lncrna_hits, full_Top3 > 2)
+```
+```{r}
+ambiguous_loci <- sgrna_window_table %>% 
+  filter((full + full_Top3) > 2) # >2 guides within the full window
+
+ambiguous_loci
+```
+
+### Overlapping, antisense, and divergent lncRNAs
+
+```{r}
+overlaps_all <- join_overlap_intersect(lncrna_subset,
+                                       coding_subset,
+                                       minoverlap = 1) %>% 
+  mutate(overlap_distance = width,
+         combination = paste(feature_id.x, feature_id.y, sep = ':')) %>% 
+  as_tibble() %>% 
+  select(feature_id.x, feature_id.y, combination, overlap_distance) %>% 
+  unique()
+
+overlaps_sense <- join_overlap_intersect_directed(lncrna_subset,
+                                                  coding_subset,
+                                                  minoverlap = 1) %>% 
+  mutate(overlap_distance = width,
+         combination = paste(feature_id.x, feature_id.y, sep = ':')) %>% 
+  as_tibble() %>% 
+  select(feature_id.x, feature_id.y, combination, overlap_distance) %>% 
+  unique()
+
+overlaps_antisense <- overlaps_all %>% filter(!(combination %in% overlaps_sense$combination))
+
+overlaps_annotate_lncrna <- overlaps_all %>% 
+  mutate(locus_type = ifelse(combination %in% overlaps_sense$combination, 'Overlapping', 'Antisense')) %>% 
+  group_by(combination) %>% 
+  top_n(1, overlap_distance) %>% 
+  ungroup() %>% 
+  left_join(pairwise) %>% 
+  group_by(feature_id.x) %>% 
+  top_n(1, -tss_distance) %>% 
+  top_n(1, overlap_distance) %>% 
+  top_n(1, feature_id.y) %>% 
+  ungroup()
+
+overlaps_annotate_coding <- overlaps_all %>% 
+  mutate(locus_type = ifelse(combination %in% overlaps_sense$combination, 'Overlapping', 'Antisense')) %>% 
+  group_by(combination) %>% 
+  top_n(1, overlap_distance) %>% 
+  ungroup() %>% 
+  left_join(pairwise) %>% 
+  group_by(feature_id.y) %>% 
+  top_n(1, -tss_distance) %>% 
+  top_n(1, overlap_distance) %>% 
+  top_n(1, feature_id.x) %>% 
+  ungroup()
+
+colnames(overlaps_annotate_coding) <- c('feature_id.y', 'feature_id.x', 'combination', 'overlap_distance', 'locus_type', 'tss_distance')
+
+overlaps_annotate <- bind_rows(overlaps_annotate_lncrna,
+                               overlaps_annotate_coding)
+
+overlaps_annotate
+```
+```{r}
+overlaps_annotate %>% 
+  group_by(feature_id.x) %>% 
+  top_n(1, overlap_distance) %>% 
+  ggplot(aes(x = overlap_distance)) +
+  geom_histogram() + 
+  scale_x_log10()
+```
+
+```{r}
+divergent_dist <- 10000 # larger distance 
+
+upstream_overlaps <- join_overlap_intersect(gtf_tss %>% filter(library == 'lncRNA'),
+                                            coding_tss_gtf %>% 
+                                              promoters(upstream = divergent_dist, # within a certain upstream distance
+                                                        downstream = 0),
+                                            minoverlap = 1) %>% 
+  mutate(combination = paste(feature_id.x, feature_id.y, sep = ':')) %>% 
+  as_tibble() %>% 
+  select(feature_id.x, feature_id.y, combination) %>% 
+  unique()
+
+convergent_loci <- join_overlap_intersect_directed(gtf_tss %>% filter(library == 'lncRNA'),
+                                                   coding_tss_gtf %>% 
+                                                     promoters(upstream = divergent_dist, # within a certain upstream distance
+                                                               downstream = 0),
+                                                   minoverlap = 1) %>% 
+  mutate(combination = paste(feature_id.x, feature_id.y, sep = ':')) %>% 
+  as_tibble() %>% 
+  select(feature_id.x, feature_id.y, combination) %>% 
+  unique()
+
+divergent_loci_lncrna <- upstream_overlaps %>% 
+  filter(!(combination %in% convergent_loci$combination)) %>% 
+  left_join(pairwise) %>% 
+  filter(tss_distance < divergent_dist) %>% 
+  group_by(feature_id.x) %>% 
+  top_n(1, -tss_distance) %>% # closest divergent TSS
+  top_n(1, feature_id.y) %>% 
+  ungroup() 
+
+divergent_loci_coding <- upstream_overlaps %>% 
+  filter(!(combination %in% convergent_loci$combination)) %>% 
+  left_join(pairwise) %>% 
+  filter(tss_distance < divergent_dist) %>% 
+  group_by(feature_id.y) %>% 
+  top_n(1, -tss_distance) %>% # closest divergent TSS
+  ungroup() 
+
+colnames(divergent_loci_coding) <- c('feature_id.y', 'feature_id.x', 'combination', 'tss_distance')
+
+divergent_loci <- bind_rows(divergent_loci_lncrna,
+                            divergent_loci_coding) %>% 
+  mutate(locus_type = 'Divergent')
+```
+
+
+
+```{r}
+lncrna_annotate <- screen_results %>% 
+  filter(library == 'lncRNA', group == 'Gene', assay == 'Differentiation') %>% 
+  select(feature_id, status, primary_pheno, pheno, direction) %>% 
+  mutate(locus_type = case_when(
+    feature_id %in% overlaps_sense$feature_id.x ~ 'Overlapping',
+    feature_id %in% divergent_loci$feature_id.x ~ 'Divergent',
+    feature_id %in% overlaps_antisense$feature_id.x ~ 'Antisense',
+    
+    TRUE ~ 'Intergenic'),
+    locus_ambiguity = ifelse(feature_id %in% ambiguous_loci$feature_id.x, 'Ambiguous', 'Non-ambiguous'))
+
+coding_annotate <- screen_results %>% 
+  filter(library == 'Coding', group == 'Gene', assay == 'Differentiation') %>% 
+  select(feature_id, status, primary_pheno, pheno, direction) %>% 
+  mutate(locus_type = case_when(
+    feature_id %in% overlaps_sense$feature_id.y ~ 'Overlapping',
+    feature_id %in% divergent_loci$feature_id.x ~ 'Divergent',
+    feature_id %in% overlaps_antisense$feature_id.y ~ 'Antisense',
+    TRUE ~ 'Coding'),
+    locus_ambiguity = ifelse(feature_id %in% ambiguous_loci$feature_id.y, 'Ambiguous', 'Non-ambiguous'))
+
+loci_annotate <- bind_rows(lncrna_annotate,
+                           coding_annotate)
+
+loci_merge <- bind_rows(divergent_loci,
+                        overlaps_annotate) %>% 
+  select(feature_id = feature_id.x,
+         locus_pair = feature_id.y,
+         locus_distance = tss_distance,
+         locus_type,
+         combination) %>% 
+  group_by(feature_id) %>% 
+  top_n(1, -locus_distance) %>% 
+  ungroup() %>% 
+  add_count(feature_id) %>% 
+  filter(n == 1 | locus_type == 'Antisense') %>% 
+  select(-n)
+  
+loci_annotate <- screen_results %>% 
+  filter(group == 'Gene', assay == 'Differentiation') %>% 
+  select(feature_id, library, status, primary_pheno, pheno, direction) %>% 
+  left_join(loci_merge) %>% 
+  mutate(locus_type = ifelse(is.na(locus_type), 'Intergenic', locus_type),
+         locus_ambiguity = ifelse(feature_id %in% c(ambiguous_loci$feature_id.x, ambiguous_loci$feature_id.y), 'Ambiguous', 'Non-ambiguous')) 
+
+loci_annotate
+```
+
+```{r}
+loci_annotate %>% filter(library == 'lncRNA') %>% pull(locus_type) %>% table()
+```
+```{r}
+lncrna_annotate$locus_type %>% table()
+```
+
+```{r}
+lncrna_annotate %>% filter(status == 'Hit') %>% pull(locus_type) %>% table()
+```
+
+```{r}
+lncrna_annotate %>% filter(locus_ambiguity != 'Ambiguous') %>% pull(locus_type) %>% table()
+```
+
+```{r}
+lncrna_annotate %>% filter(status == 'Hit', locus_ambiguity != 'Ambiguous') %>% pull(locus_type) %>% table()
+```
+
+
+
+### Analysis
+
+Plot 1% to get a general view of distribution
+```{r}
+pairwise %>% 
+  sample_frac(0.01) %>% 
+  ggplot(aes(x = tss_distance + 1)) +
+  geom_histogram(bins = 1000) + 
+  scale_x_log10()
+```
+
+
+## Neighbor analysis
+
+### Nearest gene (within the same library)
+```{r}
+nearest_gene_within <- bind_rows(find_nearest(gtf_tss %>% filter(library == 'lncRNA')),
+                                 find_nearest(coding_tss_gtf)) %>% 
+  group_by(query_id) %>% 
+  top_n(1, -distance) %>% 
+  top_n(1, subject_id) %>% 
+  ungroup() %>% 
+  unique()
+
+
+nearest_gene_within
+```
+### Nearest gene (across libraries)
+```{r}
+nearest_gene_across <- bind_rows(find_nearest(gtf_tss %>% filter(library == 'lncRNA'),
+                                              coding_tss_gtf),
+                                 find_nearest(coding_tss_gtf,
+                                              gtf_tss %>% filter(library == 'lncRNA'))) %>% 
+  group_by(query_id) %>% 
+  top_n(1, -distance) %>% 
+  top_n(1, subject_id) %>% 
+  ungroup()
+
+
+nearest_gene_across
+```
+
+### Nearest hit within libraries
+```{r}
+nearest_hit_within_all <- map(screen_results$assay %>% unique(), function(i) {
+  coding_hits <- screen_results %>% filter(assay == i, status == 'Hit', group == 'Gene', library == 'Coding') %>% pull(feature_id)
+  lncrna_hits <- screen_results %>% filter(assay == i, status == 'Hit', group == 'Gene', library == 'lncRNA') %>% pull(feature_id)
+  
+  nearest_hit <- bind_rows(find_nearest(gtf_tss %>% filter(library == 'lncRNA'),
+                                        gtf_tss %>% filter(feature_id %in% lncrna_hits)), # lncrna to lncrna hit
+                           find_nearest(coding_tss_gtf,
+                                        coding_tss_gtf %>% filter(feature_id %in% coding_hits))) %>%  # coding to coding hit
+    mutate('assay' = i) %>% 
+    mutate(subject_id = ifelse(is.na(subject_id), 'None', subject_id), # if no cross hit neighbor, set to none and set distance to 100 Mb
+           distance = ifelse(is.na(subject_id), 1e8, distance))
+}) %>% bind_rows()
+
+# hits match themselves; find next nearest hit
+nearest_hit_within_hits <- map(screen_results$assay %>% unique(), function(i) {
+  coding_hits <- screen_results %>% filter(assay == i, status == 'Hit', group == 'Gene', library == 'Coding') %>% pull(feature_id)
+  lncrna_hits <- screen_results %>% filter(assay == i, status == 'Hit', group == 'Gene', library == 'lncRNA') %>% pull(feature_id)
+  
+  nearest_hit <- bind_rows(find_nearest(gtf_tss %>% filter(feature_id %in% lncrna_hits)), # lncrna hit to lncrna hit
+                           find_nearest(coding_tss_gtf %>% filter(feature_id %in% coding_hits))) %>%  # coding to coding hit
+    mutate('assay' = i) %>% 
+    mutate(subject_id = ifelse(is.na(subject_id), 'None', subject_id), # if no cross hit neighbor, set to none and set distance to 100 Mb
+           distance = ifelse(is.na(subject_id), 1e8, distance))
+}) %>% bind_rows()
+
+nearest_hit_within <- bind_rows(nearest_hit_within_all %>% filter(query_id != subject_id),
+                                nearest_hit_within_hits) %>% 
+  mutate(distance = ifelse(is.na(distance), 0, distance)) %>% 
+  unique() %>% 
+  group_by(query_id, assay) %>% 
+  top_n(1, -distance) %>% 
+  ungroup()
+
+nearest_hit_within
+```
+
+
+### Nearest hit across libraries (for calling neighbor hits)
+```{r}
+nearest_hit_across <- map(screen_results$assay %>% unique(), function(i) {
+  coding_hits <- screen_results %>% filter(assay == i, status == 'Hit', group == 'Gene', library == 'Coding') %>% pull(feature_id)
+  lncrna_hits <- screen_results %>% filter(assay == i, status == 'Hit', group == 'Gene', library == 'lncRNA') %>% pull(feature_id)
+  
+  nearest_hit <- bind_rows(find_nearest(gtf_tss %>% filter(library == 'lncRNA'),
+                                        coding_tss_gtf %>% filter(feature_id %in% coding_hits)), # lncrna to coding hit
+                           find_nearest(coding_tss_gtf,
+                                        gtf_tss %>% filter(feature_id %in% lncrna_hits))) %>%  # coding to lncrna hit
+    mutate('assay' = i) %>% 
+    mutate(subject_id = ifelse(is.na(subject_id), 'None', subject_id), # if no cross hit neighbor, set to none and set distance to 1 Mb
+           distance = ifelse(is.na(subject_id), 1e8, distance))
+}) %>% bind_rows() %>% 
+  mutate(distance = ifelse(is.na(distance), 0, distance)) %>% 
+  unique() %>% 
+  group_by(query_id, assay) %>% 
+  top_n(1, -distance) %>% 
+  ungroup()
+
+
+nearest_hit_across
+```
+
+
+
+Neighbor genes
+```{r}
+neighbor_strength <- screen_results %>% 
+  # nearest hit across
+  inner_join(nearest_hit_across %>% 
+               select(feature_id = query_id, 
+                      neighbor_hit_id = subject_id, 
+                      neighbor_hit_distance = distance, 
+                      assay)) %>% 
+  # nearest hit within
+  inner_join(nearest_hit_within %>% 
+               select(feature_id = query_id, 
+                      neighbor_hit_within_id = subject_id, 
+                      neighbor_hit_within_distance = distance, 
+                      assay)) %>% 
+  
+  # nearest gene across
+    inner_join(nearest_gene_across %>% 
+               select(feature_id = query_id, 
+                      neighbor_gene_id = subject_id, 
+                      neighbor_gene_distance = distance)) %>% 
+  
+  # nearest gene within
+  inner_join(nearest_gene_within %>% 
+               select(feature_id = query_id, 
+                      neighbor_gene_within_id = subject_id, 
+                      neighbor_gene_within_distance = distance)) %>% 
+  
+  left_join(screen_results %>% select(neighbor_hit_id = feature_id, assay, neighbor_pheno = pheno)) %>% 
+  mutate(neighbor_relative_pheno = (abs(neighbor_pheno) - abs(pheno)))
+
+neighbor_strength
+```
+Neighbor strength appears normally distributed; use mean +/- sd as cutoffs for 
+```{r}
+neighbor_strength %>% 
+  filter(status == 'Hit') %>%  # only makes sense for hits
+  ggplot(aes(x = neighbor_relative_pheno)) +
+  geom_histogram(binwidth = 0.05) 
+```
+```{r}
+neighbor_strength_cutoffs <- neighbor_strength %>% 
+  filter(status == 'Hit') %>% 
+  summarize(mean = mean(neighbor_relative_pheno, na.rm = TRUE),
+            sd = sd(neighbor_relative_pheno, na.rm = TRUE)) %>% 
+  mutate(cutoff_lo = mean - 2*sd,
+         cutoff_hi = mean + 2*sd)
+
+neighbor_strength_cutoffs
+```
+
+## Integrate neighbor data
+```{r}
+neighbor_hit_distance_cutoff <- 1000 # 1 kb either direction, 2 kb total window
+neighbor_strength_cutoff <- neighbor_strength_cutoffs$sd * 2 # consider a neighbor hit unless the pheno difference is much larger than neighbor, e.g. 2 sd
+
+neighbor_integration <- neighbor_strength %>% 
+  mutate(
+    neighbor_direction = ifelse(neighbor_pheno * pheno > 0, 'Same', 'Opposite'),
+    neighbor_strength = case_when(
+      neighbor_relative_pheno > neighbor_strength_cutoff ~ 'Stronger', 
+      neighbor_relative_pheno >= -neighbor_strength_cutoff ~ 'Similar',
+      neighbor_relative_pheno < -neighbor_strength_cutoff ~ 'Weaker'),
+    full_status = case_when(
+      (library == 'lncRNA') &
+        (status == 'Hit') & 
+        (neighbor_hit_distance < neighbor_hit_distance_cutoff) & (neighbor_direction == 'Same') ~ 'Neighbor hit', # if closest hit within cutoff distance, consider neighbor hit
+      status == 'Hit' ~ 'Hit', # otherwise, hit
+      status == 'Non-hit' ~ 'Non-hit')) %>% # otherwise, non-hit
+  left_join(loci_annotate %>% select(feature_id, locus_ambiguity, locus_type, locus_pair, locus_distance)) %>% 
+  left_join(screen_results %>% select(locus_pair = feature_id, assay, locus_pair_pheno = pheno, locus_pair_status = status)) %>% 
+  select(feature_id, gene_name, library, assay, pheno, score, direction, status, hit_direction, primary_pheno, full_status, starts_with('locus'), starts_with('neighbor'))
+
+neighbor_integration
+```
+
+```{r}
+neighbor_integration %>% 
+  filter(full_status == 'Neighbor hit') %>% group_by(library, primary_pheno) %>% tally()
+```
+```{r}
+neighbor_integration %>% filter(full_status == 'Hit') %>% group_by(library, assay, locus_ambiguity) %>% tally() 
+```
+
+### Expression correlation between neighbors
+```{r}
+neighbor_pairs <- neighbor_integration %>% select(assay, library, feature_id, neighbor_hit_id, neighbor_gene_id)
+neighbor_pairs
+```
+Loop for correlated neighbor expression
+```{r}
+cor_features <- intersect(rownames(expression_cor), neighbor_integration$feature_id)
+
+neighbor_hit_pairs <- neighbor_pairs %>% select(assay, feature_id, neighbor_hit_id)
+
+neighbor_hit_cor <- map(1:nrow(neighbor_hit_pairs), function(i) {
+  neighbor_pair <- neighbor_hit_pairs[i,]
+  
+  if(neighbor_pair$neighbor_hit_id == 'None') {
+    output_cor <- NA
+  } else if((neighbor_pair$feature_id %in% cor_features) & (neighbor_pair$neighbor_hit_id %in% cor_features)) {
+    output_cor <- expression_cor[neighbor_pair$feature_id,
+                                 neighbor_pair$neighbor_hit_id]
+  } else {
+    output_cor <- NA
+  } 
+  
+  neighbor_pair %>% mutate(neighbor_hit_cor = output_cor)
+}) %>% bind_rows()
+```
+
+
+```{r}
+neighbor_gene_pairs <- neighbor_pairs %>% select(feature_id, neighbor_gene_id) %>% unique()
+
+neighbor_gene_cor <- map(1:nrow(neighbor_gene_pairs), function(i) {
+  neighbor_pair <- neighbor_gene_pairs[i,]
+  
+  if((neighbor_pair$feature_id %in% cor_features) & (neighbor_pair$neighbor_gene_id %in% cor_features)) {
+    output_cor <- expression_cor[neighbor_pair$feature_id,
+                                 neighbor_pair$neighbor_gene_id]
+  } else {
+    output_cor <- NA
+  } 
+  
+  neighbor_pair %>% mutate(neighbor_gene_cor = output_cor)
+}) %>% bind_rows() 
+```
+
+### Locus pair correlations
+```{r}
+locus_gene_pairs <-  neighbor_integration %>% select(feature_id, locus_pair) %>% unique() %>% drop_na()
+
+locus_gene_cor <- map(1:nrow(locus_gene_pairs), function(i) {
+  locus_pair <- locus_gene_pairs[i,]
+  
+  if((locus_pair$feature_id %in% cor_features) & (locus_pair$locus_pair %in% cor_features)) {
+    output_cor <- expression_cor[locus_pair$feature_id,
+                                 locus_pair$locus_pair]
+  } else {
+    output_cor <- NA
+  } 
+  
+  locus_pair %>% mutate(locus_cor = output_cor)
+}) %>% bind_rows() 
+
+locus_gene_cor
+```
+
+
+### Add expression cor to neighbor table
+```{r}
+neighbor_integration <- neighbor_integration %>% left_join(locus_gene_cor) %>% left_join(neighbor_hit_cor) %>% left_join(neighbor_gene_cor) 
+neighbor_integration
+
+```
+
+
+### Convert to wide format
+```{r}
+basic_metadata <- neighbor_integration %>% 
+  select(feature_id,
+         gene_name,
+         library,
+         primary_pheno,
+         locus_ambiguity,
+         locus_type,
+         locus_pair,
+         locus_distance,
+         locus_cor,
+         contains('neighbor_gene')) %>% 
+  unique() 
+
+basic_metadata
+```
+
+
+```{r}
+basic_columns <- colnames(basic_metadata) %>% setdiff('feature_id')
+
+basic_columns
+```
+
+
+```{r}
+differentiation <- neighbor_integration %>% 
+  filter(assay == 'Differentiation') %>% 
+  select(-one_of(basic_columns),
+         -assay) 
+
+colnames(differentiation)[-1] <- paste0('diff_', colnames(differentiation)[-1])
+differentiation
+```
+
+
+```{r}
+proliferation <- neighbor_integration %>% 
+  filter(assay == 'Proliferation') %>% 
+  select(-one_of(basic_columns),
+         -assay) 
+
+colnames(proliferation)[-1] <- paste0('prol_', colnames(proliferation)[-1])
+proliferation
+```
+
+
+```{r}
+neighbor_wide <- basic_metadata %>% 
+  left_join(differentiation) %>% 
+  left_join(proliferation) %>% 
+  mutate(primary_pheno = case_when( # resolve dual neighbor hits
+    primary_pheno == 'Dual' & diff_full_status == 'Hit' & prol_full_status == 'Neighbor hit' ~ 'Differentiation',
+    primary_pheno == 'Dual' & diff_full_status == 'Neighbor hit' & prol_full_status == 'Hit' ~ 'Differentiation',
+    TRUE ~ primary_pheno),
+    neighbor_overall_status = case_when(
+      primary_pheno == 'Differentiation' & diff_full_status == 'Neighbor hit' ~ 'Neighbor hit',
+      primary_pheno == 'Proliferation' & prol_full_status == 'Neighbor hit' ~ 'Neighbor hit',
+      primary_pheno == 'Dual' & diff_full_status == 'Neighbor hit' & prol_full_status == 'Neighbor hit' ~ 'Neighbor hit',
+      primary_pheno == 'Dual' & prol_full_status == 'Neighbor hit' ~ 'Neighbor hit',
+      primary_pheno == 'None' ~ 'Non-hit',
+      TRUE ~ 'Non-neighbor')) %>% 
+  select(feature_id, 
+         gene_name, 
+         library, 
+         primary_pheno, 
+         locus_ambiguity, 
+         locus_type, 
+         locus_pair, 
+         locus_distance,
+         locus_cor,
+         locus_pair_diff_status = diff_locus_pair_status,
+         locus_pair_diff_pheno = diff_locus_pair_pheno,
+         locus_pair_prol_status = prol_locus_pair_status,
+         locus_pair_prol_pheno = prol_locus_pair_pheno,
+         starts_with('diff_'), starts_with('prol'), everything())
+  
+neighbor_wide
+```
+
+
+
+### Enrichment analysis
+
+```{r}
+enrichment_input <- neighbor_integration %>% filter(locus_ambiguity != 'Ambiguous', assay == 'Differentiation', full_status != 'Neighbor hit', library == 'lncRNA')
+enrichment_input
+```
+
+
+```{r}
+antisense <- enrichment_input %>% 
+  filter(locus_type == 'Antisense') %>% pull(feature_id) %>% unique()
+
+divergent <- enrichment_input %>% 
+  filter(locus_type == 'Divergent') %>% pull(feature_id) %>% unique()
+
+intergenic <- enrichment_input %>% 
+  filter(locus_type == 'Intergenic') %>% pull(feature_id) %>% unique()
+
+overlapping <- enrichment_input %>% 
+  filter(locus_type == 'Overlapping') %>% pull(feature_id) %>% unique()
+
+hits <- enrichment_input %>% 
+  filter(status == 'Hit') %>% pull(feature_id) %>% unique()
+
+universe <- enrichment_input %>% pull(feature_id) %>% unique()
+
+enrichment_test(antisense,
+                hits,
+                cat1 = c('Antisense', 'Non-antisense'),
+                cat2 = c('Hit', 'Non-hit'),
+                background = universe)$fisher
+```
+```{r}
+enrichment_test(divergent,
+                hits,
+                cat1 = c('Divergent', 'Non-divergent'),
+                cat2 = c('Hit', 'Non-hit'),
+                background = universe)$fisher
+```
+```{r}
+enrichment_test(intergenic,
+                hits,
+                cat1 = c('Intergenic', 'Non-intergenic'),
+                cat2 = c('Hit', 'Non-hit'),
+                background = universe)$fisher
+```
+
+```{r}
+enrichment_test(overlapping,
+                hits,
+                cat1 = c('Overlapping', 'Non-overlapping'),
+                cat2 = c('Hit', 'Non-hit'),
+                background = universe)$fisher
+```
+
+```{r}
+neighbor_integration %>% 
+  filter(library == 'lncRNA', assay == 'Differentiation', status == 'Hit') %>% 
+  select(feature_id, gene_name, status, full_status, locus_ambiguity, locus_type, neighbor_gene_distance, neighbor_gene_id) %>% filter(locus_ambiguity == 'Ambiguous') %>% arrange(neighbor_gene_distance)
+```
+```{r}
+neighbor_integration %>% filter(full_status == 'Hit', library == 'Coding' | locus_ambiguity == 'Non-ambiguous') %>% group_by(library, assay) %>% tally()
+```
+
+```{r}
+neighbor_integration %>% filter(library == 'lncRNA', locus_ambiguity == 'Non-ambiguous', assay == 'Differentiation') %>% group_by(locus_type) %>% tally()
+```
+```{r}
+neighbor_integration %>% filter(library == 'lncRNA', locus_ambiguity == 'Non-ambiguous', assay == 'Differentiation', full_status == 'Hit') %>% group_by(locus_type) %>% tally()
+```
+
+## Export
+```{r}
+neighbor_integration %>% write_tsv('analysis/screen/output/03_neighbors/neighbor_hits.tsv.gz')
+neighbor_wide %>% write_tsv('analysis/screen/output/03_neighbors/neighbor_wide.tsv.gz')
+gtf_tss %>% export('analysis/screen/output/03_neighbors/screen_tss.gtf')
+```
+
+Neighbor strengths
+```{r fig.height=6, fig.width=10}
+neighbor_integration %>% 
+  ggplot(aes(x = pheno, y = neighbor_pheno, color = full_status)) + 
+  geom_point(alpha = 0.5, size = 1) + 
+  facet_grid(rows = vars(library),
+             cols = vars(full_status)) +
+  coord_equal() +
+  theme_publication(grid = TRUE, axis = FALSE) +
+  theme(panel.border = element_rect(color = 'black', fill = 'transparent')) +
+  scale_color_few() +
+  labs(x = 'Phenotype',
+       y = 'Neighbor Phenotype')
+```
+
+```{r fig.height=6, fig.width=10}
+neighbor_integration %>% 
+  filter(assay == 'Differentiation') %>% 
+  ggplot(aes(x = neighbor_relative_pheno)) + 
+  geom_histogram(alpha = 0.5, binwidth = 0.5) + 
+  geom_vline(xintercept = 0, linetype = 'dashed', color = 'red') + 
+  facet_wrap(~library + full_status, scales = 'free_y', nrow = 2)
+```
+
+
+```{r fig.height=6, fig.width=4}
+neighbor_integration %>% 
+  ggplot(aes(x = neighbor_relative_pheno)) + 
+  geom_histogram(alpha = 0.5, bins = 100) + 
+  geom_vline(xintercept = 0, linetype = 'dashed', color = 'red') + 
+  facet_wrap(~full_status, scales = 'free_y', nrow = 3)
+```
+Hits vs neighbor hits
+```{r}
+hist_alpha <- 0.5
+hist_binwidth <- 0.2
+neighbor_integration %>% 
+  filter(full_status != 'Non-hit') %>% 
+  ggplot(aes(x = neighbor_relative_pheno, fill = full_status)) + 
+  geom_histogram(data = . %>% filter(full_status == 'Hit'), alpha = hist_alpha, binwidth = hist_binwidth) + 
+  geom_histogram(data = . %>% filter(full_status == 'Neighbor hit'), alpha = hist_alpha, binwidth = hist_binwidth) +
+  scale_fill_few()
+```
+To what distance are neighbor effects significant?
+```{r}
+(neighbor_integration %>% 
+  filter(status == 'Hit') %>% 
+   ggplot(aes(x = neighbor_hit_distance + 1,
+              y = neighbor_relative_pheno)) + 
+   geom_point(alpha = 0.5) +
+   scale_x_log10(breaks = c(1, 10, 100, 1e3, 1e4, 1e5, 1e6),
+                 labels = c('1 bp', '10 bp', '100 bp', '1 kb', '10 kb', '100 kb', '1 Mb')) +
+   geom_vline(xintercept = 1000, color = 'red', linetype = 'dashed', size = 1) +
+   geom_smooth(method = 'lm') +
+   scale_color_few()) %>% 
+  ggMarginal()
+  
+```
+```{r}
+rolling_median <- function(formula, data, n_roll = 7, ...) {
+  x <- data$x[order(data$x)]
+  y <- data$y[order(data$x)]
+  y <- zoo::rollmedian(y, n_roll, na.pad = TRUE)
+  structure(list(x = x, y = y, f = approxfun(x, y)), class = "rollmed")
+}
+
+predict.rollmed <- function(mod, newdata, ...) {
+  setNames(mod$f(newdata$x), newdata$x)
+}
+
+```
+
+```{r}
+p <- (neighbor_integration %>% 
+  filter(assay == 'Differentiation',
+         library == 'lncRNA') %>% 
+   ggplot(aes(x = neighbor_hit_distance + 1,
+              y = neighbor_relative_pheno)) + 
+   geom_point(alpha = 0.1) +
+   scale_x_log10(breaks = c(1, 10, 100, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8),
+                 labels = c('1 bp', '10 bp', '100 bp', '1 kb', '10 kb', '100 kb', '1 Mb', '10 Mb', '100 Mb')) +
+   geom_vline(xintercept = 1000, color = 'red', linetype = 'dashed', size = 1) +
+   geom_hline(yintercept = 0, color = 'red', linetype = 'dashed', size = 1) +
+   geom_smooth(forma = y ~ x, method = 'rolling_median', se = FALSE) +
+   labs(x = 'Distance to coding hit TSS',
+        y = 'abs(Coding rho) - abs(lncRNA rho)',
+        title = 'All lncRNAs (hits + non-hits)')) %>% 
+  ggMarginal()
+
+p
+```
+```{r}
+p <- (neighbor_integration %>% 
+  filter(assay == 'Differentiation',
+         library == 'lncRNA',
+         status == 'Hit') %>% 
+   ggplot(aes(x = neighbor_hit_distance + 1,
+              y = neighbor_relative_pheno)) + 
+   geom_point(alpha = 0.5) +
+   scale_x_log10(breaks = c(1, 10, 100, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8),
+                 limits = c(1, 1e8),
+                 labels = c('1 bp', '10 bp', '100 bp', '1 kb', '10 kb', '100 kb', '1 Mb', '10 Mb', '100 Mb')) +
+   geom_vline(xintercept = 1000, color = 'red', linetype = 'dashed', size = 1) +
+   geom_hline(yintercept = 0, color = 'red', linetype = 'dashed', size = 1) +
+   geom_smooth(forma = y ~ x, method = 'rolling_median', se = FALSE) +
+   labs(x = 'Distance to coding hit TSS',
+        y = 'abs(Coding rho) - abs(lncRNA rho)',
+        title = 'lncRNA hits only')) %>% 
+  ggMarginal()
+
+p
+```
+
+```{r }
+neighbor_integration %>% 
+  filter(status == 'Hit') %>% 
+  ggplot(aes(x = neighbor_hit_distance + 1,
+             y = neighbor_relative_pheno)) + 
+  geom_point(alpha = 0.5) +
+  scale_x_log10(breaks = c(1, 10, 100, 1e3, 1e4, 1e5, 1e6),
+                labels = c('1 bp', '10 bp', '100 bp', '1 kb', '10 kb', '100 kb', '1 Mb')) +
+  geom_vline(xintercept = 1000, color = 'red', linetype = 'dashed', size = 1) +
+  scale_color_few() +
+  geom_smooth(method = 'lm', se = FALSE) +
+  facet_wrap(~library) + 
+  labs(x = 'Distance to neighbor',
+       y = 'Relative neighbor phenotype')
+```
+
+```{r}
+(neighbor_integration %>% 
+  filter(status == 'Non-hit') %>% 
+   ggplot(aes(x = neighbor_hit_distance + 1,
+              y = neighbor_relative_pheno)) + 
+   geom_point(alpha = 0.05,
+              size = 0.5,
+              color = 'steelblue') +
+   scale_x_log10(breaks = c(1, 10, 100, 1e3, 1e4, 1e5, 1e6),
+                 labels = c('1 bp', '10 bp', '100 bp', '1 kb', '10 kb', '100 kb', '1 Mb')) +
+   geom_vline(xintercept = 1000, color = 'red', linetype = 'dashed', size = 1)) %>% 
+  ggMarginal()
+```
+
+```{r}
+(neighbor_integration %>% 
+  filter(status == 'Hit',
+         neighbor_hit_distance > 1000) %>% 
+   ggplot(aes(x = neighbor_hit_distance + 1,
+              y = neighbor_relative_pheno,
+              color = full_status)) + 
+   geom_point(alpha = 0.5) +
+   scale_x_log10(breaks = c(1, 10, 100, 1e3, 1e4, 1e5, 1e6),
+                 labels = c('1 bp', '10 bp', '100 bp', '1 kb', '10 kb', '100 kb', '1 Mb')) +
+   scale_color_few() +
+   geom_smooth(method = 'lm')) %>% 
+  ggMarginal()
+```
+
+
+```{r}
+neighbor_integration %>% 
+  filter(status == 'Hit',
+         neighbor_hit_distance < neighbor_hit_distance_cutoff) %>% 
+  select(feature_id, library, assay, pheno, neighbor_hit_id, neighbor_pheno, neighbor_relative_pheno)
+```
+
+Neighbors with opposite phenotypes
+```{r}
+neighbor_integration %>% 
+  filter(status == 'Hit',
+         neighbor_hit_distance < neighbor_hit_distance_cutoff,
+         neighbor_direction == 'Opposite') %>% 
+  select(feature_id, library, assay, pheno, neighbor_hit_id, neighbor_pheno, neighbor_relative_pheno)
+```
+
+```{r}
+neighbor_integration %>% filter(status == 'Non-hit') %>% 
+  ggplot(aes(x = neighbor_hit_distance + 1)) + theme_publication() +
+  geom_histogram(alpha = 0.5, position = 'stack', binwidth = 0.1) + scale_x_log10() + facet_wrap(~library, scales = 'free_y')
+```
+```{r}
+neighbor_integration %>% 
+  filter(full_status == 'Neighbor hit') %>% group_by(library, assay) %>% tally()
+```
+```{r}
+neighbor_integration %>% 
+  filter(full_status == 'Neighbor hit') %>% group_by(library, primary_pheno) %>% tally()
+```
+
+What is the distribution of phenotype values? 
+Use abs val
+```{r}
+screen_results %>% 
+  filter(group == 'Gene') %>% 
+  ggplot(aes(x = abs(pheno), fill = status)) +
+  geom_histogram(bins = 100, alpha = 0.5) +
+  scale_fill_few() +
+  facet_wrap(~status + assay, scales = 'free_y')
+```
+For non-hits, phenotype scores should be considered 0 under a certain threshold
+Use the hits distribution to determine
+```{r}
+pheno_thresh <- screen_results %>% 
+  filter(status == 'Hit',
+         group == 'Gene') %>% 
+  group_by(assay) %>% 
+  summarize(mean_pheno = mean(abs(pheno)),
+            sd_pheno = sd(abs(pheno))) %>% 
+  mutate(threshold = mean_pheno - sd_pheno)
+
+pheno_thresh
+```
+
+
+
+For the neighborhoods with more than 1 hit, which neighbor is the strongest?
+Use pairwise TSS distances to help plot
+```{r}
+more_than_1_phenos_distance <- more_than_1_phenos %>% 
+  inner_join(pairwise %>% select(feature_id = feature_id.x, neighbor_id = feature_id.y, tss_distance))
+more_than_1_phenos_distance %>% arrange(feature_id)
+```
+
+Nearest neighbor not always strongest neighbor, but differences in neighbor phenotypes are minimal
+```{r fig.height=10, fig.width=10}
+more_than_1_phenos_distance %>% 
+  ggplot(aes(x = tss_distance, y = abs(neighbor_pheno))) + 
+  geom_point(alpha = 0.5) +
+  ylim(c(0, 2)) + 
+  facet_wrap(~feature_id)
+```
+
+## Session info
+```{r}
+sessionInfo()
+```

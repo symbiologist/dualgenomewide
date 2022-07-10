@@ -1,0 +1,4 @@
+neg	Rep1	87381784
+neg	Rep2	86854020
+pos	Rep1	64606642
+pos	Rep2	65801483

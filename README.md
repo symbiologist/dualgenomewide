@@ -8,5 +8,5 @@ A processed Seurat object for analysis in R can be downloaded from [GEO](https:/
 Please see GEO for raw sequencing data (GSE150062) and our [public data resource](https://danlimlab.shinyapps.io/dualgenomewide) to interactively explore our datasets and analyses.  
 <br>
 Please don't hesitate to contact us with any questions or comments!  
-David Wu, PhD (first author): dwu@ucsf.edu  
+David Wu, MD, PhD (first author): dwu@ucsf.edu  
 Dan Lim, MD, PhD (corresponding author): daniel.lim@ucsf.edu
